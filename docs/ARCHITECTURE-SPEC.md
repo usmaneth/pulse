@@ -64,10 +64,18 @@ y = W @ x
 | `ffn_down` | 17408 | signs + WHT | same |
 | `attn_qkv` | 5120 | signs + WHT | cos 0.99999907 |
 | `ssm_out` | 6144 | **permute** + signs + WHT | cos 0.99999463 |
+| `attn_output` | 6144 | signs + WHT, **no** permute | cos 0.99999876 |
 
 `ssm_out` needs the tiled `[hd=128, nk=16, rep=3]` -> grouped `[hd, rep, nk]`
 permutation first. Without it: cos **-0.11**. With WHT but no permute: cos
 **-0.32**. Both wrong, in different directions.
+
+**`attn_output` does NOT need the permutation**, and adding it breaks the result
+(cos 0.664 against 0.99999876 without). The reason is structural: attention
+heads are laid out with `h = kv*6 + r`, which is already the grouped order, so
+the permutation is an identity there. GDN's layout is genuinely tiled. Two
+head-bearing activations of the same width, two different answers - which is
+why each one has to be measured rather than inferred from the other.
 
 ---
 

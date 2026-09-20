@@ -1048,6 +1048,61 @@ int main(int argc, char** argv) {
                 printf("    best variant cosine %.8f\n", cn/std::sqrt(std::max(ga*ra,1e-30)));
             }
         }
+        // ---- attention output projection, layer 3 (a full-attention layer)
+        std::vector<float> ag, ao;
+        if (load_ref("attn_gated-3", ag) && load_ref("attn_output-3", ao)) {
+            const DevTensor* wo3 = m.layer(3,"attn_output.weight");
+            if (wo3 && wo3->type == T_PQ2_0) {
+                const int nin = (int)wo3->ne[0], nout = (int)wo3->ne[1];
+                if ((int)ag.size() == nin) {
+                    std::vector<int32_t> sv, sw;
+                    m.reader().array_i32("prism.hadamard.sign_values", sv);
+                    m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                    float* sgn = nullptr;
+                    { size_t off=0;
+                      for (size_t i=0;i<sw.size();++i){ if (sw[i]==nin){
+                            std::vector<float> f(nin);
+                            for (int j=0;j<nin;++j) f[j]=(float)sv[off+j];
+                            CU(cudaMalloc(&sgn,(size_t)nin*4));
+                            CU(cudaMemcpy(sgn,f.data(),(size_t)nin*4,cudaMemcpyHostToDevice)); break; }
+                          off += (size_t)sw[i]; } }
+                    const int HB=1024; const float hs=1.0f/std::sqrt((float)HB);
+                    double best=1e30;
+                    for (int variant = 0; variant < 3; ++variant) {
+                        float *dx,*dy;
+                        CU(cudaMalloc(&dx,(size_t)nin*4)); CU(cudaMalloc(&dy,(size_t)nout*4));
+                        CU(cudaMemcpy(dx,ag.data(),(size_t)nin*4,cudaMemcpyHostToDevice));
+                        if (variant==2) {
+                            // tiled [hd=256, nk=4, rep=6] -> grouped [256, 6, 4]
+                            float* dp; CU(cudaMalloc(&dp,(size_t)nin*4));
+                            k_perm_tiled_to_grouped<<<(nin+255)/256,256>>>(dx,dp,256,4,6);
+                            CU(cudaDeviceSynchronize());
+                            CU(cudaMemcpy(dx,dp,(size_t)nin*4,cudaMemcpyDeviceToDevice));
+                            cudaFree(dp);
+                        }
+                        if (variant>=1)
+                            k_hadamard<<<(nin+HB-1)/HB,512,HB*4>>>(dx,sgn,nin,HB,hs);
+                        CU(cudaDeviceSynchronize());
+                        k_matvec_pq2<<<(nout+7)/8,256>>>((const blk*)wo3->ptr,dx,dy,nin,nout);
+                        CU(cudaDeviceSynchronize());
+                        std::vector<float> got(nout);
+                        CU(cudaMemcpy(got.data(),dy,(size_t)nout*4,cudaMemcpyDeviceToHost));
+                        double e=0,mag=0,cn=0,ga=0,ra=0;
+                        for (int i=0;i<nout;++i){
+                            e=std::max(e,(double)std::fabs(got[i]-ao[i]));
+                            mag=std::max(mag,(double)std::fabs(ao[i]));
+                            cn+=(double)got[i]*ao[i]; ga+=(double)got[i]*got[i]; ra+=(double)ao[i]*ao[i]; }
+                        static const char* vn[3]={"plain","hadamard","permute+hadamard"};
+                        printf("    attn_output %-18s rel %.3e  cos %.8f\n", vn[variant],
+                               e/std::max(mag,1e-9), cn/std::sqrt(std::max(ga*ra,1e-30)));
+                        best = std::min(best, e/std::max(mag,1e-9));
+                        cudaFree(dx); cudaFree(dy);
+                    }
+                    report("attention output projection vs llama.cpp", best, 1e-2);
+                    if (sgn) cudaFree(sgn);
+                }
+            }
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
