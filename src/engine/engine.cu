@@ -301,6 +301,30 @@ __global__ void k_apply_signs(float* __restrict__ x, const float* __restrict__ s
     if (i < n && s) x[i] *= s[i];
 }
 
+// BF16 mat-vec, for ssm_alpha and ssm_beta which are stored as type 30.
+__global__ __launch_bounds__(256)
+void k_matvec_bf16(const uint16_t* __restrict__ W, const float* __restrict__ x,
+                   float* __restrict__ y, int ne0, int nrows) {
+    const int row = blockIdx.x;
+    if (row >= nrows) return;
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < ne0; i += blockDim.x) {
+        const uint32_t bits = (uint32_t)__ldg(&W[(size_t)row*ne0 + i]) << 16;
+        float w; memcpy(&w, &bits, 4);
+        acc += w * x[i];
+    }
+    __shared__ float red[8];
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    if ((tid & 31) == 0) red[tid>>5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0; for (int i = 0; i < (int)(blockDim.x>>5); ++i) t += red[i];
+        y[row] = t;
+    }
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -1162,6 +1186,55 @@ int main(int argc, char** argv) {
                 report("token embedding (inverse hadamard)", best, 1e-2);
                 (void)bestv;
                 cudaFree(dz); if (sgn) cudaFree(sgn);
+            }
+        }
+        // ---- ssm_alpha / ssm_beta: BF16 projections of the attn_norm output
+        std::vector<float> an0b, ref_a, ref_b;
+        if (load_ref("attn_norm-0", an0b) && load_ref("alpha-0", ref_a)
+                                          && load_ref("beta-0", ref_b)) {
+            const DevTensor* wa = m.layer(0,"ssm_alpha.weight");
+            const DevTensor* wb = m.layer(0,"ssm_beta.weight");
+            if (wa && wb && wa->type == T_BF16 && (int)an0b.size() == n) {
+                const int nh = (int)wa->ne[1];
+                std::vector<int32_t> sv, sw;
+                m.reader().array_i32("prism.hadamard.sign_values", sv);
+                m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                float* sgn = nullptr;
+                { size_t off=0;
+                  for (size_t i=0;i<sw.size();++i){ if (sw[i]==n){
+                        std::vector<float> f(n);
+                        for (int j=0;j<n;++j) f[j]=(float)sv[off+j];
+                        CU(cudaMalloc(&sgn,(size_t)n*4));
+                        CU(cudaMemcpy(sgn,f.data(),(size_t)n*4,cudaMemcpyHostToDevice)); break; }
+                      off += (size_t)sw[i]; } }
+                const int HB=1024; const float hs=1.0f/std::sqrt((float)HB);
+                float *dx,*da2,*db2;
+                CU(cudaMalloc(&dx,(size_t)n*4)); CU(cudaMalloc(&da2,(size_t)nh*4));
+                CU(cudaMalloc(&db2,(size_t)nh*4));
+                double bestA=1e30, bestB=1e30;
+                for (int variant = 0; variant < 2; ++variant) {
+                    CU(cudaMemcpy(dx,an0b.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+                    if (variant==1)
+                        k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dx,sgn,n,HB,hs);
+                    CU(cudaDeviceSynchronize());
+                    k_matvec_bf16<<<nh,256>>>((const uint16_t*)wa->ptr,dx,da2,n,nh);
+                    k_matvec_bf16<<<nh,256>>>((const uint16_t*)wb->ptr,dx,db2,n,nh);
+                    CU(cudaDeviceSynchronize());
+                    std::vector<float> ga(nh), gb(nh);
+                    CU(cudaMemcpy(ga.data(),da2,(size_t)nh*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(gb.data(),db2,(size_t)nh*4,cudaMemcpyDeviceToHost));
+                    double ea=0,ma=0,eb=0,mb=0;
+                    for (int i=0;i<nh;++i){
+                        ea=std::max(ea,(double)std::fabs(ga[i]-ref_a[i])); ma=std::max(ma,(double)std::fabs(ref_a[i]));
+                        eb=std::max(eb,(double)std::fabs(gb[i]-ref_b[i])); mb=std::max(mb,(double)std::fabs(ref_b[i])); }
+                    printf("    ssm_alpha/beta %-14s alpha rel %.3e   beta rel %.3e\n",
+                           variant? "WITH hadamard":"plain", ea/std::max(ma,1e-9), eb/std::max(mb,1e-9));
+                    bestA = std::min(bestA, ea/std::max(ma,1e-9));
+                    bestB = std::min(bestB, eb/std::max(mb,1e-9));
+                }
+                report("ssm_alpha projection vs llama.cpp", bestA, 1e-2);
+                report("ssm_beta projection vs llama.cpp",  bestB, 1e-2);
+                cudaFree(dx); cudaFree(da2); cudaFree(db2); if (sgn) cudaFree(sgn);
             }
         }
     }

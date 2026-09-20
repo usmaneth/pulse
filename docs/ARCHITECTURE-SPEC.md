@@ -78,6 +78,12 @@ Getting this backwards poisons the residual stream from token 0.
 | `attn_qkv` | 5120 | signs + WHT | cos 0.99999907 |
 | `ssm_out` | 6144 | **permute** + signs + WHT | cos 0.99999463 |
 | `attn_output` | 6144 | signs + WHT, **no** permute | cos 0.99999876 |
+| `ssm_alpha`, `ssm_beta` | 5120 | **plain, NOT folded** (BF16) | rel 1.6e-07 / 8.3e-08 |
+
+**The fold applies to PQ2_0 weights only.** `ssm_alpha` and `ssm_beta` are BF16
+and take the activation unrotated - applying the transform to them gives rel
+1.03e+00 and 8.2e-01. That is consistent with `weight_names` having 401 entries
+against 402 PQ2_0 tensors.
 
 `ssm_out` needs the tiled `[hd=128, nk=16, rep=3]` -> grouped `[hd, rep, nk]`
 permutation first. Without it: cos **-0.11**. With WHT but no permute: cos
@@ -147,6 +153,16 @@ costs nothing extra as context grows.
 
 **Pre-recurrence chain:** `attn_qkv` -> depthwise conv1d (K=4, validated
 2.6e-08) -> SiLU (6.9e-08) -> split q 2048 / k 2048 / v 6144.
+
+q and k arrive **already L2-normalised per head** (norms exactly 1.0, and
+`q_conv_predelta` is bit-identical to the first half of `qk_conv_l2`).
+
+**Conv window convention.** `conv_input` is `[K=4, channels]` with the current
+token in the LAST slot: at position 0 it is `[0, 0, 0, x]`, cols 0-2 exactly
+zero. Standard causal depthwise conv with an empty state.
+
+**Gate sources.** `alpha` and `beta` are projections of the **attn_norm output**
+through the BF16 `ssm_alpha`/`ssm_beta` weights, unrotated.
 
 **Post-recurrence:** `silu(z) * rmsnorm_per_head(o, ssm_norm)` -> `ssm_out`.
 Validated at **9.788e-08, cosine 1.00000000**.
