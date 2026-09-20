@@ -107,6 +107,39 @@ Batching amortises the sweep across sequences, so it scales:
 | 8 | 106.09 | 945.06 |
 | 16 | **133.08** | 881.44 |
 
+## The biggest single-stream lever: speculation is a net loss at long context
+
+Draft acceptance does not hold up as context grows. It collapses
+(`bench/acceptlong.py`, v1 drafter at K=4, spreads 0.3-0.7%):
+
+| ctx tokens | acceptance | decode tok/s |
+|---|---|---|
+| 2,134 | **26.25%** | 37.41 |
+| 8,666 | 18.18% | 29.48 |
+| 16,165 | 6.25% | 20.41 |
+| 34,196 | **0.00%** | 14.41 |
+
+At 34k the drafter proposes 144 tokens per run and **none** are accepted. It
+still streams its 0.59 GB every step and still pays ~3.11 ms per verify row, so
+speculation stops paying for itself:
+
+| ctx tokens | spec K=4 | no spec | winner |
+|---|---|---|---|
+| 2,134 | **38.18** | 27.25 | spec, +40.1% |
+| 8,666 | **29.86** | 25.52 | spec, +17.0% |
+| 12,279 | 24.65 | 24.19 | wash (inside noise) |
+| 14,036 | 21.24 | **24.04** | no spec, +13.2% |
+| 34,196 | 14.59 | **20.03** | **no spec, +37.3%** |
+
+**The crossover is between 12.3k and 14k tokens**, and turning speculation off
+above it is worth **1.37x at 34k** — more than the entire configuration story,
+at the context length where agents actually run.
+
+The serving policy below only ever considered *concurrency*. Context length is a
+second, independent axis and nobody had looked at it. `pulse serve` now gates on
+it (`PULSE_SPEC_CTX_CUTOFF`, default 12288 tokens). This uses the per-request
+`n_max` patch above: `n_max=0` disables drafting for a single request.
+
 ## Speculation and batching are substitutes, not complements
 
 The drafter buys extra tokens per weight sweep while the sweep is under-occupied.
