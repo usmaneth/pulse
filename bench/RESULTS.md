@@ -1461,3 +1461,57 @@ For a long-context agentic workload the highest-value feature is therefore
 **prompt/prefix caching**, ahead of both drafter quality and KV compression.
 This is exactly what Inco built `StateCache` for - their published cached-replay
 TTFT is 282 ms against 96 s cold. We have measured nothing in this area.
+
+---
+
+# Round 18 - prefix caching: 131.7x, and it was off the whole time
+
+llama.cpp's server has supported prompt caching all along, via `cache_prompt`.
+**Every benchmark in this repository before this round ran with
+`cache_prompt=false`**, which measures the cold path exclusively. The Pulse proxy
+never set the flag either.
+
+Measured at 16384-token context (`bench/cache.py`), single slot, v1 drafter:
+
+| scenario | prefill | decode |
+|---|---|---|
+| 1. cold (`cache_prompt=false`) | **22321.6 ms** | 7.89 t/s |
+| 2. first request, cache on | 168.8 ms | 18.12 t/s |
+| 3. exact replay, cached | 169.4 ms | 17.59 t/s |
+| 4. agentic turn (prefix + new message) | **321.0 ms** | 22.70 t/s |
+
+    exact replay : 131.7x   (22322 ms -> 169 ms)
+    agentic turn :  69.5x   (22322 ms -> 321 ms)
+
+Decode roughly doubles as well (7.89 -> 18-22 t/s), because the slot is no
+longer spending its time re-prefilling.
+
+## Why this matters more than everything else measured here
+
+Round 17 established that a cold 131072-token prefill takes 211.7 s, and that
+256k would be roughly 7 minutes. That framing was right about the cold path and
+wrong about the workload: an agent pays the cold prefill **once**, then every
+subsequent turn reuses the prefix.
+
+So a 256k agentic session looks like:
+
+| | |
+|---|---|
+| first turn (cold prefill) | ~7 minutes, paid once |
+| every later turn | a few hundred ms to first token |
+| decode | 41-60 tok/s with the KV and drafter levers |
+
+That is a usable session. Without the flag it is not.
+
+For comparison, Inco publish 282 ms cached replay against 96 s cold for Splash's
+`StateCache` - the same class of result. We had the equivalent in llama.cpp,
+switched off.
+
+## Consequence for every earlier number in this file
+
+Rounds 1-17 measured cold-path prefill throughout. The decode figures stand
+(they are steady-state), but any time-to-first-token or end-to-end figure in
+those rounds reflects a workload that re-prefills every turn, which is not how
+an agent behaves. `bench/conc.py` also passes `cache_prompt: false` deliberately,
+to isolate decode - that remains correct for its purpose but should not be read
+as end-to-end performance.
