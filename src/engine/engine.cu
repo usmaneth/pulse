@@ -96,6 +96,76 @@ __global__ void k_rope(float* __restrict__ x, int n_head, int head_dim,
     p[i + rope_dim/2] = a*sn + b*cs;
 }
 
+
+// ------------------------------------------------------- KV cache + attention
+// Layout per full-attention layer: K[n_ctx][n_kv_head][head_dim], same for V.
+// Contiguous in head_dim so a warp reads a head's vector coalesced.
+struct KVCache {
+    float* k = nullptr;
+    float* v = nullptr;
+    int n_ctx = 0, n_kv_head = 0, head_dim = 0, n_layer_attn = 0;
+    size_t per_layer_elems() const { return (size_t)n_ctx*n_kv_head*head_dim; }
+    size_t bytes() const { return per_layer_elems()*n_layer_attn*2*sizeof(float); }
+    void alloc(int ctx, int kvh, int hd, int nl) {
+        n_ctx=ctx; n_kv_head=kvh; head_dim=hd; n_layer_attn=nl;
+        CU(cudaMalloc(&k, per_layer_elems()*nl*sizeof(float)));
+        CU(cudaMalloc(&v, per_layer_elems()*nl*sizeof(float)));
+    }
+    __host__ float* k_layer(int li) const { return k + (size_t)li*per_layer_elems(); }
+    __host__ float* v_layer(int li) const { return v + (size_t)li*per_layer_elems(); }
+};
+
+// One block per query head. Online softmax so scores are never materialised:
+// a single pass keeps a running max and running sum, rescaling the accumulator
+// when the max moves. That is what makes long context affordable - memory is
+// O(head_dim), not O(n_kv).
+__global__ __launch_bounds__(256)
+void k_attention(const float* __restrict__ Q,      // [n_head][head_dim]
+                 const float* __restrict__ K,      // [n_ctx][n_kv_head][head_dim]
+                 const float* __restrict__ V,
+                 float* __restrict__ O,            // [n_head][head_dim]
+                 int n_head, int n_kv_head, int head_dim, int n_kv, float scale) {
+    const int h  = blockIdx.x;
+    if (h >= n_head) return;
+    const int kvh = h / (n_head / n_kv_head);      // GQA mapping
+    const int tid = threadIdx.x, nthr = blockDim.x;
+
+    extern __shared__ float sh[];
+    float* sq  = sh;                 // head_dim  - the query
+    float* acc = sh + head_dim;      // head_dim  - running weighted sum of V
+    __shared__ float s_max, s_den, s_red[8];
+
+    for (int i = tid; i < head_dim; i += nthr) { sq[i] = Q[(size_t)h*head_dim+i]; acc[i] = 0.0f; }
+    if (tid == 0) { s_max = -INFINITY; s_den = 0.0f; }
+    __syncthreads();
+
+    for (int t = 0; t < n_kv; ++t) {
+        const float* kp = K + ((size_t)t*n_kv_head + kvh)*head_dim;
+        float dot = 0.0f;
+        for (int i = tid; i < head_dim; i += nthr) dot += sq[i]*kp[i];
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
+        if ((tid & 31) == 0) s_red[tid>>5] = dot;
+        __syncthreads();
+        if (tid == 0) {
+            float sc = 0; for (int i = 0; i < (int)(nthr>>5); ++i) sc += s_red[i];
+            sc *= scale;
+            const float m_new = fmaxf(s_max, sc);
+            const float corr  = __expf(s_max - m_new);      // 0 on the first step
+            const float w     = __expf(sc - m_new);
+            s_den = s_den*corr + w;
+            s_red[0] = corr; s_red[1] = w; s_max = m_new;
+        }
+        __syncthreads();
+        const float corr = s_red[0], w = s_red[1];
+        const float* vp = V + ((size_t)t*n_kv_head + kvh)*head_dim;
+        for (int i = tid; i < head_dim; i += nthr) acc[i] = acc[i]*corr + w*vp[i];
+        __syncthreads();
+    }
+    const float inv = 1.0f / s_den;
+    for (int i = tid; i < head_dim; i += nthr) O[(size_t)h*head_dim+i] = acc[i]*inv;
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -238,6 +308,70 @@ int main(int argc, char** argv) {
         report("rope(mRoPE text path, pos=137)", e/std::max(mag,1e-9), 1e-5);
         report("rope pair-norm preservation",    norm_err,             1e-6);
         cudaFree(d_r);
+    }
+
+    // ---- attention: GQA + online softmax, against a CPU reference
+    {
+        const int n_head = hp.n_head, n_kv_head = hp.n_head_kv, hd = hp.key_len;
+        const int n_kv = 384;
+        const float scale = 1.0f/std::sqrt((float)hd);
+        std::vector<float> hq((size_t)n_head*hd), hk((size_t)n_kv*n_kv_head*hd),
+                           hv((size_t)n_kv*n_kv_head*hd);
+        for (size_t i=0;i<hq.size();++i) hq[i] = sinf(i*0.013f)*0.5f;
+        for (size_t i=0;i<hk.size();++i) hk[i] = cosf(i*0.007f)*0.5f;
+        for (size_t i=0;i<hv.size();++i) hv[i] = sinf(i*0.005f)*0.5f;
+        float *dq,*dk,*dv,*doo;
+        CU(cudaMalloc(&dq,hq.size()*4)); CU(cudaMalloc(&dk,hk.size()*4));
+        CU(cudaMalloc(&dv,hv.size()*4)); CU(cudaMalloc(&doo,hq.size()*4));
+        CU(cudaMemcpy(dq,hq.data(),hq.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dk,hk.data(),hk.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dv,hv.data(),hv.size()*4,cudaMemcpyHostToDevice));
+        const size_t shmem = (size_t)2*hd*sizeof(float);
+        k_attention<<<n_head,256,shmem>>>(dq,dk,dv,doo,n_head,n_kv_head,hd,n_kv,scale);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> got(hq.size());
+        CU(cudaMemcpy(got.data(),doo,hq.size()*4,cudaMemcpyDeviceToHost));
+
+        double worst = 0, mag = 0;
+        std::vector<double> sc(n_kv);
+        for (int h = 0; h < n_head; ++h) {
+            const int kvh = h/(n_head/n_kv_head);
+            double mx = -1e300;
+            for (int t = 0; t < n_kv; ++t) {
+                double d = 0;
+                for (int i = 0; i < hd; ++i)
+                    d += (double)hq[(size_t)h*hd+i]*hk[((size_t)t*n_kv_head+kvh)*hd+i];
+                sc[t] = d*scale; mx = std::max(mx, sc[t]);
+            }
+            double den = 0; for (int t=0;t<n_kv;++t){ sc[t]=std::exp(sc[t]-mx); den+=sc[t]; }
+            for (int i = 0; i < hd; ++i) {
+                double o = 0;
+                for (int t = 0; t < n_kv; ++t) o += sc[t]*hv[((size_t)t*n_kv_head+kvh)*hd+i];
+                o /= den;
+                worst = std::max(worst, std::fabs(got[(size_t)h*hd+i]-o));
+                mag   = std::max(mag, std::fabs(o));
+            }
+        }
+        report("attention GQA 24q/4kv, 384 ctx", worst/std::max(mag,1e-9), 1e-4);
+        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(doo);
+    }
+
+    // ---- KV cache sizing for this architecture
+    {
+        int n_attn = 0; for (int il=0; il<hp.n_layer; ++il) n_attn += m.is_full_attn(il);
+        KVCache kv;
+        const int test_ctx = 4096;
+        kv.alloc(test_ctx, hp.n_head_kv, hp.key_len, n_attn);
+        printf("\nKV cache: %d attention layers x %d ctx x %d kv-heads x %d dim\n",
+               n_attn, test_ctx, hp.n_head_kv, hp.key_len);
+        printf("  f32 at %d ctx : %.2f GB   (%.1f MB per 1k tokens)\n",
+               test_ctx, kv.bytes()/1e9, kv.bytes()/1e6/(test_ctx/1024.0));
+        const double per_tok = (double)kv.bytes()/test_ctx;
+        printf("  projected f32 : %.1f GB at 32k, %.1f GB at 256k\n",
+               per_tok*32768/1e9, per_tok*262144/1e9);
+        printf("  as f16        : %.1f GB at 32k, %.1f GB at 256k\n",
+               per_tok*32768/2e9, per_tok*262144/2e9);
+        cudaFree(kv.k); cudaFree(kv.v);
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
