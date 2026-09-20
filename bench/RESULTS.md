@@ -3242,5 +3242,26 @@ also reframes the effort estimate: the remaining work on the GDN side is not
 (four iterations to reach 96% of a mature implementation, never passing it)
 applies to it as well.
 
+## Ruling out the easy explanations
+
+Before accepting that the algorithms differ, five reconstructions were tried
+against `new_state-0`, all from a verified-zero prior state:
+
+| reconstruction | worst rel |
+|---|---|
+| token 0 only | 7.498e-01 |
+| token 1 only | 1.015e+00 |
+| token 0 then 1 (sequential) | 8.866e-01 |
+| token 1 then 0 (reversed) | 7.578e-01 |
+| gates indexed `[head][token]` instead of `[token][head]` | 8.859e-01 |
+
+None match. `k` is unit-norm at both token positions (1.0000 and 1.0000), so the
+L2 normalisation is not the difference either.
+
+That rules out a transposed gate index, a token-order mistake, and a missing
+normalisation - the three cheap explanations - and leaves the conclusion that the
+chunked path computes a genuinely different intermediate `new_state`, not the
+same state by another route.
+
 Recorded because "it works for one token, so N tokens is a loop" is exactly the
 assumption this whole project keeps finding to be false.
