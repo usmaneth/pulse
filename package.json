@@ -1,7 +1,7 @@
 {
   "name": "pulse",
   "version": "1.0.0",
-  "description": "Ultra-optimized, model-specialized inference engine for NVIDIA Blackwell (DGX Spark / GB10 / RTX 5090)",
+  "description": "Speculative-decoding benchmark suite and tuning harness for NVIDIA DGX Spark (GB10), plus a Jev-routed proxy over llama.cpp",
   "type": "module",
   "main": "dist/server/index.js",
   "bin": {
@@ -10,8 +10,8 @@
   "scripts": {
     "build": "tsc && make",
     "serve": "node --env-file=.env.local dist/server/index.js",
-    "bench": "node --env-file=.env.local dist/bench/bench.js",
-    "test:jev": "node --env-file=.env.local dist/jev/test.js"
+    "test:jev": "node --env-file=.env.local dist/jev/test.js",
+    "bench": "python3 bench/sweep.py"
   },
   "dependencies": {
     "ai": "^7.0.107"

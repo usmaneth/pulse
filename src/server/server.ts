@@ -16,7 +16,7 @@ export class PulseServer {
   private totalRequests = 0;
   private totalTokensGenerated = 0;
   private activeStreams = 0;
-  private peakTokensPerSec = 141.28;
+  private peakTokensPerSec = 0; // measured at runtime; no seeded value
   private lastJevDecision: SpeculationDecision | null = null;
 
   constructor(config: Partial<ServerConfig> = {}) {
@@ -51,26 +51,12 @@ export class PulseServer {
             JSON.stringify({
               engine: 'pulse',
               version: '1.0.0',
-              target_device: 'NVIDIA GB10 (48 SMs, sm_121, 128 GB LPDDR5X)',
-              tensor_parallel: {
-                enabled: true,
-                world_size: 2,
-                mode: 'DUAL_SPARK_SHARDED',
-                fabric: '400 Gbps QSFP RoCEv2 RDMA (85us ping)',
-                cluster_nodes: ['spark1 (10.99.0.1)', 'spark2 (10.99.0.2)'],
-                sharded_working_set_gb: 3.35,
-                target_forward_sweep_ms: 17.75,
-                fused_cuda_graph_step_ms: 17.87,
-                measured_tp2_throughput_toks_sec: 279.81,
-                speedup_vs_unspec: '9.42x',
-                native_cuda_graph_engine_active: this.nativeEngine.isAvailable,
-              },
+              target_device: 'NVIDIA GB10 (48 SMs, sm_121, 128 GB unified LPDDR5X)',
+              role: 'HTTP proxy with Jev speculation-window routing in front of llama.cpp; not a standalone engine',
               active_streams: this.activeStreams,
               total_requests: this.totalRequests,
               total_tokens_generated: this.totalTokensGenerated,
               peak_decode_toks_per_sec: this.peakTokensPerSec,
-              paged_kv_pool_capacity_pages: 2621440,
-              gdn_state_snapshots_active: 14,
               jev_system_one_decisions_enabled: true,
               last_jev_decision: this.lastJevDecision,
             }, null, 2)

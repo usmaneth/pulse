@@ -9,9 +9,10 @@ using namespace pulse;
 
 int main(int argc, char** argv) {
     std::cout << "=======================================================\n";
-    std::cout << " PULSE: Hardware-Specialized Blackwell Inference Engine\n";
+    std::cout << " PULSE kernel microbenchmarks - NVIDIA Blackwell (GB10, sm_121)\n";
     std::cout << " Target Silicon: NVIDIA GB10 (sm_121, 128GB LPDDR5X)\n";
-    std::cout << " Dynamic Multi-Format Kernel Dispatch Engine\n";
+    std::cout << " NOT an inference engine: no model weights are loaded here.\n"
+              << " Real decode numbers come from bench/sweep.py. See bench/RESULTS.md.\n";
     std::cout << "=======================================================\n\n";
 
     std::cout << "[1/4] Initializing 128GB Unified Memory Governor...\n";
@@ -46,38 +47,36 @@ int main(int argc, char** argv) {
     cudaStreamDestroy(test_stream);
 
     // 3. Dense 27B Benchmark (Ternary PQ2_0 with Hadamard)
-    std::cout << "\n[3/4] Benchmarking Mode A: Dense 27B Decode (Ternary PQ2_0, 6.70 GB sweep)...\n";
+    std::cout << "\n[3/4] Kernel dispatch microbenchmark A: PQ2_0 ternary GEMV + scan (toy graph, no weights)...\n";
     SpeculativeEngine engine_dense(ModelFormat::PQ2_0_TERNARY, ModelArchitecture::DENSE_27B, 5);
     engine_dense.initialize();
     std::cout << "  - Active Kernel: " << engine_dense.get_active_kernel_name() << "\n";
 
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Step | Draft K | Accepted | Step Time | Net Rate\n";
-    std::cout << "-----+---------+----------+-----------+----------\n";
+    std::cout << "Step | Draft K | Accepted | Dispatch Time (real cudaEvent)\n";
+    std::cout << "-----+---------+----------+---------------------------\n";
     for (int step = 1; step <= 5; ++step) {
         SpeculativeStepResult res = engine_dense.step_pipelined(5);
         std::cout << std::setw(4) << step << " | "
                   << std::setw(7) << res.draft_tokens_count << " | "
                   << std::setw(8) << res.accepted_tokens_count << " | "
-                  << std::setw(7) << res.step_wall_ms << " ms | "
-                  << std::setw(7) << (res.accepted_tokens_count / (res.step_wall_ms / 1000.0)) << " tok/s\n";
+                  << std::setw(7) << res.step_wall_ms << " ms\n";
     }
 
     // 4. Sparse MoE 35B Benchmark (Blackwell NVFP4, 1.68 GB active sweep)
-    std::cout << "\n[4/4] Benchmarking Mode B: Sparse MoE 35B Decode (Blackwell NVFP4, 1.68 GB active sweep)...\n";
+    std::cout << "\n[4/4] Kernel dispatch microbenchmark B: NVFP4 GEMV + scan (toy graph, no weights)...\n";
     SpeculativeEngine engine_moe(ModelFormat::NVFP4, ModelArchitecture::SPARSE_MOE_35B, 5);
     engine_moe.initialize();
     std::cout << "  - Active Kernel: " << engine_moe.get_active_kernel_name() << "\n";
 
-    std::cout << "Step | Draft K | Accepted | Step Time | Net Rate\n";
-    std::cout << "-----+---------+----------+-----------+----------\n";
+    std::cout << "Step | Draft K | Accepted | Dispatch Time (real cudaEvent)\n";
+    std::cout << "-----+---------+----------+---------------------------\n";
     for (int step = 1; step <= 5; ++step) {
         SpeculativeStepResult res = engine_moe.step_pipelined(5);
         std::cout << std::setw(4) << step << " | "
                   << std::setw(7) << res.draft_tokens_count << " | "
                   << std::setw(8) << res.accepted_tokens_count << " | "
-                  << std::setw(7) << res.step_wall_ms << " ms | "
-                  << std::setw(7) << (res.accepted_tokens_count / (res.step_wall_ms / 1000.0)) << " tok/s\n";
+                  << std::setw(7) << res.step_wall_ms << " ms\n";
     }
 
     std::cout << "=======================================================\n";

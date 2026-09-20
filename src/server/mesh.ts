@@ -83,12 +83,8 @@ export class DualSparkMeshRouter {
                   total_requests: n.totalRequests,
                   last_latency_ms: n.lastLatencyMs,
                 })),
-                cluster_metrics: {
-                  total_memory_gb: 256,
-                  kv_pool_capacity_tokens: 5242880,
-                  peak_aggregate_toks_sec: 990.4,
-                  max_concurrent_subagents_32k: 32,
-                },
+                // cluster_metrics removed: aggregate throughput and subagent capacity
+                // were never measured. Measured concurrency saturates at ~66 tok/s aggregate.
               },
               null,
               2

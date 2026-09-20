@@ -61,7 +61,8 @@ export class JevDecisionClient {
     consecutiveRejections?: number;
   }): Promise<SpeculationDecision> {
     const snippet = state.promptSnippet || '';
-    // High-repetition / schema / boilerplate -> K=7 (hits 90%+ acceptance, up to 206 tok/s)
+    // High-repetition / schema / boilerplate -> larger K. NOTE: K is capped by the
+    // drafter's block size (v1=4, v2=7); requesting beyond it is a no-op.
     if (/class |interface |dataclass|json|schema|struct |table |enum |typedef |public /i.test(snippet)) {
       return {
         k: 7,
