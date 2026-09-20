@@ -1931,3 +1931,58 @@ fast-path" while running a local regex. `/status` advertised
 `jev_system_one_decisions_enabled: true`. Both now state what actually happens:
 the hot-path K decision is a local heuristic, and the gateway is used for memory
 admission.
+
+---
+
+# Round 25 - the drafter retrain lever, bounded without a retrain
+
+The open item after Round 24 was a drafter retrain: a block >= 7 model holding
+>= 70% acceptance at long context. That is a multi-hour GPU job. It does not need
+to run, because the question it answers can be answered with a drafter that
+already exists.
+
+**v2 is that drafter.** It is 1.03 GB against v1's 0.59 GB, and its block size is
+7 against v1's 4. If deeper drafting were the binding constraint, v2 would win.
+
+## Same sweep, both drafters, single stream
+
+`bench/kcurve.py`, 128 tokens, greedy, interleaved repeats, each drafter at its
+own best K. Only rows with a spread under the 3.4% noise floor are quoted.
+
+| workload | v1 best (block 4) | v2 best (block 7) | delta |
+|---|---|---|---|
+| code | **56.43** (K=6, spread 0.6%) | 55.89 (K=6, spread 0.5%) | v1 +1.0% |
+| schema | 51.14 (K=3, spread 0.1%) | **51.66** (K=5, spread 0.5%) | v2 +1.0% |
+| chat | **41.62** (K=6, spread 0.6%) | 39.73 (K=3, spread 0.2%) | **v1 +4.8%** |
+
+**A drafter with 1.75x the weights and 1.75x the block size buys nothing.** Two
+of three workloads are a tie inside noise, and v2 loses chat outright by 4.8%.
+Round 20's serving grid already showed v2 losing under batching at every
+concurrency except 2. It now also fails to win at batch 1.
+
+## Why depth does not pay
+
+Round 12 measured the drafter cost differential at **7.42 ms/GB** on the same
+prompt. The drafter's forward pass is roughly proportional to its weight volume,
+so a deeper drafter pays for its extra depth twice: once in weights streamed per
+step, and again in verify rows, which cost **3.11 ms each**.
+
+A deeper block only wins if acceptance rises enough to cover both. Between v1 and
+v2 it does not. The constraint is the drafter's own execution cost, not the
+ceiling on how many tokens it may propose.
+
+## Conclusion
+
+**Do not run the retrain.** The hypothesis behind it - that a deeper block is
+worth having - is contradicted by the deeper drafter already on disk. A retrain
+would be worth running only against a *cheaper* drafter at equal depth, or one
+whose acceptance at long context is materially higher. Depth alone is measured
+and does not pay.
+
+## Noise, recorded
+
+The first v2 code sweep reported spreads of 46-49% at K=5, 6 and 7, roughly 14x
+the noise floor. Those medians were discarded rather than published. A re-run
+with 2 warmup requests and 6 interleaved repeats gave spreads of 0.5-1.0% at
+K=4, 6 and 7, and those are the quoted figures. Two GPU compute apps were
+resident throughout both sweeps, which is why `pulse doctor` refuses a busy GPU.
