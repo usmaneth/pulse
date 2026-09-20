@@ -1645,6 +1645,55 @@ int main(int argc, char** argv) {
             printf("    --- %d layers checked, worst cosine %.8f at layer %d ---\n",
                    layers_checked, worst_layer_cos, worst_layer);
             report("FULL 64-LAYER SWEEP (worst layer cos)", 1.0-worst_layer_cos, 1e-2);
+
+            // --- final norm + output head, on top of Pulse's own 64-layer result
+            {
+                CU(cudaMemcpy(dx,x.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+                k_rmsnorm<<<1,256>>>(dx,(const float*)m.get("output_norm.weight")->ptr,dh,n,hp.rms_eps);
+                CU(cudaDeviceSynchronize());
+                std::vector<float> rn2(n);
+                CU(cudaMemcpy(rn2.data(),dh,(size_t)n*4,cudaMemcpyDeviceToHost));
+                std::vector<float> ref_rn;
+                if (load_ref("result_norm", ref_rn) && (int)ref_rn.size()==n) {
+                    double cn=0,ga2=0,ra2=0;
+                    for (int i=0;i<n;++i){ cn+=(double)rn2[i]*ref_rn[i];
+                        ga2+=(double)rn2[i]*rn2[i]; ra2+=(double)ref_rn[i]*ref_rn[i]; }
+                    printf("    final norm vs result_norm  cos %.8f\n",
+                           cn/std::sqrt(std::max(ga2*ra2,1e-30)));
+                }
+                const DevTensor* ow2 = m.get("output.weight");
+                const int nv2 = (int)ow2->ne[1];
+                float* dlog; CU(cudaMalloc(&dlog,(size_t)nv2*4));
+                k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dh,S5120,n,HB,hs);
+                CU(cudaDeviceSynchronize());
+                k_matvec_pq2<<<(nv2+7)/8,256>>>((const blk*)ow2->ptr,dh,dlog,n,nv2);
+                CU(cudaDeviceSynchronize());
+                std::vector<float> lg(nv2);
+                CU(cudaMemcpy(lg.data(),dlog,(size_t)nv2*4,cudaMemcpyDeviceToHost));
+                std::vector<float> ref_lg;
+                if (load_ref("result_output", ref_lg) && (int)ref_lg.size()==nv2) {
+                    int ag=0, ar=0;
+                    for (int i=0;i<nv2;++i){ if (lg[i]>lg[ag]) ag=i; if (ref_lg[i]>ref_lg[ar]) ar=i; }
+                    std::vector<int> ig(nv2), ir(nv2);
+                    for (int i=0;i<nv2;++i){ ig[i]=i; ir[i]=i; }
+                    std::partial_sort(ig.begin(),ig.begin()+10,ig.end(),
+                        [&](int a,int b){ return lg[a]>lg[b]; });
+                    std::partial_sort(ir.begin(),ir.begin()+10,ir.end(),
+                        [&](int a,int b){ return ref_lg[a]>ref_lg[b]; });
+                    int agree=0; for (int i=0;i<10;++i) agree += (ig[i]==ir[i]);
+                    double cn=0,ga2=0,ra2=0;
+                    for (int i=0;i<nv2;++i){ cn+=(double)lg[i]*ref_lg[i];
+                        ga2+=(double)lg[i]*lg[i]; ra2+=(double)ref_lg[i]*ref_lg[i]; }
+                    printf("\n    ===== END-TO-END: embedding -> 64 layers -> head =====\n");
+                    printf("    argmax   pulse %d (%.4f)   llama.cpp %d (%.4f)   %s\n",
+                           ag, lg[ag], ar, ref_lg[ar], ag==ar?"MATCH":"DIFFER");
+                    printf("    top-10 ranking agreement : %d/10\n", agree);
+                    printf("    logit cosine             : %.8f\n",
+                           cn/std::sqrt(std::max(ga2*ra2,1e-30)));
+                    report("END-TO-END logits vs llama.cpp", ag==ar ? 0.0 : 1.0, 0.5);
+                }
+                cudaFree(dlog);
+            }
             cudaFree(dx);cudaFree(dh);cudaFree(dt);cudaFree(dbig);cudaFree(dsmall);
             cudaFree(dg);cudaFree(du);cudaFree(dfw);cudaFree(dgate);
             if(S5120)cudaFree(S5120); if(S6144)cudaFree(S6144); if(S17408)cudaFree(S17408);

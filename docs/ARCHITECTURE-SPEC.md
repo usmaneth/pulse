@@ -264,8 +264,29 @@ composition. Every one was caught the same way:
 
 ---
 
+## Status: the forward pass is complete and validated
+
+Pulse runs this model end to end and predicts the same token llama.cpp does:
+
+```
+embedding -> 64 layers -> final norm -> output head
+
+argmax   pulse 198 (8.6358)   llama.cpp 198 (8.6142)   MATCH
+top-10 ranking agreement : 10/10
+logit cosine             : 0.99999318
+worst per-layer cosine   : 0.99997288 (layer 62 of 64)
+```
+
+The sweep carries Pulse's own residual stream through all 64 layers and never
+re-seeds from the reference. **Error does not accumulate** - layer 32
+(0.99999704) is tighter than layer 2 (0.99999283).
+
 ## Open items
 
-- **Full 64-layer loop.** Every component validated; not yet composed end to end.
+- **>1 token.** Q, K, the q/k norms and RoPE all cancel at a single token
+  (softmax over one element), so they are unit-validated but not exercised in
+  composition. A two-token run closes that.
+- **Multi-token GDN.** The recurrence is validated from a zero state. Carrying
+  state across tokens, and the conv1d window shifting, need a longer run.
 - **Attention output projection + gate.** Mapping confirmed; projection not yet
   checked against `attn_output`.
