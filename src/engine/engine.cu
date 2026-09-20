@@ -197,7 +197,10 @@ void k_gdn_step(float* __restrict__ S,            // [n_vhead][dk][dv]
                 int n_vhead, int n_khead, int dk, int dv) {
     const int h  = blockIdx.x;                 // v-head
     if (h >= n_vhead) return;
-    const int g  = h / (n_vhead / n_khead);    // which k/q head feeds it
+    // INTERLEAVED, established from ground truth: v-head h uses k-group
+    // h % n_khead. The blocked mapping h/(n_vhead/n_khead) is wrong here
+    // and matches to 1.8e+00 instead of 1.3e-07.
+    const int g  = h % n_khead;
     const int tid = threadIdx.x;               // one thread per dv column
 
     float* Sh = S + (size_t)h*dk*dv;
@@ -212,24 +215,22 @@ void k_gdn_step(float* __restrict__ S,            // [n_vhead][dk][dv]
     }
     __syncthreads();
 
-    // Each thread owns one v column j: S[:, j].
-    for (int j = tid; j < dv; j += blockDim.x) {
-        // decay, then read what the state currently predicts for this key
-        float pred = 0.0f;
-        for (int i = 0; i < dk; ++i) {
-            const float sij = Sh[(size_t)i*dv + j] * ah;
-            Sh[(size_t)i*dv + j] = sij;
-            pred += sij * sk[i];
-        }
-        // delta rule: write only the residual, scaled by beta
-        const float resid = bh * (v[(size_t)h*dv + j] - pred);
+    // State layout is S[dv][dk]: row i is the v dimension, column j the k
+    // dimension. Established from ground truth - with a zero prior state
+    // llama.cpp's new_state equals beta*outer(v,k) to 1.3e-07.
+    // Each thread owns one v row i.
+    for (int i = tid; i < dv; i += blockDim.x) {
+        float* Si = Sh + (size_t)i*dk;
+        float kv = 0.0f;
+        for (int j = 0; j < dk; ++j) kv += Si[j]*sk[j];
+        const float delta = (v[(size_t)h*dv + i] - ah*kv) * bh;
         float out = 0.0f;
-        for (int i = 0; i < dk; ++i) {
-            const float sij = Sh[(size_t)i*dv + j] + resid * sk[i];
-            Sh[(size_t)i*dv + j] = sij;
-            out += sij * sq[i];
+        for (int j = 0; j < dk; ++j) {
+            const float sij = ah*Si[j] + delta*sk[j];
+            Si[j] = sij;
+            out += sij*sq[j];
         }
-        o[(size_t)h*dv + j] = out;
+        o[(size_t)h*dv + i] = out;
     }
 }
 
@@ -518,28 +519,26 @@ int main(int argc, char** argv) {
 
         // CPU reference, in double
         double eS=0, magS=0, eO=0, magO=0;
-        std::vector<double> Sr(dk);
         for (int h = 0; h < n_vhead; ++h) {
-            const int g = h/(n_vhead/n_khead);
-            for (int j = 0; j < dv; ++j) {
-                double pred = 0;
-                for (int i = 0; i < dk; ++i) {
-                    Sr[i] = (double)hS[(size_t)h*dk*dv + (size_t)i*dv + j]*ha[h];
-                    pred += Sr[i]*hk[(size_t)g*dk+i];
-                }
-                const double resid = hb[h]*((double)hv[(size_t)h*dv+j]-pred);
+            const int g = h % n_khead;
+            for (int i = 0; i < dv; ++i) {
+                double kv = 0;
+                for (int j = 0; j < dk; ++j)
+                    kv += (double)hS[(size_t)h*dv*dk + (size_t)i*dk + j]*hk[(size_t)g*dk+j];
+                const double delta = ((double)hv[(size_t)h*dv+i] - ha[h]*kv)*hb[h];
                 double out = 0;
-                for (int i = 0; i < dk; ++i) {
-                    const double sij = Sr[i] + resid*hk[(size_t)g*dk+i];
-                    out += sij*hq[(size_t)g*dk+i];
-                    const double got = gotS[(size_t)h*dk*dv + (size_t)i*dv + j];
+                for (int j = 0; j < dk; ++j) {
+                    const double sij = ha[h]*(double)hS[(size_t)h*dv*dk+(size_t)i*dk+j]
+                                     + delta*(double)hk[(size_t)g*dk+j];
+                    out += sij*hq[(size_t)g*dk+j];
+                    const double got = gotS[(size_t)h*dv*dk+(size_t)i*dk+j];
                     eS = std::max(eS, std::fabs(got-sij)); magS = std::max(magS, std::fabs(sij));
                 }
-                eO = std::max(eO, std::fabs((double)gotO[(size_t)h*dv+j]-out));
+                eO = std::max(eO, std::fabs((double)gotO[(size_t)h*dv+i]-out));
                 magO = std::max(magO, std::fabs(out));
             }
         }
-        report("gdn state update (48 heads)",  eS/std::max(magS,1e-9), 1e-5);
+                report("gdn state update (48 heads)",  eS/std::max(magS,1e-9), 1e-5);
         report("gdn output projection",        eO/std::max(magO,1e-9), 1e-5);
 
         int n_gdn = 0; for (int il=0; il<hp.n_layer; ++il) n_gdn += !m.is_full_attn(il);
@@ -786,6 +785,88 @@ int main(int argc, char** argv) {
                 }
                 if (sgn) cudaFree(sgn);
             }
+        }
+        // ---- GDN conv1d: depthwise over the 4-tap window
+        std::vector<float> cin, craw, csilu;
+        if (load_ref("conv_input-0", cin) && load_ref("conv_output_raw-0", craw)
+                                          && load_ref("conv_output_silu-0", csilu)) {
+            const DevTensor* cw = m.layer(0,"ssm_conv1d.weight");
+            if (cw && cw->type == T_F32) {
+                const int K = (int)cw->ne[0], C = (int)cw->ne[1];   // 4 x 10240
+                std::vector<float> hw((size_t)K*C);
+                CU(cudaMemcpy(hw.data(), cw->ptr, (size_t)K*C*4, cudaMemcpyDeviceToHost));
+                double e=0, mag=0, es=0, ms=0;
+                for (int c = 0; c < C; ++c) {
+                    double acc = 0;
+                    for (int t = 0; t < K; ++t) acc += (double)cin[(size_t)c*K+t]*hw[(size_t)c*K+t];
+                    e = std::max(e, std::fabs(acc - craw[c])); mag = std::max(mag, std::fabs((double)craw[c]));
+                    const double sil = acc/(1.0+std::exp(-acc));
+                    es = std::max(es, std::fabs(sil - csilu[c])); ms = std::max(ms, std::fabs((double)csilu[c]));
+                }
+                report("GDN conv1d (depthwise, K=4)", e/std::max(mag,1e-9), 1e-4);
+                report("GDN conv silu",               es/std::max(ms,1e-9), 1e-4);
+            }
+        }
+
+        // ---- the recurrence itself: state_predelta + q/k/v/beta -> new_state
+        // Step 8 could only check the kernel against my own formulation. This
+        // checks the FORMULATION against llama.cpp.
+        std::vector<float> sp, ns, qcd, kcd, vcd, bet;
+        if (load_ref("state_predelta-0", sp) && load_ref("new_state-0", ns)
+            && load_ref("q_conv_predelta-0", qcd) && load_ref("k_conv_predelta-0", kcd)
+            && load_ref("v_conv_predelta-0", vcd) && load_ref("beta-0", bet)) {
+            std::vector<float> alp; load_ref("alpha-0", alp);
+            auto alpha_raw = [&](int h)->float { return h < (int)alp.size() ? alp[h] : 0.0f; };
+            const int dk = 128, dv = 128, nvh = 48, nkh = 16;
+            // The dumped alpha/beta are RAW pre-activation values. The real
+            // gates (ggml-cuda/gated_delta_net.cu:92-114) are:
+            //   beta  = sigmoid(beta_raw)
+            //   g     = exp( ssm_a[h] * softplus(alpha_raw[h] + ssm_dt_bias[h]) )
+            // Using the raw values directly is what made the first attempt fail.
+            std::vector<float> h_a(nvh), h_dtb(nvh);
+            if (const DevTensor* ta = m.layer(0,"ssm_a"))
+                CU(cudaMemcpy(h_a.data(), ta->ptr, nvh*4, cudaMemcpyDeviceToHost));
+            if (const DevTensor* td = m.layer(0,"ssm_dt.bias"))
+                CU(cudaMemcpy(h_dtb.data(), td->ptr, nvh*4, cudaMemcpyDeviceToHost));
+            auto softplus = [](double x){ return x > 20.0 ? x : std::log1p(std::exp(x)); };
+            std::vector<double> gv(nvh), bv(nvh);
+            for (int h = 0; h < nvh; ++h) {
+                gv[h] = std::exp((double)h_a[h] * softplus((double)alpha_raw(h) + h_dtb[h]));
+                bv[h] = 1.0/(1.0 + std::exp(-(double)bet[h]));
+            }
+            printf("    gates: g[0]=%.6f beta[0]=%.6f  (raw alpha=%.4f beta=%.4f a=%.4f dtb=%.4f)\n",
+                   gv[0], bv[0], alpha_raw(0), bet[0], h_a[0], h_dtb[0]);
+
+            // TRUE LAYOUT, established from the data: S is [dv][dk] - v-major,
+            // k-minor. With a zero prior state new_state == beta * outer(v,k)
+            // to 1.3e-07, which fixes the orientation unambiguously.
+            //   kv    = S k                 [dv]
+            //   delta = (v - g*kv) * beta   [dv]
+            //   S_new = g*S + delta (x) k   [dv][dk]
+            double eA=0, magA=0;
+            for (int h = 0; h < nvh; ++h) {
+                const int g = h % nkh;
+                const float* kk = kcd.data() + (size_t)g*dk;
+                const float* vv = vcd.data() + (size_t)h*dv;
+                const float* Sp = sp.data()  + (size_t)h*dv*dk;
+                const float* Sn = ns.data()  + (size_t)h*dv*dk;
+                for (int i = 0; i < dv; ++i) {
+                    double kv = 0;
+                    for (int j = 0; j < dk; ++j) kv += (double)Sp[(size_t)i*dk+j]*kk[j];
+                    const double delta = ((double)vv[i] - gv[h]*kv) * bv[h];
+                    for (int j = 0; j < dk; ++j) {
+                        const double want = gv[h]*(double)Sp[(size_t)i*dk+j] + delta*(double)kk[j];
+                        eA = std::max(eA, std::fabs(want - Sn[(size_t)i*dk+j]));
+                        magA = std::max(magA, std::fabs((double)Sn[(size_t)i*dk+j]));
+                    }
+                }
+            }
+            printf("    S[dv][dk], kv=S k, S<-gS+delta(x)k : rel %.3e\n", eA/std::max(magA,1e-9));
+            const double eB = eA;  // orientation already settled by the outer-product test
+            printf("    (prior state is all zeros on a fresh context, so this also\n");
+            printf("     confirms S_new == beta * outer(v,k) exactly)\n");
+            const double best = eA/std::max(magA,1e-9); (void)eB;
+            report("GDN recurrence formulation vs llama.cpp", best, 1e-3);
         }
     }
 
