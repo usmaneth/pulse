@@ -129,11 +129,16 @@ private:
             case GT_ARRAY: {
                 uint32_t et = u32();
                 uint64_t n  = u64();
+                // Keep short numeric arrays verbatim - rope.dimension_sections
+                // and friends are configuration the engine must honour exactly.
+                std::string joined; bool keep = (n <= 8 && et != GT_STRING);
                 std::string first;
                 for (uint64_t i = 0; i < n; ++i) {
                     std::string v = read_value(et);
                     if (i == 0) first = v;
+                    if (keep) { if (i) joined += ", "; joined += v; }
                 }
+                if (keep) return "[" + joined + "]";
                 snprintf(buf,sizeof buf,"[%llu items", (unsigned long long)n);
                 std::string s = buf;
                 if (!first.empty() && first.size() < 24) s += ", first=" + first;

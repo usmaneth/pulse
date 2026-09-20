@@ -70,6 +70,32 @@ __global__ void k_swiglu(const float* __restrict__ g, const float* __restrict__ 
     o[i] = (v / (1.0f + __expf(-v))) * u[i];
 }
 
+
+// ------------------------------------------------------------------- RoPE
+// mRoPE with dimension_sections = [11,11,10,0]. For TEXT-ONLY decoding every
+// section indexes the same position, so this reduces exactly to standard RoPE
+// over the first rope_dim dims of each head; the remaining head dims are left
+// unrotated (rope_dim=64 of key_length=256 here).
+//
+// This matters beyond correctness. llama.cpp refuses K-shifting on any model
+// with n_pos_per_embd() > 1 (src/llama-kv-cache.cpp), which is why
+// --cache-reuse is unavailable on this model and a mid-context edit costs a
+// full re-prefill. An engine that owns RoPE can shift positions itself on the
+// text path, because the multimodal sections collapse to one position.
+__global__ void k_rope(float* __restrict__ x, int n_head, int head_dim,
+                       int rope_dim, int pos, float freq_base) {
+    const int h = blockIdx.x;                 // head
+    const int i = threadIdx.x;                // pair index within rope_dim/2
+    if (h >= n_head || i >= rope_dim/2) return;
+    const float inv = powf(freq_base, -2.0f*i/(float)rope_dim);
+    const float th  = pos * inv;
+    float sn, cs; __sincosf(th, &sn, &cs);
+    float* p = x + (size_t)h*head_dim;
+    const float a = p[i], b = p[i + rope_dim/2];
+    p[i]              = a*cs - b*sn;
+    p[i + rope_dim/2] = a*sn + b*cs;
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -171,6 +197,47 @@ int main(int argc, char** argv) {
             e = std::max(e, std::fabs(got[i]-r)); mag = std::max(mag, std::fabs(r)); }
         report("swiglu", e/std::max(mag,1e-9), 1e-5);
         cudaFree(d_g); cudaFree(d_u); cudaFree(d_o);
+    }
+
+    // ---- RoPE, against a CPU reference, plus a norm-preservation check
+    {
+        const int n_head = hp.n_head, head_dim = hp.key_len;
+        const int rope_dim = 64;               // qwen35.rope.dimension_count
+        const float fb = 1e7f;                 // qwen35.rope.freq_base
+        const int pos = 137;
+        const size_t nel = (size_t)n_head*head_dim;
+        std::vector<float> h0(nel);
+        for (size_t i = 0; i < nel; ++i) h0[i] = sinf(i*0.011f);
+        float* d_r; CU(cudaMalloc(&d_r, nel*4));
+        CU(cudaMemcpy(d_r, h0.data(), nel*4, cudaMemcpyHostToDevice));
+        k_rope<<<n_head, rope_dim/2>>>(d_r, n_head, head_dim, rope_dim, pos, fb);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> got(nel);
+        CU(cudaMemcpy(got.data(), d_r, nel*4, cudaMemcpyDeviceToHost));
+
+        double e = 0, mag = 0, norm_err = 0;
+        for (int h = 0; h < n_head; ++h) {
+            const float* src = h0.data() + (size_t)h*head_dim;
+            const float* dst = got.data() + (size_t)h*head_dim;
+            for (int i = 0; i < rope_dim/2; ++i) {
+                const double inv = std::pow((double)fb, -2.0*i/(double)rope_dim);
+                const double th = pos*inv, cs = std::cos(th), sn = std::sin(th);
+                const double a = src[i], b = src[i+rope_dim/2];
+                const double r0 = a*cs - b*sn, r1 = a*sn + b*cs;
+                e = std::max(e, std::max(std::fabs(dst[i]-r0), std::fabs(dst[i+rope_dim/2]-r1)));
+                mag = std::max(mag, std::max(std::fabs(r0), std::fabs(r1)));
+                // a rotation must preserve the length of each pair
+                const double n_in  = a*a + b*b;
+                const double n_out = (double)dst[i]*dst[i] + (double)dst[i+rope_dim/2]*dst[i+rope_dim/2];
+                norm_err = std::max(norm_err, std::fabs(n_out-n_in)/std::max(n_in,1e-9));
+            }
+            // dims beyond rope_dim must be untouched
+            for (int i = rope_dim; i < head_dim; ++i)
+                e = std::max(e, (double)std::fabs(dst[i]-src[i]));
+        }
+        report("rope(mRoPE text path, pos=137)", e/std::max(mag,1e-9), 1e-5);
+        report("rope pair-norm preservation",    norm_err,             1e-6);
+        cudaFree(d_r);
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
