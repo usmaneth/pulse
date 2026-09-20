@@ -2045,3 +2045,80 @@ in-flight requests. Both signals now run the same graceful shutdown.
 
 `activeStreams` is decremented in a `finally`, and the client-close listener is
 removed there too. Neither leaks.
+
+---
+
+# Round 27 - acceptance collapses with context, and speculation becomes a net loss
+
+Round 25 concluded that deeper drafting does not pay, and named one escape
+hatch: a drafter with materially better acceptance **at long context** would
+still be worth training. That input had never been measured. Measuring it
+changes the serving policy.
+
+## Acceptance decays to zero
+
+`bench/acceptlong.py`, v1 drafter at K=4, warm, prompt cached so prefill is not
+what is being timed. All spreads 0.3-0.7%.
+
+| ctx tokens | acceptance | decode tok/s |
+|---|---|---|
+| 531 | 17.71% | 31.90 |
+| 2,134 | **26.25%** | 37.41 |
+| 8,666 | 18.18% | 29.48 |
+| 16,165 | 6.25% | 20.41 |
+| 34,196 | **0.00%** | 14.41 |
+
+At 34k the drafter proposes 144 tokens per run and **none** are accepted.
+
+## So speculation becomes a net loss
+
+A drafter that is never right still streams its 0.59 GB every step and still
+pays ~3.11 ms per verify row. Comparing K=4 against K=0 on the same prompt
+(`speculative.n_max: 0` disables drafting for one request, which needs the
+per-request n_max patch from Round 24):
+
+| ctx tokens | spec K=4 | no spec | winner | delta |
+|---|---|---|---|---|
+| 2,134 | **38.18** | 27.25 | spec | +40.1% |
+| 8,666 | **29.86** | 25.52 | spec | +17.0% |
+| 10,392 | 25.54 | 24.81 | wash | +2.9% (inside noise) |
+| 12,279 | 24.65 | 24.19 | wash | +1.9% (inside noise) |
+| 14,036 | 21.24 | **24.04** | no spec | +13.2% |
+| 34,196 | 14.59 | **20.03** | no spec | **+37.3%** |
+
+**The crossover is between 12.3k and 14k tokens**, where acceptance falls from
+11.54% to 6.67%.
+
+## This is the largest single-stream lever in the project
+
+Disabling speculation above the crossover is worth **1.37x at 34k**. For
+comparison, the whole configuration story is 1.5-1.6x, and per-request K is
+3.9% on schema traffic. Long context is also exactly where agents live.
+
+The serving policy had only ever considered **concurrency** (drafter below 12
+clients, none above). Context length is a second, independent axis, and nobody
+had looked at it.
+
+## Shipped
+
+`src/server/server.ts` now gates speculation on estimated prompt size, cutoff
+`PULSE_SPEC_CTX_CUTOFF` (default 12288 tokens). Verified end to end through the
+proxy:
+
+| request | K chosen | tok/s |
+|---|---|---|
+| short (~10 tokens) | 4 | 44.74 |
+| medium (~5.5k) | 3 | 29.93 |
+| long (~33k) | **0** | **19.73** |
+
+The long case matches the 20.03 measured directly with drafting off, against
+14.59 with it on.
+
+## Note on Round 25
+
+Round 25 said a retrain is worth running only for a cheaper drafter at equal
+depth, or one with materially better acceptance at long context. The second
+condition is now measured and it is not a marginal gap: acceptance is **zero**
+at 34k. Fixing that is a drafter-quality problem, not a depth problem, which is
+consistent with Round 25's finding that block 7 buys nothing over block 4.
+Disabling speculation past the crossover is the cheaper fix and it ships today.

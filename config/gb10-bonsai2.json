@@ -485,12 +485,93 @@
       "reading": "mid-context divergence is rare, so the case this layer targets is itself uncommon; prefix caching already collects almost all of the win"
     },
     "primitive_micro_benchmark_still_valid": [
-      { "ctx": 512, "save_ms": 94.3, "restore_ms": 28.5, "size_mb": 190.7 },
-      { "ctx": 2048, "save_ms": 142.9, "restore_ms": 48.4, "size_mb": 291.4 },
-      { "ctx": 8192, "save_ms": 288.9, "restore_ms": 90.8, "size_mb": 694.2 }
+      {
+        "ctx": 512,
+        "save_ms": 94.3,
+        "restore_ms": 28.5,
+        "size_mb": 190.7
+      },
+      {
+        "ctx": 2048,
+        "save_ms": 142.9,
+        "restore_ms": 48.4,
+        "size_mb": 291.4
+      },
+      {
+        "ctx": 8192,
+        "save_ms": 288.9,
+        "restore_ms": 90.8,
+        "size_mb": 694.2
+      }
     ],
     "size_model": "157 MB fixed (Gated DeltaNet recurrent state) + 64 KB/token",
     "restore_bandwidth_gbs": 7.6,
     "retention_cost": "157 MB + 64 KB/token per checkpoint; at 256k that is 17.2 GB each"
+  },
+  "speculation_by_context": {
+    "$comment": "Draft acceptance collapses as context grows, so speculation becomes a net loss past a crossover. See bench/RESULTS.md Round 27.",
+    "cutoff_tokens": 12288,
+    "env_override": "PULSE_SPEC_CTX_CUTOFF",
+    "harness": "bench/acceptlong.py",
+    "acceptance_by_context": [
+      {
+        "ctx": 531,
+        "accept_pct": 17.71,
+        "toks": 31.9
+      },
+      {
+        "ctx": 2134,
+        "accept_pct": 26.25,
+        "toks": 37.41
+      },
+      {
+        "ctx": 8666,
+        "accept_pct": 18.18,
+        "toks": 29.48
+      },
+      {
+        "ctx": 16165,
+        "accept_pct": 6.25,
+        "toks": 20.41
+      },
+      {
+        "ctx": 34196,
+        "accept_pct": 0.0,
+        "toks": 14.41
+      }
+    ],
+    "spec_vs_nospec": [
+      {
+        "ctx": 2134,
+        "spec_k4": 38.18,
+        "no_spec": 27.25,
+        "winner": "spec"
+      },
+      {
+        "ctx": 8666,
+        "spec_k4": 29.86,
+        "no_spec": 25.52,
+        "winner": "spec"
+      },
+      {
+        "ctx": 12279,
+        "spec_k4": 24.65,
+        "no_spec": 24.19,
+        "winner": "wash"
+      },
+      {
+        "ctx": 14036,
+        "spec_k4": 21.24,
+        "no_spec": 24.04,
+        "winner": "no_spec"
+      },
+      {
+        "ctx": 34196,
+        "spec_k4": 14.59,
+        "no_spec": 20.03,
+        "winner": "no_spec"
+      }
+    ],
+    "win": "1.37x at 34k context - the largest single-stream lever measured in this project"
   }
 }

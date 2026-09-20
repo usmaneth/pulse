@@ -177,12 +177,39 @@ export class PulseServer {
     const domain = isMath ? 'math' : isCode ? 'code' : 'chat';
 
     const t0 = performance.now();
+    const ckptKeyLength = messages.reduce(
+      (n: number, m: { content?: string }) => n + (m.content?.length ?? 0), 0);
     const kDecision: SpeculationDecision = await this.jev.decideSpeculationK({
       promptSnippet: lastUserMessage,
       taskDomain: domain,
       recentAcceptanceRate: isCode || isMath ? 0.85 : 0.50,
     });
     const jevLatency = performance.now() - t0;
+
+    // CONTEXT GATE. Draft acceptance collapses as context grows on this stack:
+    // measured 26.25% at 2.1k tokens, 11.54% at 12.3k, 6.67% at 14k and 0.00%
+    // at 34k. Past the crossover the drafter streams its weights every step and
+    // gets nothing back, so speculation costs throughput instead of adding it.
+    //
+    //    ctx      spec K=4   no spec    winner
+    //    2,134      38.18     27.25     spec    +40.1%
+    //    8,666      29.86     25.52     spec    +17.0%
+    //   12,279      24.65     24.19     wash (inside the 3.4% noise floor)
+    //   14,036      21.24     24.04     no spec +13.2%
+    //   34,196      14.59     20.03     no spec +37.3%
+    //
+    // Disabling speculation above the crossover is worth 1.37x at 34k, which is
+    // the largest single-stream lever measured in this project. n_max=0 turns
+    // drafting off for one request; it needs the per-request n_max patch.
+    const approxPromptTokens = ckptKeyLength / 3.6;
+    const ctxCutoff = Number(process.env.PULSE_SPEC_CTX_CUTOFF ?? 12288);
+    const longContext = approxPromptTokens > ctxCutoff;
+    if (longContext) {
+      kDecision.k = 0;
+      kDecision.reasoning =
+        `measured (bench/acceptlong.py): ~${Math.round(approxPromptTokens)} tokens is past the ` +
+        `${ctxCutoff}-token crossover where acceptance collapses; speculation disabled`;
+    }
     this.lastJevDecision = kDecision;
 
     // 2. Forward to Live GB10 Inference Engine with client abort propagation
