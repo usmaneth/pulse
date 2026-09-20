@@ -2806,3 +2806,75 @@ The case for this engine remains capability rather than throughput: owning RoPE
 makes text-path position shifting possible, which llama.cpp refuses for any
 model with `n_pos_per_embd() > 1` and which costs a full re-prefill on every
 mid-context edit today.
+
+---
+
+# Round 39 - optimising the engine: 65.9 -> 53.3 ms, and a graph llama.cpp can't build
+
+Round 38 measured the correct-but-unoptimised engine at 65.9 ms against
+llama.cpp's 36.65. Two changes, both measured.
+
+## 1. Device-resident forward pass: 65.9 -> 56.0 ms
+
+The validation sweep copied intermediates to the host between stages and ran the
+whole gated-delta recurrence on the CPU in doubles. Replacing that with
+device-side kernels - `k_conv_silu_pos0`, `k_l2_head`, `k_gdn_gates`,
+`k_gdn_step` (already validated at 9.169e-08), `k_gdn_norm_gate`,
+`k_attn_gate_pos0`, `k_add` - and keeping the residual stream on the GPU:
+
+**65.9 -> 56.0 ms.**
+
+## 2. CUDA graph capture: 56.0 -> 53.3 ms
+
+The pass is ~15 kernels per layer over 64 layers, close to a thousand launches.
+Capturing them into one graph removes the per-launch cost.
+
+**56.0 -> 53.3 ms, 1.05x.**
+
+**This is a capability llama.cpp does not have on this model.** Its CUDA graphs
+are rejected at runtime because Gated DeltaNet nodes fail
+`ggml_cuda_graph_check_compability` - recorded in this file at Round 5, where
+enabling `GGML_CUDA_GRAPHS=ON` measured 61.84 vs 62.40 tok/s, i.e. nothing,
+because the graph was never used. An engine that owns its own launch sequence
+has no such restriction.
+
+Capture required replacing every synchronous `cudaMemcpy` in the loop with
+`cudaMemcpyAsync` on the capture stream; the synchronous form fails capture with
+"operation would make the legacy stream depend on a capturing blocking stream".
+
+## Where it stands
+
+| | ms | effective GB/s |
+|---|---|---|
+| harness (host round-trips, CPU recurrence) | 65.9 | 101.7 |
+| device-resident | 56.0 | 119.7 |
+| **+ CUDA graph** | **53.3** | **125.7** |
+| weight-sweep bound at 176 GB/s | 38.1 | 176 |
+| llama.cpp decode | 36.65 | 183 |
+
+**1.45x slower than llama.cpp**, down from 1.8x.
+
+## The remaining 15 ms, attributed
+
+- **GDN state traffic.** `k_gdn_step` reads and writes the full recurrent state:
+  48 heads x 128 x 128 x 4 B = 3.1 MB per layer, touched twice, over 48 GDN
+  layers = ~600 MB. At 176 GB/s that is **~3.4 ms** and it is real work, not
+  overhead - llama.cpp pays it too.
+- **`k_rmsnorm` launches with one block**, so it uses 1 of 48 SMs, and runs
+  twice per layer (128 times total).
+- **The Hadamard runs 3-4 times per layer** as separate kernels over 5120, 6144
+  and 17408 floats - small transfers, but each is a launch and a full
+  read-modify-write of the activation.
+
+The obvious next steps are fusing the Hadamard into the matvec prologue and
+parallelising the norm across blocks. Both are ordinary kernel engineering
+against a known target.
+
+## What this does not change
+
+Parity is the ceiling, not the goal post. Round 35 measured four matvec
+iterations converging to 176 GB/s against llama.cpp's 183, and the one
+structural freedom an engine has on that op - choosing the memory layout - came
+out 12% worse. Closing the remaining 15 ms lands Pulse at roughly llama.cpp's
+speed. It does not pass it, and nothing measured in this project suggests a
+route that does.
