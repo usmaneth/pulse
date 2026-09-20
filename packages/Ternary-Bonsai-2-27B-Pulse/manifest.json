@@ -3,7 +3,10 @@
   "engine": "pulse",
   "version": "1.0.0",
   "schema_version": 2,
-  "hardware_targets": ["NVIDIA GB10 (sm_121)", "NVIDIA RTX 5090 (sm_120)"],
+  "hardware_targets": [
+    "NVIDIA GB10 (sm_121)",
+    "NVIDIA RTX 5090 (sm_120)"
+  ],
   "target_model": {
     "filename": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
     "architecture": "qwen35",
@@ -24,11 +27,27 @@
     "max_k": 7
   },
   "benchmarks": {
-    "device": "NVIDIA GB10 (48 SMs, 128 GB LPDDR5X)",
-    "single_stream_decode_toks_sec": 141.28,
-    "peak_decode_toks_sec": 206.50,
-    "speculative_acceptance_rate": 0.800,
-    "gdn_state_restore_ms": 0.021,
-    "aggregate_16_subagents_toks_sec": 495.20
-  }
+    "note": "Measured on an idle NVIDIA GB10 with llama-speculative-simple, temperature 0, --ignore-eos, 1854-token code prompt. Nothing here is extrapolated. See https://github.com/usmaneth/pulse/blob/main/bench/RESULTS.md",
+    "device": "NVIDIA GB10 (48 SMs, sm_121, 121.7 GB unified LPDDR5X, CUDA 13.0)",
+    "no_drafter_baseline_toks_sec": 29.7,
+    "best_decode": {
+      "drafter": "v2",
+      "k": 7,
+      "toks_sec": 73.0,
+      "acceptance": 0.6859,
+      "tokens_per_step": 5.81
+    },
+    "best_acceptance": {
+      "drafter": "v1",
+      "k": 3,
+      "toks_sec": 62.98,
+      "acceptance": 0.9018,
+      "tokens_per_step": 3.72
+    },
+    "prefill_toks_sec_at_2756_tokens": 646.2,
+    "aggregate_toks_sec_16_streams": 65.8,
+    "measured_memory_bandwidth_gbs": 184.6,
+    "cost_model": "t_step_ms = 48.3 + 4.47*K (long context fit)"
+  },
+  "corrections": "An earlier manifest claimed 141.28 tok/s single-stream, 206.50 peak, 0.021 ms GDN restore and 495.20 aggregate tok/s across 16 subagents. Those were not measured and have been replaced with measured values."
 }
