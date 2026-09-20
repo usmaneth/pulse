@@ -740,3 +740,69 @@ drafter's own 603 MB weight sweep.
 Together: **100+ tok/s single-stream, with no change to the target model and no
 new target quantization.** That is the whole remaining gap, stated in measured
 quantities.
+
+---
+
+# Round 9 - what the neural drafter costs, and what it is worth
+
+## Where the drafter path time goes
+
+Two profiles at matched draft depth, differenced per step. `ngram-simple` has no
+neural model, so the delta is the dspark drafter path.
+
+| kernel | ngram ms/step | dspark ms/step | delta | launches/step |
+|---|---|---|---|---|
+| `mul_mat_q` (MMQ) | 2.465 | 16.165 | **+13.700** | 24.0 |
+| `gated_delta_net` | 0.376 | 2.745 | +2.369 | 7.5 |
+| `unary_gated_op` | 0.213 | 1.955 | +1.742 | 20.4 |
+| `fwht_cuda_block` | 0.251 | 1.809 | +1.558 | 40.5 |
+
+53% of the overhead is the drafter's own forward pass on the tensor-core MMQ
+path. DSpark is a block-diffusion drafter with its own Gated DeltaNet layers and
+Hadamard transforms - it is a small model doing real work, not a lookup.
+
+(nsys absolute numbers are unreliable on GB10, see Round 6. The composition is
+the usable signal; measured wall delta is 61.14 - 49.88 = 11.26 ms/step.)
+
+## Is the neural drafter worth it? Yes, on real code
+
+Same 5000-char code context for all four:
+
+| drafter | tok/s | accept% | tok/step |
+|---|---|---|---|
+| **dspark (603 MB)** | **64.53** | 72.28% | 3.86 |
+| ngram-simple | 45.41 | 100.00% | 2.75 |
+| ngram-cache | 44.44 | 100.00% | 3.13 |
+| ngram-mod | 26.63 | 0.00% | 1.00 |
+
+1.42x over the best free drafter. Note ngram-simple reaches 100% acceptance but
+only 2.75 tok/step: it proposes only when it has a confident match.
+
+## Stacking drafters: it works, and it is worth +1.8%
+
+`--spec-type` takes a comma-separated list. Round 2 reported that stacking
+"never fired" - that was measured on a 60-token prompt, where an n-gram drafter
+has nothing to look up. With a real context both components engage:
+
+| spec-type | tok/s | accept% | tok/step | ms/step |
+|---|---|---|---|---|
+| draft-dspark | 63.88 | 72.28% | 3.86 | 60.47 |
+| draft-dspark,ngram-simple | 64.45 | 67.14% | 3.66 | 56.79 |
+| **ngram-simple,draft-dspark** | **65.06** | 67.14% | 3.66 | 56.26 |
+| draft-dspark,ngram-cache | 40.18 | 87.42% | 3.53 | 87.78 |
+
+The mechanism is visible: step time falls 60.47 -> 56.26 ms because n-gram drafts
+are free, but tokens per step fall 3.86 -> 3.66 because those free drafts displace
+better dspark ones. Net +1.8%. Real, reproducible, and small - reported as such.
+
+Stacking with `ngram-cache` is strongly negative (-37%).
+
+## Best measured single-stream configuration
+
+`--spec-type ngram-simple,draft-dspark` with the v1 drafter at K=4:
+**65.06 tok/s**, against a 27.54 tok/s no-drafter baseline. 2.36x.
+
+The design curve says 3.66 tok/step should cost ~44 ms/step, and this measures
+56.26. The remaining gap is the drafter's own forward pass, which is the price of
+its acceptance. Closing the gap means a cheaper or deeper drafter, not a runtime
+change - every runtime lever has now been measured and tabulated.
