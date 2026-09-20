@@ -9,76 +9,67 @@
 
 Universal runtimes (llama.cpp, Ollama, vLLM) leave massive performance on the table because they treat all models as generic compute graphs and suffer from CPU driver dispatch latency. **Pulse turns this assumption upside down: the engine is built strictly around the model and the silicon.**
 
-By pairing persistent **CUDA Graphs**, **DFlash 2 parallel block speculation**, **Gated DeltaNet (GDN) recurrent state snapshotting**, and **TypeSafe AI Jev** for sub-second System One decision steering, Pulse delivers **141 to 206 tok/s** on single-stream decode, **sub-3ms prompt replays**, and **495 aggregate tok/s** across 16 subagents on 128GB unified memory.
+It pairs **DFlash 2 block speculative decoding**, **Gated DeltaNet recurrent state snapshotting**, and a **hardware-aware memory plan** for the 128 GB unified LPDDR5X pool.\n\nMeasured single-stream decode on an idle GB10: **66.03 tok/s at 72.86% acceptance** (DSpark v1, K=5), against a 29.7 tok/s no-drafter baseline. Method, raw tables, cost model and negative results are in [bench/RESULTS.md](bench/RESULTS.md). Reaching 100 tok/s needs ~90% acceptance sustained to draft depth 7; that gap is drafter quality, not serving overhead.
 
 ---
 
-## Benchmarks on NVIDIA GB10 (128 GB Unified LPDDR5X)
+## Benchmarks on NVIDIA GB10 — measured
 
-All figures measured directly on hardware: **NVIDIA GB10 (48 SMs, `sm_121`, 128 GB unified LPDDR5X, 273 GB/s peak memory bus)** running `Ternary-Bonsai-2-27B-PQ2_0` (6.70 GB) with its paired DFlash 2 drafter.
+Every figure below was produced by running a binary on the hardware and reading its
+output. Full method, raw tables and negative results: [bench/RESULTS.md](bench/RESULTS.md).
 
-### 1. Single-Stream Speculative Decode Throughput
+Hardware verified via `cudaGetDeviceProperties`: NVIDIA GB10, compute capability 12.1
+(`sm_121`), 48 SMs, 121.7 GB unified LPDDR5X, 256-bit bus, CUDA 13.0.
+
+Method: `llama-speculative-simple`, target `Ternary-Bonsai-2-27B-PQ2_0.gguf` (6.70 GB),
+temperature 0, `-n 200`, `-c 4096`, `-fa on`, **idle GPU**.
+
+### Single-stream decode, drafter comparison
+
+| drafter | size | block | K | tok/s | accept% | tok/step | ms/step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| DSpark v1 | 603 MB | 4 | 3 | 60.92 | 77.60% | 3.33 | 54.62 |
+| DSpark v1 | 603 MB | 4 | 4 | 65.90 | 72.86% | 3.91 | 59.40 |
+| **DSpark v1** | 603 MB | 4 | 5 | **66.03** | 72.86% | 4.89 | 74.11 |
+| DSpark v2 | 1.1 GB | 7 | 6 | 65.75 | 60.34% | 4.62 | 70.28 |
+| Qwen3.8 DSpark | 1008 MB | - | 5 | 64.59 | 63.75% | 4.19 | 64.84 |
+
+Best measured single-stream decode: **66.03 tok/s at 72.86% acceptance**.
+
+### Acceptance decays with draft depth
+
+| K | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| accept% (v2) | 88.78 | 77.85 | 73.30 | 73.53 | 66.45 | 60.34 | 54.08 |
+
+Depth 1 acceptance is excellent. The decay with depth, not bandwidth, is the binding
+constraint on throughput.
+
+### Cost model (fit)
 
 ```
-=================================================================
- NVIDIA GB10 Blackwell Hardware Roofline & Speculative Benchmark
- Working Set: 6.70 GB (Ternary Bonsai 2 27B Weights)
- Target Silicon: NVIDIA GB10 (sm_121, 128 GB Unified LPDDR5X)
-=================================================================
-
-[1/4] Allocating 6.70 GB in Unified LPDDR5X memory...
-[2/4] Measuring sustained memory bandwidth on 6.70 GB weight sweep...
-  • Sweep Latency: 35.49 ms per full model pass
-  • Sustained LPDDR5X Bandwidth: 175.84 GB/s (64.4% of 273 GB/s peak)
-
-[3/4] Measuring CUDA Graph single-unit dispatch latency...
-  • CUDA Graph Single-Unit Step Time: 35.35 ms
+t_step (ms) = 42.0 + 4.36 * K
+tok/s       = (1 + K*a) / (0.042 + 0.00436*K)
 ```
 
-At **35.35 ms per step**, single-stream throughput across speculation windows ($K$) and acceptance rates reaches:
+The 42.0 ms intercept over a 6.70 GB sweep is ~160 GB/s effective, against 184.6 GB/s
+from a pure streaming kernel on the same idle GPU. Serving overhead is already small.
 
-| Speculation Window ($K$) | Acceptance Rate | Accepted Tokens / Step | Single-Stream Throughput | Speedup vs Baseline |
-|:---:|:---:|:---:|:---:|:---:|
-| **K = 4** | 70.0% | 3.80 tokens | **107.5 tok/s** | **3.62x** |
-| **K = 4** | 85.0% | 4.40 tokens | **124.5 tok/s** | **4.19x** |
-| **K = 5** | 75.0% | 4.75 tokens | **134.4 tok/s** | **4.52x** |
-| **K = 5** | **80.0%** | **5.00 tokens** | **141.4 tok/s** | **4.76x** |
-| **K = 5** | **87.1%** *(live prime check)* | **5.35 tokens** | **151.3 tok/s** | **5.09x** |
-| **K = 5** | **91.3%** *(interval merging)* | **5.57 tokens** | **157.4 tok/s** | **5.30x** |
-| **K = 7** | 70.0% | 5.90 tokens | **166.9 tok/s** | **5.62x** |
-| **K = 7** | 80.0% | 6.60 tokens | **186.7 tok/s** | **6.29x** |
-| **K = 7** | **90.0%** *(boilerplate / schema)* | **7.30 tokens** | **206.5 tok/s** | **6.95x** |
+Reaching 100 tok/s requires `K = 3.2 / (a - 0.436)`, i.e. **~90% acceptance sustained to
+depth 7**. That is a drafter-training problem, not a serving problem.
 
-- **Average Speculative Throughput**: **141.28 tok/s**.
-- **Peak Single-Stream Decode**: **206.50 tok/s**.
-- **Cumulative Acceptance Rate**: **80.00% to 87.14%**.
-- **Baseline without speculation (29.7 tok/s)**: **4.75x to 6.95x speedup**.
+### Measured negative results
 
----
-
-### 2. Multi-Slot Subagent Concurrency on 128 GB Unified Memory
-
-Because the DGX Spark provides 128 GB of unified LPDDR5X as standard, Pulse reserves 16 GB for model weights and allocates an enormous **80 GB for 2.62 million KV pages** alongside 4 GB for GDN recurrent snapshots. 
-
-| Workload Configuration | Concurrent Slots | Context Length | Aggregate tok/s | Acceptance Rate | Speedup vs Baseline |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **Math (GSM8K, K=5)** | 1 slot | 16K ctx | **139.69 tok/s** | 80.0% | 4.70x |
-| **Code (Python AST, K=5)** | 1 slot | 16K ctx | **131.84 tok/s** | 75.2% | 4.44x |
-| **Agent Fanout (4 subagents)** | 4 slots | 32K ctx | **268.40 tok/s** | 68.5% | 9.04x |
-| **Agent Fanout (8 subagents)** | 8 slots | 32K ctx | **384.10 tok/s** | 62.0% | 12.93x |
-| **Agent Fanout (16 subagents)** | **16 slots** | 32K ctx | **495.20 tok/s** | 58.4% | **16.67x** |
-
-At 16 concurrent subagents, Pulse sustains **nearly 500 aggregate tokens per second** with zero memory eviction or swap thrashing.
-
----
-
-### 3. Prefix Cache Reuse: Cold Prefill vs. GDN State Restore
-
-- **Cold 32K Token Prefill Replay**: 35,000 to 90,000 ms.
-- **GDN Recurrent Snapshot Restore**: **0.02 ms** (measured on device).
-- **Effective Turn-2 TTFT Speedup**: **> 15,000x**.
-
----
+- **CUDA Graphs give no speedup here.** Rebuilt with `-DGGML_CUDA_GRAPHS=ON`
+  (confirmed in `CMakeCache.txt`): 61.84 tok/s vs 62.40 tok/s stock, with identical
+  accept counters. They are disabled at runtime because Bonsai 2's Gated DeltaNet
+  recurrent nodes fail `ggml_cuda_graph_check_compability`.
+- **The smaller PTQ1_0 target is slower** under speculation: 51.73 vs 65.96 tok/s,
+  because batched verify runs at prompt-processing speed.
+- **N-gram stacking did not engage** on a short prompt; counters were byte-identical
+  to the drafter alone. Untested rather than disproven.
+- **GPU contention dominates measurement error.** The same streaming kernel measured
+  33.79-150.33 ms across runs depending on co-resident processes.
 
 ## Architectural Pillars
 
@@ -124,7 +115,7 @@ Standard engines only cache the attention KV cache. On turn 2 of a coding conver
 
 Pulse implements a dedicated **GdnStateCache**:
 - Each layer's $128 \times 128$ recurrent state matrix is snapshotted at prompt prefix boundaries (3.9 MB total).
-- On turn 2, Pulse restores the recurrent state via peer device memory in **0.02 ms**.
+- On turn 2, Pulse restores the recurrent state with a device-to-device copy. Measured\n  copy time for the 3.9 MB snapshot is well under a millisecond, but note this is a\n  memcpy benchmark: it has not yet been compared against a real prefill replay of the\n  same prefix, so no speedup ratio is claimed here.
 - The agent starts streaming output immediately without paying repeated prefill penalties.
 
 ### 3. Hadamard Invariant Restoration (PR #210)
@@ -148,9 +139,9 @@ To eliminate configuration traps and guarantee mathematical alignment, official 
 
 | Repository on Hugging Face | Architecture & Precision | Download Size | Verified Throughput |
 |---|---|:---:|:---:|
-| [**`asimfiles/Ternary-Bonsai-2-27B-Pulse`**](https://huggingface.co/asimfiles/Ternary-Bonsai-2-27B-Pulse) | 1.76-bit Ternary (`PQ2_0`) + DSpark v2 Draft | **7.7 GB** | **141.3 - 206.5 tok/s** |
-| **`asimfiles/Qwen3.6-35B-A3B-Pulse`** | Sparse MoE 35B (3B active) + DFlash 2 Draft | **18.5 GB** | **180.0 - 240.0+ tok/s** |
-| **`asimfiles/Qwen3.8-27B-Pulse`** | Dense NVFP4 + DFlash 2 Draft | **16.2 GB** | **40.0 - 52.0 tok/s** |
+| [**`asimfiles/Ternary-Bonsai-2-27B-Pulse`**](https://huggingface.co/asimfiles/Ternary-Bonsai-2-27B-Pulse) | 1.76-bit Ternary (`PQ2_0`) + DSpark v1/v2 drafts | **7.7 GB** | **66.03 tok/s measured** |
+| `asimfiles/Qwen3.6-35B-A3B-Pulse` | Sparse MoE 35B (3B active) + DFlash 2 draft | 18.5 GB | not yet benchmarked |
+| `asimfiles/Qwen3.8-27B-Pulse` | Dense NVFP4 + DFlash 2 draft | 16.2 GB | not yet benchmarked |
 
 ---
 
