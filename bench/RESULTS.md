@@ -1388,12 +1388,15 @@ not - and would need 65 GB of KV regardless.
 Measured with `llama-batched-bench` in a **single process** (model resident, so
 no cold-start confound), `-c 200000 -b 131072` fixed across all points:
 
-| context | predicted x0.87 | measured | ratio |
-|---|---|---|---|
-| 16384 | 24.2 | **24.26** | 1.00 |
-| 65536 | 17.1 | **16.50** | 0.97 |
+| context | step reads | predicted x0.87 | measured | ratio |
+|---|---|---|---|---|
+| 16384 | 7.77 GB | 24.17 | **24.26** | 1.00 |
+| 65536 | 10.99 GB | 17.09 | **16.50** | 0.97 |
+| 131072 | 15.29 GB | 12.29 | **10.43** | 0.85 |
 
-Two independent points within 3%. The model is trustworthy for projection.
+Three independent points. Efficiency drifts down slightly at extreme context
+(1.00 -> 0.97 -> 0.85), so projections beyond 128k should use ~0.80 rather
+than 0.87.
 
 ## Below ~16k, context does not resolve
 
@@ -1416,12 +1419,18 @@ At 256k a step must read 6.70 GB of weights **plus 17.18 GB of KV** = 23.88 GB,
 which is 110.6 ms at 216 GB/s, i.e. **7.9 tok/s** after the software factor.
 Speculation amortises the whole read - weights and KV alike:
 
+Using the observed efficiency drift (~0.80 at this scale) rather than 0.87:
+
 | configuration | tok/s at 256k |
 |---|---|
-| no drafter | 7.9 |
-| 5.74 tok/step (block 7 @ 69% acceptance) | 45 |
-| 6.95 tok/step (block 7 @ 85%) | 55 |
-| **5.74 tok/step + 6x KV compression** | **113** |
+| no drafter | 7.2 |
+| 5.74 tok/step (block 7 @ 69% acceptance) | 41 |
+| 6.95 tok/step (block 7 @ 85%) | 50 |
+| **5.74 tok/step + 6x KV compression** | **~110** |
+
+**Path A does not reliably clear 50-70 tok/s at 256k.** Even at 85% acceptance
+it lands at 50, the very bottom of the range. KV compression is not an optional
+optimisation for that target - it is required.
 
 **Path A** (drafter only) lands at 45-55 tok/s and requires holding >=70%
 acceptance at 256k. Acceptance currently *falls* with context (74.59% at 1.5k,
@@ -1434,3 +1443,21 @@ correctly found KV compression worth approximately nothing.
 
 This supersedes the earlier dismissal of TurboQuant-class KV compression. That
 dismissal was right for <=8k and wrong for long context.
+
+## Prefill dominates the 256k user experience
+
+From the same sweep:
+
+| context | prefill t/s | time to first token |
+|---|---|---|
+| 16384 | 669.6 | 24.5 s |
+| 65536 | 769.5 | 85.2 s |
+| 131072 | 619.1 | **211.7 s** |
+
+At 131072 tokens a cold prefill takes **3.5 minutes**; 256k would be roughly
+**7 minutes**. Decode throughput is close to irrelevant beside that.
+
+For a long-context agentic workload the highest-value feature is therefore
+**prompt/prefix caching**, ahead of both drafter quality and KV compression.
+This is exactly what Inco built `StateCache` for - their published cached-replay
+TTFT is 282 ms against 96 s cold. We have measured nothing in this area.
