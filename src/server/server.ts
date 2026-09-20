@@ -224,12 +224,25 @@ export class PulseServer {
         this.lastCheckpointRestore = { chars: restored.text.length, bytes: restored.bytes };
       }
 
-      const backendResponse = await fetch(`${this.config.backendUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(backendPayload),
-        signal: abortController.signal,
-      });
+      // Bound how long we wait for the backend to respond at all. This guards
+      // time-to-headers, not total duration: a cold 131k prefill legitimately
+      // takes 211.7 s on this hardware, and a long stream may run far longer.
+      // The timer is cleared the moment headers arrive.
+      const ttfbTimer = setTimeout(
+        () => abortController.abort(),
+        Number(process.env.PULSE_BACKEND_TIMEOUT_MS ?? 600_000),
+      );
+      let backendResponse: Response;
+      try {
+        backendResponse = await fetch(`${this.config.backendUrl}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(backendPayload),
+          signal: abortController.signal,
+        });
+      } finally {
+        clearTimeout(ttfbTimer);
+      }
 
       if (!backendResponse.ok) {
         const errorText = await backendResponse.text();
@@ -256,12 +269,47 @@ export class PulseServer {
         }
 
         const decoder = new TextDecoder();
+        let streamedTokens = 0;
+        let eventTally = 0;
+        let tail = '';
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           const chunkStr = decoder.decode(value, { stream: true });
-          res.write(chunkStr);
+
+          // Honour backpressure. Ignoring the return value of write() lets a
+          // slow client grow the socket buffer without bound.
+          if (!res.write(chunkStr)) {
+            await new Promise<void>((resolve) => res.once('drain', resolve));
+          }
+
+          // Account for streamed output. This branch previously updated neither
+          // totalTokensGenerated nor peakTokensPerSec, so /status silently
+          // ignored every streaming request.
+          tail += chunkStr;
+          const lines = tail.split('\n');
+          tail = lines.pop() ?? '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ') || line.includes('[DONE]')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6)) as Record<string, any>;
+              // Counting SSE events undercounts badly: with speculation accepted
+              // a chunk carries every token from that step, so a 48-token reply
+              // arrives in ~6 events. llama.cpp emits no `usage` object either.
+              // The final chunk's timings.predicted_n is the authoritative count;
+              // the event tally is only a fallback if timings never arrive.
+              if (ev?.choices?.[0]?.delta?.content) eventTally++;
+              const t = ev?.timings as Record<string, number> | undefined;
+              if (t?.predicted_per_second && t.predicted_per_second > this.peakTokensPerSec) {
+                this.peakTokensPerSec = t.predicted_per_second;
+              }
+              if (typeof t?.predicted_n === 'number') streamedTokens = t.predicted_n;
+            } catch {
+              // a partial or non-JSON SSE line is not worth failing the stream over
+            }
+          }
         }
+        this.totalTokensGenerated += streamedTokens || eventTally;
         res.end();
         // Checkpoint the slot now that it holds this full context, so a later
         // turn that edits earlier text can restore instead of re-prefilling.
@@ -283,7 +331,10 @@ export class PulseServer {
           measured_toks_per_sec: toksSec,
           draft_acceptance_rate: timings.draft_n ? (timings.draft_n_accepted / timings.draft_n) : null,
           device: 'NVIDIA GB10 (sm_121, 128GB LPDDR5X)',
-          tensor_parallel_world_size: 2,
+          // `tensor_parallel_world_size: 2` used to be reported here. This is a
+          // single GB10 running a single llama.cpp process. There is no tensor
+          // parallelism and no second rank. The field was never measured and is
+          // removed rather than corrected, because nothing here is parallel.
         };
         void this.checkpoints.save(ckptKey).catch(() => null);
 
@@ -310,10 +361,23 @@ export class PulseServer {
   }
 
   private readRequestBody(req: http.IncomingMessage): Promise<string> {
+    // Cap the body. Long-context requests are genuinely large (1M tokens of
+    // text is a few MB), so the default is generous, but unbounded string
+    // concatenation from an untrusted client is not acceptable in a server.
+    const limit = Number(process.env.PULSE_MAX_BODY_BYTES ?? 268_435_456);
     return new Promise((resolve, reject) => {
-      let data = '';
-      req.on('data', (chunk) => (data += chunk));
-      req.on('end', () => resolve(data));
+      const chunks: Buffer[] = [];
+      let size = 0;
+      req.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > limit) {
+          reject(new Error(`request body exceeds PULSE_MAX_BODY_BYTES (${limit})`));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
       req.on('error', reject);
     });
   }

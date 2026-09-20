@@ -1986,3 +1986,62 @@ the noise floor. Those medians were discarded rather than published. A re-run
 with 2 warmup requests and 6 interleaved repeats gave spreads of 0.5-1.0% at
 K=4, 6 and 7, and those are the quoted figures. Two GPU compute apps were
 resident throughout both sweeps, which is why `pulse doctor` refuses a busy GPU.
+
+---
+
+# Round 26 - production-readiness audit of the proxy
+
+"Production ready" is a separate claim from throughput, and it had not been
+audited. Six defects, all fixed.
+
+## 1. A fabricated field in every API response
+
+`pulse_meta` reported `tensor_parallel_world_size: 2` on every non-streaming
+request. This is a single GB10 running a single llama.cpp process. There is no
+tensor parallelism and no second rank. The field was never measured. It is
+removed rather than corrected, because nothing here is parallel.
+
+## 2. Streaming traffic was never counted
+
+`totalTokensGenerated` and `peakTokensPerSec` were updated only on the
+non-streaming branch. Agent traffic streams, so `/status` silently ignored
+almost all real load and reported a peak throughput drawn from a minority of
+requests.
+
+The fix needed a second correction. Counting SSE events undercounts badly:
+**with speculation accepted, one chunk carries every token from that step**, so
+a 48-token reply arrives in 6 events - an 8x undercount. llama.cpp emits no
+`usage` object either (0 of 48 events carried one). The authoritative count is
+`timings.predicted_n` on the final chunk.
+
+Verified: backend `predicted_n` = 48, `/status` delta = 48.
+
+## 3. No backpressure on the streamed response
+
+`res.write()`'s return value was discarded, so a slow client could grow the
+socket buffer without bound. The loop now waits for `drain`.
+
+## 4. No timeout on the backend request
+
+A hung backend held the client connection forever. There is now a
+time-to-headers timeout (`PULSE_BACKEND_TIMEOUT_MS`, default 600 s), cleared the
+moment headers arrive. It deliberately does **not** bound total duration: a cold
+131k prefill legitimately takes 211.7 s and a long stream runs longer.
+
+## 5. Unbounded request body
+
+`readRequestBody` concatenated an untrusted client's body into a string with no
+limit. Now capped by `PULSE_MAX_BODY_BYTES` (default 256 MB, generous because
+long-context requests are genuinely large), and it buffers `Buffer` chunks
+instead of doing string concatenation per chunk.
+
+## 6. SIGTERM was not handled
+
+Only SIGINT was. SIGTERM is what systemd, docker and kubernetes send first, so
+the process would have been killed outright after the grace period, dropping
+in-flight requests. Both signals now run the same graceful shutdown.
+
+## Not defects
+
+`activeStreams` is decremented in a `finally`, and the client-close listener is
+removed there too. Neither leaks.
