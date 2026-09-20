@@ -374,3 +374,97 @@ deployment this argues for the shallower configuration independently of mean thr
 
 **DSpark v1 at K=3.** It gives up about 1.7 tok/s of median throughput against v2/K=7
 but returns 21 points of acceptance and an 18x tighter throughput distribution.
+
+---
+
+# Round 5 — the LM head is the exploitable inefficiency
+
+## Question
+
+Measured marginal cost of an extra speculative draft row is 4.47 ms (fit
+`t_step = 48.3 + 4.47K`). An earlier nsys profile of the model *body* showed only
+~1.1 ms per extra row. Where does the other ~3.4 ms come from?
+
+Hypothesis: the output head. Vocab is 248,320 and hidden is 5120, so a 4-bit head is
+0.592 GB. If speculative verification evaluates the head as a per-row GEMV, it re-reads
+the entire head for each of the K+1 positions: 0.592 GB / 184.6 GB/s = **3.21 ms per
+row**, which almost exactly accounts for the residual.
+
+## Confirmation
+
+| rows | per-row 4-bit GEMV (ms) | marginal ms/row |
+| ---: | ---: | ---: |
+| 1 | 3.233 | - |
+| 2 | 6.220 | 3.035 |
+| 4 | 13.230 | 3.682 |
+| 6 | 19.359 | 3.708 |
+| 8 | 26.025 | 3.791 |
+
+A single-row head GEMV measures **3.233 ms against a 3.21 ms theoretical read**, i.e.
+it is already memory-bandwidth optimal. Eight rows therefore cost eight full head reads
+(26.03 ms measured vs 25.7 ms predicted). Hypothesis confirmed: **the head is re-read
+per verification position, and at K=7 that is 26.0 ms of a 79.63 ms step — 33% of it.**
+
+## Three hand-written batched kernels that failed
+
+| approach | 8 rows (ms) | vs GEMV |
+| --- | ---: | ---: |
+| 8x per-row GEMV (baseline) | 26.03 | 1.00x |
+| naive batched, `float acc[8]` runtime-indexed | 67.59 | 0.38x |
+| templated `NROWS`, full unroll | 67.59 | 0.38x |
+| shared-memory column tiling (TILE=512) | 38.75 | 0.67x |
+| shared-memory column tiling (TILE=256) | 42.82 | 0.61x |
+
+All slower than the GEMV they were meant to replace, and all 12x off the 3.21 ms
+single-read floor, so none was bandwidth-bound. Diagnosis: register spill from
+dynamically indexed accumulators in the first two, and 4-way shared-memory bank
+conflicts in the tiled versions (threads read `sx[r][lc+j]` with `lc` striding 8 floats,
+so lanes 0, 4, 8 ... collide).
+
+Recording these because the negative result is the useful part: naive batching of a
+skinny tall GEMM does not beat a bandwidth-optimal GEMV without careful attention to
+banking and register budget.
+
+## The floor, measured with cuBLAS
+
+| rows | cuBLAS FP16 GEMM (ms) |
+| ---: | ---: |
+| 1 | 11.975 |
+| 2 | 12.307 |
+| 4 | 11.675 |
+| 6 | 12.306 |
+| 8 | **11.622** |
+
+**Flat in row count.** Verifying 8 positions costs the same as verifying 1. This is the
+behaviour the hand-written kernels were trying and failing to reach, and it confirms the
+saving is real rather than theoretical.
+
+cuBLAS achieves this while moving **4.2x more data** than necessary: an FP16 head is
+2.368 GB against 0.592 GB for 4-bit. It still beats 8 sequential 4-bit GEMVs by
+**2.24x** (11.62 vs 26.03 ms), and runs at 2.368 GB / 11.622 ms = **203 GB/s**, i.e.
+fully bandwidth-saturated.
+
+## What this is worth
+
+| head implementation | head cost at K=7 | step ms | tok/s @ 68.59% | tok/s @ 90% |
+| --- | ---: | ---: | ---: | ---: |
+| 8x int4 GEMV (current behaviour) | 26.03 | 79.63 | 63.8 | - |
+| cuBLAS FP16 batched | 11.62 | 65.23 | 89.1 | 112 |
+| int4 mixed-input tensor-core GEMM | ~3.21 | ~56.8 | **102.2** | **128** |
+
+The last row is the target: a mixed-input INT4 x FP16 tensor-core GEMM reads the 4-bit
+head once per step instead of once per verification position. That single kernel is
+worth roughly 22.8 ms of a 79.63 ms step and, on its own, crosses 100 tok/s at today's
+measured acceptance. Combined with a v3 drafter holding 90% to depth 7 it reaches
+roughly 128 tok/s.
+
+## Revised plan to the target
+
+1. **Batched mixed-input head GEMM** (INT4 weights, FP16 activations, tensor cores via
+   CUTLASS). Measured upside 26.03 -> ~3.21 ms per step. Gets to ~102 tok/s alone.
+   Interim fallback: cuBLAS FP16 already gives 89.1 tok/s today.
+2. **DSpark v3 drafter**, block size >= 8, ~90% acceptance held across depth. Takes the
+   same step time to ~128 tok/s.
+
+Item 1 is a kernel engineering task with a measured floor and a known failure mode to
+avoid. Item 2 is a training run. Neither is speculative any more.
