@@ -370,5 +370,69 @@
       "with_6x_kv_compression": 110,
       "conclusion": "drafter alone does not reliably clear 50-70 tok/s at 256k; KV compression is required"
     }
+  },
+  "kv_quantization": {
+    "$comment": "Measured at 64k context with llama-batched-bench. KV compression delivers ~43% of its theoretical bandwidth benefit here; the rest is lost to dequantization.",
+    "measured_at_64k": [
+      {
+        "type": "f16",
+        "decode_toks_sec": 15.08,
+        "kv_gb": 4.29,
+        "step_gb": 10.99
+      },
+      {
+        "type": "q8_0",
+        "decode_toks_sec": 16.6,
+        "kv_gb": 2.28,
+        "step_gb": 8.98,
+        "predicted_gain_pct": 22.4,
+        "actual_gain_pct": 10.1,
+        "realized_pct": 45
+      },
+      {
+        "type": "q4_0",
+        "decode_toks_sec": 17.57,
+        "kv_gb": 1.21,
+        "step_gb": 7.91,
+        "predicted_gain_pct": 39.0,
+        "actual_gain_pct": 16.5,
+        "realized_pct": 42
+      }
+    ],
+    "realization_factor": 0.43,
+    "recommendation_by_context": [
+      {
+        "ctx": "<= 8k",
+        "use": "f16",
+        "why": "KV is under 16% of the step; q8_0 measured slightly WORSE than f16 at short context"
+      },
+      {
+        "ctx": "16k - 64k",
+        "use": "q8_0 or q4_0",
+        "why": "q4_0 gives +16.5% at 64k"
+      },
+      {
+        "ctx": ">= 128k",
+        "use": "q4_0",
+        "why": "KV exceeds the model size; this is the dominant term"
+      }
+    ],
+    "projection_256k": {
+      "f16": {
+        "raw_toks_sec": 7.2,
+        "with_block7_69pct": 41
+      },
+      "q4_0": {
+        "raw_toks_sec": 10.5,
+        "with_block7_69pct": 60,
+        "note": "clears the 50-70 target with the drafter we already have"
+      },
+      "6x_turboquant_class": {
+        "raw_toks_sec": 11.8,
+        "with_block7_69pct": 68
+      },
+      "caveat": "at 50% acceptance (what the drafter currently degrades to by 4k) q4_0 gives 47 tok/s and misses the target. Both levers are needed."
+    },
+    "quality_caveat": "these are throughput measurements only. q4_0 KV carries an accuracy cost that has NOT been measured here. TurboQuant's contribution is better distortion at low bit-width, which is exactly what a naive q4_0 does not give you."
   }
 }
