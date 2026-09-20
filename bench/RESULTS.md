@@ -3148,3 +3148,51 @@ Round 33 made the identical error in the other direction, attributing a residual
 to the head based on a head size that was wrong. **Anything involving
 `output.weight` needs the whole model measured, because that one tensor is large
 enough and unusual enough to dominate any sample it appears in.**
+
+## Round 42b - an attempt to beat MMQ, and why it failed
+
+Round 42 established that MMQ is a better algorithm above batch 8, not a
+penalty. The obvious response is to write a tiled kernel of the same shape.
+
+First attempt: stage the activation tile in shared memory so a block of warps
+reuses it across rows.
+
+| kernel at NC=16 | ms |
+|---|---|
+| register accumulators | 162.6 |
+| **shared-memory tiled** | **213.9** |
+| llama.cpp full step at batch 16 | ~120 |
+
+**The tiled version is 32% slower.** It fixed the wrong thing.
+
+The problem with the register version is that 16 accumulators per warp collapses
+occupancy. Moving the *activation* to shared memory does not change that - the
+accumulators are still in registers - and the activation was already served from
+cache. What it added was two `__syncthreads()` per k-block, 80 per row-group,
+which serialises warps that were previously independent.
+
+A real MMQ-shaped kernel has to tile over **rows as well as columns** so each
+warp holds few accumulators, load a large enough k-tile to amortise the
+synchronisation, and ideally use warp-level MMA. That is days of GEMM
+engineering against a mature implementation, and on the evidence of the matvec -
+four iterations to reach 96% and never passing it - the likely outcome is
+another near-miss.
+
+## Seven attempts, all negative
+
+| # | attempt | result |
+|---|---|---|
+| 1 | matvec kernel iterations (v1-v4) | 176 vs 183 GB/s, converged from below |
+| 2 | split qs/scale layout | 12% worse |
+| 3 | mmvq warp geometry sweep | 0.39%, not worth diverging |
+| 4 | persistent CTAs at GB10's occupancy optimum | 16% worse |
+| 5 | batched register-accumulator kernel | 2.38x scaling vs llama.cpp's 4.83x |
+| 6 | shared-memory tiled kernel | 32% worse than attempt 5 |
+| 7 | full-pass decomposition | ~48 of 53.3 ms accounted, no hotspot |
+
+**The conclusion is not that llama.cpp is unbeatable in principle. It is that it
+is well-engineered on this hardware, and beating it requires more than a
+determined afternoon.** Every shortcut that looked available - layout freedom,
+occupancy tuning, cliff avoidance - measured negative when tested.
+
+That is worth recording precisely because the opposite is so easy to assume.
