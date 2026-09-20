@@ -70,27 +70,49 @@ Crossover is between 8 and 16 clients. `pulse serve` picks the side of that
 curve for you. Honest caveat: versus a static always-on drafter the gain is only
 ~5%, at 16 clients only.
 
+## The serving policy (measured)
+
+Full grid: drafter x concurrent clients, `bench/grid.sh`, 16 slots, 128 tok/request.
+
+| clients | no drafter | **v1** (block 4) K=4 | **v2** (block 7) K=7 |
+|---|---|---|---|
+| 1 | 23.54 | **37.78** | 36.35 |
+| 2 | 40.24 | 53.24 | **58.83** |
+| 4 | 68.02 | **74.66** | 62.80 |
+| 8 | 87.77 | **92.37** | 77.06 |
+| 16 | **111.44** | 102.86 | 84.39 |
+
+**Deeper speculation is actively harmful under batching.** v2 wins *single-stream*
+on code context (71.5 vs ~64) but loses to v1 at every concurrency level except 2.
+Batch rows are `clients × (K+1)`, so at 16 clients v2's K=7 means **128 rows per
+batch** — past `MMVQ_MAX_BATCH_SIZE = 8`, putting every matmul on MMQ, which has a
+~65 ms base against `mul_mat_vec_q`'s 36.6 ms. Depth that pays for itself at batch 1
+is pure cost once batching has already filled the weight sweep.
+
+| clients | use |
+|---|---|
+| 1 | v1 at K=4 — or v2 at K=7 for code-like prompts specifically |
+| 2–8 | v1 at K=4 |
+| ≥12 | no drafter |
+
+`pulse serve` applies this automatically from `--slots`.
+
+**Caveat.** The grid ran short chat-style prompts and saw 29–43% acceptance; the
+single-stream code runs saw 69–72%. Acceptance is strongly workload-dependent —
+measured range across this project is **21% to 96%** — so the right drafter depends
+on prompt type as well as concurrency. The grid answers "which drafter under load",
+not "what throughput will my workload get".
+
 ## Drafters
 
-| drafter | size | block | best K | tok/s | acceptance | tok/step |
-|---|---|---|---|---|---|---|
-| v1 | 603 MB | 4 | 4 | 64.1 | 72.28% | 3.86 |
-| **v2** | 1.10 GB | 7 | **7** | **66.3** median | 69.10% | 5.74 |
+| drafter | size | block | best K | single-stream tok/s | acceptance |
+|---|---|---|---|---|---|
+| **v1** (default) | 603 MB | 4 | 4 | ~64 | 72.3% |
+| v2 | 1.10 GB | 7 | 7 | **71.5** warm median | 69.1% |
 
-v2 at K=7 is the default: **66.3 tok/s median** (62.4–69.2 over 6 repeats after a 90 s
-quiesce) on a realistic code context, against a 27.54 tok/s no-drafter baseline — **2.4x**.
-
-> An earlier revision of this README reported **73.3 tok/s with a 1.09 spread** for this
-> exact config. That was measured in an unusually favourable machine state. See
-> *Measurement hygiene* — this machine has a **10.2% noise floor**.
-
-Stacking a free n-gram drafter ahead of the neural one helps v1 (+1.8%) and *hurts*
-v2 (−11%): the free drafts displace deeper dspark drafts, 5.74 → 4.62 tok/step. With
-the recommended drafter, don't stack.
-
-**K is capped by the drafter's block size.** With v1, `--spec-draft-n-max 5` and
-`7` are byte-identical to `4`. Requesting more is a no-op, and earlier rounds of
-this repo reported "K=7" numbers that were really K=4.
+**K is capped by the drafter's block size.** With v1, `--spec-draft-n-max 5` and `7`
+are byte-identical to `4`. Requesting more is a no-op, and earlier rounds of this
+repo reported "K=7" numbers that were really K=4.
 
 ## Measured negative results
 
