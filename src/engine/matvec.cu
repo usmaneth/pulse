@@ -130,6 +130,118 @@ void pq2_matvec_ldg(const blk* __restrict__ W, const float* __restrict__ x,
     if (lane == 0) y[warp_id] = acc;
 }
 
+// v4: two more things v3 leaves on the table.
+//   - Every lane issues its own __ldg for the block scale, 32 loads of the same
+//     2 bytes. The hardware coalesces them, but it still issues 32 instructions.
+//     Load it once on lane 0 and broadcast with __shfl_sync.
+//   - Unroll 4 blocks instead of 2, so more independent loads are in flight
+//     before the first one is needed.
+__global__ __launch_bounds__(256)
+void pq2_matvec_bcast(const blk* __restrict__ W, const float* __restrict__ x,
+                      float* __restrict__ y, int ne0, int nrows) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane    = threadIdx.x & 31;
+    if (warp_id >= nrows) return;
+
+    const int nblk = ne0 / QK;
+    const blk* row = W + (size_t)warp_id * nblk;
+
+    float acc = 0.0f;
+    int b = 0;
+    for (; b + 3 < nblk; b += 4) {
+        const uint8_t p0 = __ldg(&row[b  ].qs[lane]);
+        const uint8_t p1 = __ldg(&row[b+1].qs[lane]);
+        const uint8_t p2 = __ldg(&row[b+2].qs[lane]);
+        const uint8_t p3 = __ldg(&row[b+3].qs[lane]);
+        // one lane fetches all four scales, then broadcast
+        float d0, d1, d2, d3;
+        if (lane == 0) {
+            d0 = __half2float(__ushort_as_half(__ldg(&row[b  ].d)));
+            d1 = __half2float(__ushort_as_half(__ldg(&row[b+1].d)));
+            d2 = __half2float(__ushort_as_half(__ldg(&row[b+2].d)));
+            d3 = __half2float(__ushort_as_half(__ldg(&row[b+3].d)));
+        }
+        d0 = __shfl_sync(0xffffffff, d0, 0);
+        d1 = __shfl_sync(0xffffffff, d1, 0);
+        d2 = __shfl_sync(0xffffffff, d2, 0);
+        d3 = __shfl_sync(0xffffffff, d3, 0);
+        const float4 x0 = *reinterpret_cast<const float4*>(x + (b  )*QK + lane*4);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + (b+1)*QK + lane*4);
+        const float4 x2 = *reinterpret_cast<const float4*>(x + (b+2)*QK + lane*4);
+        const float4 x3 = *reinterpret_cast<const float4*>(x + (b+3)*QK + lane*4);
+        #define DOT4(p, xv) (((int)((p)&3)-1)*(xv).x + ((int)(((p)>>2)&3)-1)*(xv).y \
+                           + ((int)(((p)>>4)&3)-1)*(xv).z + ((int)(((p)>>6)&3)-1)*(xv).w)
+        acc += DOT4(p0,x0)*d0 + DOT4(p1,x1)*d1 + DOT4(p2,x2)*d2 + DOT4(p3,x3)*d3;
+    }
+    for (; b < nblk; ++b) {
+        const uint8_t p = __ldg(&row[b].qs[lane]);
+        const float4 xv = *reinterpret_cast<const float4*>(x + b*QK + lane*4);
+        acc += DOT4(p,xv) * __half2float(__ushort_as_half(__ldg(&row[b].d)));
+    }
+    #undef DOT4
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
+}
+
+// v5: change the LAYOUT, not the kernel.
+//
+// Every variant above is capped by the same thing: GGUF interleaves a 2-byte
+// scale with every 32 bytes of codes, so the weight stream is 34-byte periodic
+// and never perfectly sequential. llama.cpp has to live with that - it reads
+// the standard on-disk format. An engine owns its in-memory layout and does
+// not.
+//
+// This splits the tensor into two contiguous arrays, same total bytes:
+//   qs[nrows*nblk*32]  - pure sequential codes
+//   ds[nrows*nblk]     - all scales together
+__global__ __launch_bounds__(256)
+void pq2_matvec_split(const uint8_t* __restrict__ QS, const uint16_t* __restrict__ DS,
+                      const float* __restrict__ x, float* __restrict__ y,
+                      int ne0, int nrows) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane    = threadIdx.x & 31;
+    if (warp_id >= nrows) return;
+
+    const int nblk = ne0 / QK;
+    const uint8_t*  qs = QS + (size_t)warp_id * nblk * 32;
+    const uint16_t* ds = DS + (size_t)warp_id * nblk;
+
+    float acc = 0.0f;
+    int b = 0;
+    for (; b + 3 < nblk; b += 4) {
+        const uint8_t p0 = __ldg(qs + (b  )*32 + lane);
+        const uint8_t p1 = __ldg(qs + (b+1)*32 + lane);
+        const uint8_t p2 = __ldg(qs + (b+2)*32 + lane);
+        const uint8_t p3 = __ldg(qs + (b+3)*32 + lane);
+        float d0,d1,d2,d3;
+        if (lane == 0) {
+            d0 = __half2float(__ushort_as_half(__ldg(ds+b  )));
+            d1 = __half2float(__ushort_as_half(__ldg(ds+b+1)));
+            d2 = __half2float(__ushort_as_half(__ldg(ds+b+2)));
+            d3 = __half2float(__ushort_as_half(__ldg(ds+b+3)));
+        }
+        d0 = __shfl_sync(0xffffffff,d0,0); d1 = __shfl_sync(0xffffffff,d1,0);
+        d2 = __shfl_sync(0xffffffff,d2,0); d3 = __shfl_sync(0xffffffff,d3,0);
+        const float4 x0 = *reinterpret_cast<const float4*>(x + (b  )*QK + lane*4);
+        const float4 x1 = *reinterpret_cast<const float4*>(x + (b+1)*QK + lane*4);
+        const float4 x2 = *reinterpret_cast<const float4*>(x + (b+2)*QK + lane*4);
+        const float4 x3 = *reinterpret_cast<const float4*>(x + (b+3)*QK + lane*4);
+        #define D4(p, xv) (((int)((p)&3)-1)*(xv).x + ((int)(((p)>>2)&3)-1)*(xv).y \
+                         + ((int)(((p)>>4)&3)-1)*(xv).z + ((int)(((p)>>6)&3)-1)*(xv).w)
+        acc += D4(p0,x0)*d0 + D4(p1,x1)*d1 + D4(p2,x2)*d2 + D4(p3,x3)*d3;
+    }
+    for (; b < nblk; ++b) {
+        const uint8_t p  = __ldg(qs + b*32 + lane);
+        const float4  xv = *reinterpret_cast<const float4*>(x + b*QK + lane*4);
+        acc += D4(p,xv) * __half2float(__ushort_as_half(__ldg(ds+b)));
+    }
+    #undef D4
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[warp_id] = acc;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr,"usage: %s <model.gguf> [tensor] [rows]\n",argv[0]); return 2; }
     const char* want = argc > 2 ? argv[2] : "output.weight";
@@ -165,7 +277,7 @@ int main(int argc, char** argv) {
     const int threads = 256, warps_per_block = threads/32;
     const int blocks  = (nrows + warps_per_block - 1) / warps_per_block;
 
-    pq2_matvec_ldg<<<blocks, threads>>>(d_w, d_x, d_y, ne0, nrows);
+    pq2_matvec_bcast<<<blocks, threads>>>(d_w, d_x, d_y, ne0, nrows);
     CUDA_OK(cudaDeviceSynchronize());
 
     std::vector<float> y(nrows);
@@ -241,10 +353,45 @@ int main(int argc, char** argv) {
     const double b1 = bench("v1 (strided, uncoalesced)", pq2_matvec);
     const double b2 = bench("v2 (warp-coalesced)",       pq2_matvec_coalesced);
     const double b3 = bench("v3 (+__ldg, 2x unroll)",     pq2_matvec_ldg);
+    const double b4 = bench("v4 (+scale bcast, 4x)",      pq2_matvec_bcast);
+
+    // --- v5: repack into split arrays (engine-only; llama.cpp reads GGUF as-is)
+    std::vector<uint8_t>  h_qs((size_t)nrows*nblk*32);
+    std::vector<uint16_t> h_ds((size_t)nrows*nblk);
+    for (size_t j = 0; j < (size_t)nrows; ++j)
+        for (int b = 0; b < nblk; ++b) {
+            const blk& bb = host_w[j*nblk + b];
+            h_ds[j*nblk + b] = bb.d;
+            memcpy(&h_qs[(j*nblk + b)*32], bb.qs, 32);
+        }
+    uint8_t* d_qs; uint16_t* d_ds;
+    CUDA_OK(cudaMalloc(&d_qs, h_qs.size()));
+    CUDA_OK(cudaMalloc(&d_ds, h_ds.size()*2));
+    CUDA_OK(cudaMemcpy(d_qs, h_qs.data(), h_qs.size(), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_ds, h_ds.data(), h_ds.size()*2, cudaMemcpyHostToDevice));
+    for (int i = 0; i < 5; ++i)
+        pq2_matvec_split<<<blocks,threads>>>(d_qs,d_ds,d_x,d_y,ne0,nrows);
+    CUDA_OK(cudaDeviceSynchronize());
+    {   // verify the repack did not change the answer
+        std::vector<float> y5(nrows);
+        CUDA_OK(cudaMemcpy(y5.data(), d_y, (size_t)nrows*sizeof(float), cudaMemcpyDeviceToHost));
+        double wm = 0;
+        for (int j = 0; j < check_rows; ++j) wm = std::max(wm, (double)std::fabs(y5[j]-y[j]));
+        printf("  %-26s   (max |v5-v4| over %d rows = %.3e)\n", "", check_rows, wm);
+    }
+    cudaEvent_t e0,e1; CUDA_OK(cudaEventCreate(&e0)); CUDA_OK(cudaEventCreate(&e1));
+    CUDA_OK(cudaEventRecord(e0));
+    for (int i = 0; i < 50; ++i)
+        pq2_matvec_split<<<blocks,threads>>>(d_qs,d_ds,d_x,d_y,ne0,nrows);
+    CUDA_OK(cudaEventRecord(e1)); CUDA_OK(cudaEventSynchronize(e1));
+    float ms5=0; CUDA_OK(cudaEventElapsedTime(&ms5,e0,e1));
+    const double per5 = ms5/50.0, b5 = wbytes/(per5*1e-3)/1e9;
+    printf("  %-26s %7.3f ms   %6.1f GB/s\n", "v5 (split qs/scale arrays)", per5, b5);
+    cudaFree(d_qs); cudaFree(d_ds);
     printf("  %-26s %7s   %6.1f GB/s\n", "llama.cpp decode", "-", 183.0);
     printf("  %-26s %7s   %6.1f GB/s\n", "achievable (bench/cuda/bw.cu)", "-", 216.0);
     printf("\n  best Pulse kernel reaches %.0f%% of llama.cpp, %.0f%% of achievable\n",
-           100.0*std::max(b1,std::max(b2,b3))/183.0, 100.0*std::max(b1,std::max(b2,b3))/216.0);
+           100.0*std::max(std::max(b1,b2),std::max(std::max(b3,b4),b5))/183.0, 100.0*std::max(std::max(b1,b2),std::max(std::max(b3,b4),b5))/216.0);
 
     cudaFree(d_w); cudaFree(d_x); cudaFree(d_y);
     return 0;

@@ -2561,3 +2561,71 @@ projection. An engine is buildable. It is not where the throughput is.
 
 The remaining 8% to llama.cpp and 22% to the roofline is real and worth having,
 but it is the 1.19x software gap from Round 16, not a new lever.
+
+---
+
+# Round 35 - four kernel iterations, one layout hypothesis, and the engine verdict
+
+Round 34 reached 168 GB/s against llama.cpp's 183. This pushes on the remaining
+gap from two directions and finds the ceiling.
+
+## Kernel iterations
+
+`output.weight`, 0.338 GB of PQ2_0, 5120 x 248320. All variants verified
+correct (err/sum|terms| between 6.7e-09 and 1.2e-08, against fp32 epsilon of
+1.19e-07).
+
+| kernel | ms | GB/s | % of llama.cpp |
+|---|---|---|---|
+| v1 strided | 10.790 | 31.3 | 17% |
+| v2 warp-coalesced | 2.335 | 144.6 | 79% |
+| v3 + `__ldg`, 2x unroll | 1.998 | 169.0 | 92% |
+| **v4 + scale broadcast, 4x unroll** | **1.919** | **176.0** | **96%** |
+| v5 split qs/scale arrays | 2.174 | 155.3 | 85% |
+| llama.cpp decode | - | 183.0 | 100% |
+| achievable | - | 216.0 | - |
+
+Gains shrink sharply: **+113, +24, +7**. The curve is asymptotic to roughly
+llama.cpp's number, approached from below.
+
+## The layout hypothesis, and why it was wrong
+
+Every kernel above is 34-byte periodic, because GGUF interleaves a 2-byte scale
+with each 32 bytes of codes. The weight stream is therefore never perfectly
+sequential. llama.cpp must live with that - it reads the on-disk format. **An
+engine owns its in-memory layout and does not**, which looked like the first
+genuine engine-only lever in this project.
+
+So v5 repacks the tensor into two contiguous arrays - all codes, then all
+scales - with identical total bytes.
+
+**It is 12% slower: 155.3 against 176.0 GB/s.** The repack is correct;
+`max |v5 - v4|` over 256 rows is exactly **0.000e+00**, bit-identical output.
+
+The reason is the inverse of the hypothesis. In the interleaved layout a
+block's scale sits immediately beside its own codes, so it arrives in a cache
+line the warp is already fetching. Splitting them creates a second independent
+stream and two sets of lines to keep live. **GGUF's interleaving is a locality
+optimisation, not a compromise**, and the engine-only lever it appeared to
+offer does not exist.
+
+## Verdict on building the engine
+
+This is the question `docs/ENGINE.md` estimated at ~1.3x. It is now measured
+rather than projected, and the estimate was generous on the kernel side:
+
+- A from-scratch kernel reaches **96% of llama.cpp in four iterations**. There
+  is no mystery in llama.cpp's performance and no hidden inefficiency to
+  reclaim.
+- It does **not** beat it, and the one structural advantage an engine has over
+  llama.cpp on this op - freedom to choose the memory layout - **measured
+  negative**.
+- The remaining 183 -> 216 GB/s is the Round 16 software gap. Neither llama.cpp
+  nor any kernel written here captures it, and Round 30 already ruled out warp
+  geometry as its cause.
+
+**An engine is buildable and it is not where the throughput is.** The work is
+worth doing for control - owning the KV cache, shipping fixes without patching
+upstream, scheduling policy - and those are product reasons, not speed reasons.
+Anyone proposing the rewrite on performance grounds now has four measured
+kernels and a failed layout experiment arguing against it.
