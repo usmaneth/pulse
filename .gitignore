@@ -8,6 +8,7 @@ bin/*
 !bin/pulse-gguf
 !bin/pulse-matvec
 !bin/pulse-engine
+!bin/pulse-dumpref
 !bin/pulse-dequant
 *.gguf
 packages/**/*.gguf
