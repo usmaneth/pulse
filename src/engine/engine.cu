@@ -1393,6 +1393,104 @@ int main(int argc, char** argv) {
             cudaFree(dgb);cudaFree(dfin);cudaFree(dperm);cudaFree(dout2);
             if(sgn5120)cudaFree(sgn5120); if(sgn6144)cudaFree(sgn6144); if(sgn17408)cudaFree(sgn17408);
         }
+        // ================= COMPOSE LAYER 3 (full attention) =================
+        // At position 0 the softmax is over one element, so the attention result
+        // is exactly V for the mapped KV head and Q/K/RoPE/q-norm/k-norm cancel.
+        // Those are only exercised at >1 token; everything else here is real.
+        std::vector<float> in3, ref_l3;
+        if (load_ref("l_out-2", in3) && load_ref("l_out-3", ref_l3)
+            && (int)in3.size() == n && (int)ref_l3.size() == n && m.is_full_attn(3)) {
+            const int HB = 1024; const float hs = 1.0f/std::sqrt((float)HB);
+            std::vector<int32_t> sv, sw;
+            m.reader().array_i32("prism.hadamard.sign_values", sv);
+            m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+            auto mk_sign = [&](int width)->float* {
+                size_t off = 0;
+                for (size_t i = 0; i < sw.size(); ++i) {
+                    if (sw[i] == width) {
+                        std::vector<float> f(width);
+                        for (int j = 0; j < width; ++j) f[j] = (float)sv[off+j];
+                        float* d; CU(cudaMalloc(&d,(size_t)width*4));
+                        CU(cudaMemcpy(d,f.data(),(size_t)width*4,cudaMemcpyHostToDevice));
+                        return d; }
+                    off += (size_t)sw[i]; }
+                return nullptr; };
+            float* s5120 = mk_sign(5120); float* s6144 = mk_sign(6144);
+            float* s17408 = mk_sign(17408);
+            const int nff = (int)m.layer(3,"ffn_gate.weight")->ne[1];
+            const int nqf = (int)m.layer(3,"attn_q.weight")->ne[1];      // 12288
+            const int nkv = (int)m.layer(3,"attn_v.weight")->ne[1];      // 1024
+            const int hd = 256, nqh = 24, nkvh = 4;
+
+            float *dx,*dh,*dtmp,*dqf,*dv3,*dag,*dout3,*dg3,*du3,*df3;
+            CU(cudaMalloc(&dx,(size_t)n*4));   CU(cudaMalloc(&dh,(size_t)n*4));
+            CU(cudaMalloc(&dtmp,(size_t)n*4)); CU(cudaMalloc(&dqf,(size_t)nqf*4));
+            CU(cudaMalloc(&dv3,(size_t)nkv*4));CU(cudaMalloc(&dag,(size_t)6144*4));
+            CU(cudaMalloc(&dout3,(size_t)n*4));CU(cudaMalloc(&dg3,(size_t)nff*4));
+            CU(cudaMalloc(&du3,(size_t)nff*4));CU(cudaMalloc(&df3,(size_t)nff*4));
+            CU(cudaMemcpy(dx,in3.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+
+            k_rmsnorm<<<1,256>>>(dx,(const float*)m.layer(3,"attn_norm.weight")->ptr,dh,n,hp.rms_eps);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(dtmp,dh,(size_t)n*4,cudaMemcpyDeviceToDevice));
+            k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dtmp,s5120,n,HB,hs);
+            CU(cudaDeviceSynchronize());
+            k_matvec_pq2<<<(nqf+7)/8,256>>>((const blk*)m.layer(3,"attn_q.weight")->ptr,dtmp,dqf,n,nqf);
+            k_matvec_pq2<<<(nkv+7)/8,256>>>((const blk*)m.layer(3,"attn_v.weight")->ptr,dtmp,dv3,n,nkv);
+            CU(cudaDeviceSynchronize());
+            std::vector<float> qf(nqf), vv(nkv);
+            CU(cudaMemcpy(qf.data(),dqf,(size_t)nqf*4,cudaMemcpyDeviceToHost));
+            CU(cudaMemcpy(vv.data(),dv3,(size_t)nkv*4,cudaMemcpyDeviceToHost));
+
+            // attn_q emits [query | gate] interleaved per head, 2*hd per head.
+            // At pos 0 the attention output is V of the blocked-mapped kv head.
+            std::vector<float> gated(6144);
+            for (int h = 0; h < nqh; ++h) {
+                const int kv = h / (nqh / nkvh);           // BLOCKED for attention
+                for (int i = 0; i < hd; ++i) {
+                    const double g = (double)qf[(size_t)h*2*hd + hd + i];   // gate half
+                    const double sg = 1.0/(1.0+std::exp(-g));
+                    gated[(size_t)h*hd + i] = (float)(sg * (double)vv[(size_t)kv*hd + i]);
+                }
+            }
+            CU(cudaMemcpy(dag,gated.data(),(size_t)6144*4,cudaMemcpyHostToDevice));
+            k_hadamard<<<(6144+HB-1)/HB,512,HB*4>>>(dag,s6144,6144,HB,hs);   // no permute
+            CU(cudaDeviceSynchronize());
+            k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)m.layer(3,"attn_output.weight")->ptr,dag,dout3,6144,n);
+            CU(cudaDeviceSynchronize());
+            std::vector<float> oh3(n), xh3(n);
+            CU(cudaMemcpy(oh3.data(),dout3,(size_t)n*4,cudaMemcpyDeviceToHost));
+            for (int i=0;i<n;++i) xh3[i]=in3[i]+oh3[i];
+
+            CU(cudaMemcpy(dx,xh3.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+            k_rmsnorm<<<1,256>>>(dx,(const float*)m.layer(3,"post_attention_norm.weight")->ptr,dh,n,hp.rms_eps);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(dtmp,dh,(size_t)n*4,cudaMemcpyDeviceToDevice));
+            k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dtmp,s5120,n,HB,hs);
+            CU(cudaDeviceSynchronize());
+            k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)m.layer(3,"ffn_gate.weight")->ptr,dtmp,dg3,n,nff);
+            k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)m.layer(3,"ffn_up.weight")->ptr,dtmp,du3,n,nff);
+            CU(cudaDeviceSynchronize());
+            k_swiglu<<<(nff+255)/256,256>>>(dg3,du3,df3,nff);
+            CU(cudaDeviceSynchronize());
+            k_hadamard<<<(nff+HB-1)/HB,512,HB*4>>>(df3,s17408,nff,HB,hs);
+            CU(cudaDeviceSynchronize());
+            k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)m.layer(3,"ffn_down.weight")->ptr,df3,dout3,nff,n);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(oh3.data(),dout3,(size_t)n*4,cudaMemcpyDeviceToHost));
+
+            double e=0,mag=0,cn=0,ga=0,ra=0;
+            for (int i=0;i<n;++i){
+                const double got=(double)xh3[i]+oh3[i];
+                e=std::max(e,std::fabs(got-ref_l3[i])); mag=std::max(mag,std::fabs((double)ref_l3[i]));
+                cn+=got*ref_l3[i]; ga+=got*got; ra+=(double)ref_l3[i]*ref_l3[i]; }
+            report("LAYER 3 composed (attention) vs l_out-3", e/std::max(mag,1e-9), 2e-2);
+            printf("    cosine %.8f   (l_out-2 -> norm -> attn -> res -> norm -> FFN -> res)\n",
+                   cn/std::sqrt(std::max(ga*ra,1e-30)));
+            cudaFree(dx);cudaFree(dh);cudaFree(dtmp);cudaFree(dqf);cudaFree(dv3);
+            cudaFree(dag);cudaFree(dout3);cudaFree(dg3);cudaFree(du3);cudaFree(df3);
+            if(s5120)cudaFree(s5120); if(s6144)cudaFree(s6144); if(s17408)cudaFree(s17408);
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
