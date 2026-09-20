@@ -665,6 +665,77 @@ int main(int argc, char** argv) {
                 cudaFree(dn); cudaFree(dl); if (d_sign) cudaFree(d_sign);
             }
         }
+        // ---- the whole FFN block of layer 0, against llama.cpp's ffn_out-0
+        std::vector<float> apn, ref_ffn;
+        if (load_ref("attn_post_norm-0", apn) && load_ref("ffn_out-0", ref_ffn)) {
+            const DevTensor *wg = m.layer(0,"ffn_gate.weight"),
+                            *wu = m.layer(0,"ffn_up.weight"),
+                            *wd = m.layer(0,"ffn_down.weight");
+            if (wg && wu && wd && (int)apn.size() == n) {
+                const int nff = (int)wg->ne[1];
+                // sign vectors by input width
+                std::vector<int32_t> sv, sw;
+                m.reader().array_i32("prism.hadamard.sign_values", sv);
+                m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                auto sign_for = [&](int width)->float* {
+                    size_t off = 0;
+                    for (size_t i = 0; i < sw.size(); ++i) {
+                        if (sw[i] == width) {
+                            if (off + width > sv.size()) return nullptr;
+                            std::vector<float> f(width);
+                            for (int j = 0; j < width; ++j) f[j] = (float)sv[off+j];
+                            float* d; CU(cudaMalloc(&d,(size_t)width*4));
+                            CU(cudaMemcpy(d,f.data(),(size_t)width*4,cudaMemcpyHostToDevice));
+                            return d;
+                        }
+                        off += (size_t)sw[i];
+                    }
+                    return nullptr;
+                };
+                float* sgn_in  = sign_for(n);
+                float* sgn_ff  = sign_for(nff);
+
+                float *dx,*dg,*du,*dh,*dout;
+                CU(cudaMalloc(&dx,n*4));            CU(cudaMalloc(&dg,(size_t)nff*4));
+                CU(cudaMalloc(&du,(size_t)nff*4));  CU(cudaMalloc(&dh,(size_t)nff*4));
+                CU(cudaMalloc(&dout,(size_t)n*4));
+                CU(cudaMemcpy(dx,apn.data(),n*4,cudaMemcpyHostToDevice));
+
+                const int HB = 1024; const float hs = 1.0f/std::sqrt((float)HB);
+                // 1. rotate the activation for the two 5120-input projections
+                k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dx,sgn_in,n,HB,hs);
+                CU(cudaDeviceSynchronize());
+                // 2. gate and up
+                k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)wg->ptr,dx,dg,n,nff);
+                k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)wu->ptr,dx,du,n,nff);
+                CU(cudaDeviceSynchronize());
+                // 3. SwiGLU
+                k_swiglu<<<(nff+255)/256,256>>>(dg,du,dh,nff);
+                CU(cudaDeviceSynchronize());
+                // 4. rotate the 17408-wide intermediate for ffn_down
+                k_hadamard<<<(nff+HB-1)/HB,512,HB*4>>>(dh,sgn_ff,nff,HB,hs);
+                CU(cudaDeviceSynchronize());
+                // 5. down projection
+                k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)wd->ptr,dh,dout,nff,n);
+                CU(cudaDeviceSynchronize());
+
+                std::vector<float> got(n);
+                CU(cudaMemcpy(got.data(),dout,n*4,cudaMemcpyDeviceToHost));
+                double e=0, mag=0, cos_n=0, ga=0, ra=0;
+                for (int i=0;i<n;++i){
+                    e = std::max(e,(double)std::fabs(got[i]-ref_ffn[i]));
+                    mag = std::max(mag,(double)std::fabs(ref_ffn[i]));
+                    cos_n += (double)got[i]*ref_ffn[i]; ga += (double)got[i]*got[i];
+                    ra += (double)ref_ffn[i]*ref_ffn[i];
+                }
+                report("FFN block layer 0 vs llama.cpp", e/std::max(mag,1e-9), 1e-2);
+                printf("    cosine similarity vs reference : %.8f\n",
+                       cos_n/std::sqrt(std::max(ga*ra,1e-30)));
+                printf("    path: hadamard -> gate/up -> swiglu -> hadamard -> down\n");
+                cudaFree(dx);cudaFree(dg);cudaFree(du);cudaFree(dh);cudaFree(dout);
+                if (sgn_in) cudaFree(sgn_in); if (sgn_ff) cudaFree(sgn_ff);
+            }
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
