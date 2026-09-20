@@ -22,6 +22,11 @@ constexpr uint32_t QWEN_HEAD_DIM = 128;
 constexpr uint32_t QWEN_NUM_LAYERS = 62;
 constexpr uint32_t QWEN_VOCAB_SIZE = 248320;
 
+// MoE Geometry (Qwen3.6-35B-A3B: 3B active parameters out of 35B)
+constexpr uint32_t MOE_ACTIVE_EXPERTS = 4;
+constexpr uint32_t MOE_TOTAL_EXPERTS = 64;
+constexpr size_t MOE_ACTIVE_WEIGHT_BYTES = 1680000000ULL; // 1.68 GB active swept in NVFP4
+
 // Paged Attention & KV Cache Geometry
 constexpr uint32_t PAGE_SIZE_TOKENS = 16;
 constexpr size_t KV_PAGE_BYTES = PAGE_SIZE_TOKENS * QWEN_NUM_KV_HEADS * QWEN_HEAD_DIM * 2; // 32 KB per page
@@ -42,8 +47,18 @@ constexpr size_t STATE_CACHE_RESERVED_BYTES = 4ULL * 1024ULL * 1024ULL * 1024ULL
 
 enum class ModelFormat {
     PQ2_0_TERNARY,  // Bonsai 2 27B 1.76-bit with Hadamard transformation (6.7 GB)
-    NVFP4,          // Blackwell SM120 native FP4 with micro-scaling (14.5 GB)
+    NVFP4,          // Blackwell SM120/121 native FP4 with micro-scaling (15.2 GB dense, 1.68 GB MoE)
     Q4_K_M          // Standard 4-bit GGUF/GGML (15.5 GB)
+};
+
+enum class ModelArchitecture {
+    DENSE_27B,      // Qwen 3.8 / Bonsai 2 (27B dense)
+    SPARSE_MOE_35B  // Qwen 3.6 35B / DeepSeek Flash (3B active)
+};
+
+enum class ExecutionPhase {
+    PREFILL,        // Compute-bound: Tensor Core NVFP4 dominates
+    DECODE          // Memory-bound: Minimal weight sweep dominates
 };
 
 enum class TaskDomain {
@@ -56,8 +71,8 @@ enum class TaskDomain {
 
 enum class TensorParallelMode {
     DISABLED,
-    DUAL_SPARK_SHARDED,      // 2 nodes over 400G QSFP fabric (spark1 + spark2)
-    MULTI_GPU_NVLINK         // Intra-node multi-GPU NVLink / P2P
+    DUAL_SPARK_SHARDED,
+    MULTI_GPU_NVLINK
 };
 
 struct TensorParallelConfig {
@@ -68,12 +83,11 @@ struct TensorParallelConfig {
     std::string peer_host{"10.99.0.2"};
     uint16_t peer_port{50055};
 
-    // Sharded geometry metrics
     uint32_t sharded_hidden_dim{QWEN_HIDDEN_DIM};
     uint32_t sharded_intermediate_dim{QWEN_INTERMEDIATE_DIM};
     uint32_t sharded_num_heads{QWEN_NUM_HEADS};
     uint32_t sharded_kv_heads{QWEN_NUM_KV_HEADS};
-    size_t sharded_model_bytes{6700000000ULL}; // 6.7 GB full
+    size_t sharded_model_bytes{6700000000ULL};
     double target_sweep_ms{35.5};
 
     void configure(uint32_t ws, uint32_t r, TensorParallelMode m = TensorParallelMode::DUAL_SPARK_SHARDED) {
@@ -86,8 +100,8 @@ struct TensorParallelConfig {
             sharded_intermediate_dim = QWEN_INTERMEDIATE_DIM / ws;
             sharded_num_heads = QWEN_NUM_HEADS / ws;
             sharded_kv_heads = std::max(1U, QWEN_NUM_KV_HEADS / ws);
-            sharded_model_bytes = (6700000000ULL / ws);
-            target_sweep_ms = 35.5 / ws; // 17.75 ms on 2 nodes
+            sharded_model_bytes = 6700000000ULL / ws;
+            target_sweep_ms = 35.5 / ws;
         }
     }
 };
@@ -99,6 +113,7 @@ struct SpeculativeStepResult {
     double step_wall_ms;
     double verify_kernel_ms;
     double draft_kernel_ms;
+    const char* active_kernel_path;
 };
 
 } // namespace pulse

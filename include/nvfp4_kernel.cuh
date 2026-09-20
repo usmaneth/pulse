@@ -6,6 +6,7 @@
 
 namespace pulse {
 
+#ifdef __CUDACC__
 // NVFP4 E2M1 Lookup Table: maps 4-bit nibbles (0x0 to 0xF) to IEEE-754 FP32 values
 __constant__ float C_NVFP4_LUT[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
@@ -51,7 +52,6 @@ __global__ void gemv_blackwell_nvfp4_dim5120_kernel(
     size_t row_weight_offset = static_cast<size_t>(row) * (QWEN_HIDDEN_DIM / 2);
     size_t row_scale_offset = static_cast<size_t>(row) * (QWEN_HIDDEN_DIM / 16);
 
-    // Each thread processes 8 weights (4 packed bytes) per iteration
     #pragma unroll 4
     for (int col = tid * 2; col < QWEN_HIDDEN_DIM; col += blockDim.x * 2) {
         uint8_t packed = w_nvfp4[row_weight_offset + (col / 2)];
@@ -66,7 +66,6 @@ __global__ void gemv_blackwell_nvfp4_dim5120_kernel(
         }
     }
 
-    // Warp-level reduction
     for (int offset = warp_size / 2; offset > 0; offset /= 2) {
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
     }
@@ -89,5 +88,6 @@ __global__ void gemv_blackwell_nvfp4_dim5120_kernel(
         }
     }
 }
+#endif
 
 } // namespace pulse

@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include "memory_pool.hpp"
 #include "hadamard.hpp"
+#include "nvfp4_kernel.cuh"
 #include <cuda_runtime.h>
 #include <vector>
 #include <memory>
@@ -14,18 +15,20 @@ class SpeculativeEngine {
 public:
     SpeculativeEngine(
         ModelFormat format = ModelFormat::PQ2_0_TERNARY,
+        ModelArchitecture arch = ModelArchitecture::DENSE_27B,
         uint32_t default_k = DEFAULT_SPECULATION_K,
         size_t memory_budget = GB10_TOTAL_MEMORY_BYTES,
         TensorParallelConfig tp_config = {}
     );
     ~SpeculativeEngine();
+
     bool initialize();
 
-    // Standard synchronous speculative step
-    SpeculativeStepResult step(uint32_t k = DEFAULT_SPECULATION_K);
+    // Standard synchronous speculative step with dynamic kernel dispatch
+    SpeculativeStepResult step(uint32_t k = DEFAULT_SPECULATION_K, ExecutionPhase phase = ExecutionPhase::DECODE);
 
-    // Asynchronous pipelined step (draft t+1 overlaps with verify t)
-    SpeculativeStepResult step_pipelined(uint32_t k = DEFAULT_SPECULATION_K);
+    // Asynchronous pipelined step
+    SpeculativeStepResult step_pipelined(uint32_t k = DEFAULT_SPECULATION_K, ExecutionPhase phase = ExecutionPhase::DECODE);
 
     std::vector<int32_t> generate(
         const std::vector<int32_t>& prompt_tokens,
@@ -40,35 +43,41 @@ public:
     double get_cumulative_acceptance_rate() const;
     size_t get_total_accepted_tokens() const { return total_accepted_tokens_; }
     size_t get_total_drafted_tokens() const { return total_drafted_tokens_; }
+    const char* get_active_kernel_name() const;
 
 private:
     ModelFormat format_;
+    ModelArchitecture arch_;
     uint32_t k_;
     size_t memory_budget_;
     bool initialized_{false};
     bool graph_captured_{false};
-    bool ping_pong_state_{false}; // false = ping, true = pong
+    bool ping_pong_state_{false};
 
     std::unique_ptr<MemoryGovernor> governor_;
-
-    // Dual concurrent CUDA streams for asynchronous pipelined execution
     TensorParallelConfig tp_config_{};
-    cudaStream_t compute_stream_{nullptr}; // Target verification (40 SMs)
-    cudaStream_t draft_stream_{nullptr};   // DFlash 2 drafting (8 SMs)
 
-    // Hardware synchronization events
+    cudaStream_t compute_stream_{nullptr};
+    cudaStream_t draft_stream_{nullptr};
+
     cudaEvent_t draft_ready_event_{nullptr};
     cudaEvent_t verify_ready_event_{nullptr};
 
     cudaGraph_t speculative_graph_{nullptr};
     cudaGraphExec_t graph_exec_{nullptr};
 
-    // Double-buffered device activation and token arrays
+    // Device Buffers for Model Activations and Speculation
     float* d_hidden_states_{nullptr};
     float* d_draft_hidden_states_{nullptr};
     float* d_verify_logits_{nullptr};
-    
-    // Ping-Pong Draft & Verify Buffers
+    float* d_ffn_out_{nullptr};
+
+    // Packed Weights Buffers
+    uint32_t* d_ternary_packed_w_{nullptr}; // 1.76-bit Ternary with Hadamard
+    uint8_t* d_nvfp4_packed_w_{nullptr};    // Blackwell NVFP4 E2M1
+    float* d_nvfp4_scales_{nullptr};        // FP8 block micro-scales
+
+    // Ping-Pong Buffers
     int32_t* d_draft_tokens_ping_{nullptr};
     int32_t* d_draft_tokens_pong_{nullptr};
     int32_t* d_target_argmax_ping_{nullptr};
