@@ -93,7 +93,10 @@ export class DualSparkMeshRouter {
           return;
         }
 
-        // Forward chat completions
+        // Forward chat completions.
+        // NOTE: the mesh forwards the client body verbatim, so prefix caching
+        // depends on the caller setting cache_prompt. The single-node proxy in
+        // server.ts defaults it to true.
         if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions')) {
           await this.routeChatCompletion(req, res);
           return;

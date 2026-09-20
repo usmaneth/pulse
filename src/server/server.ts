@@ -172,6 +172,17 @@ export class PulseServer {
       const backendPayload = {
         ...parsed,
         stream,
+        // Prefix caching. An agent re-sends a growing context every turn; without
+        // this the backend re-prefills the whole thing each time. A cold 131k
+        // prefill measured 211.7 s on this hardware, so this is the single
+        // highest-value flag for long-context agentic use. Callers may override.
+        cache_prompt: parsed.cache_prompt ?? true,
+        // NOTE: the backend currently IGNORES this. Per-request speculative
+        // parameters are compiled out of llama.cpp's server behind `#if 0`
+        // (tools/server/server-schema.cpp), and the decode path reads
+        // params_base.speculative rather than per-task params. The Jev decision
+        // below is therefore advisory only - it is reported on /status but does
+        // not change backend behaviour until that block is enabled upstream.
         spec_draft_n_max: kDecision.k,
       };
 
