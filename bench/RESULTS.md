@@ -1595,3 +1595,55 @@ unless `--cache-reuse` is enabled.
 prefix of the 16384-token prompt used in Round 18, built from the same pool in
 the same order, so it hit the existing cache. The relative comparison between
 A, B and C is unaffected, since all four rows ran against the same server state.)
+
+## Round 20b - `--cache-reuse` cannot be enabled on this model
+
+Re-ran with `--cache-reuse 256 --cache-ram -1` and a genuinely cold cache:
+
+| scenario | prefill | vs cold |
+|---|---|---|
+| cold 8192-token prefill | 11443.5 ms | - |
+| **A. append-only** | **242.2 ms** | **47.2x** |
+| B. mid-context edit | 8702.0 ms | 1.3x |
+| C. early chunk dropped | 8124.7 ms | 1.4x |
+
+The server logged:
+
+    cache_reuse is not supported by this context, it will be disabled
+
+so these are identical to the `--cache-reuse 0` run (8647 vs 8702 ms, within
+noise). The flag is a no-op here.
+
+### Why, precisely
+
+`server-context.cpp:1132` gates it on `llama_memory_can_shift()`. For a hybrid
+memory that delegates to the attention cache, and `llama-kv-cache.cpp:1176` has:
+
+    if (hparams.n_pos_per_embd() > 1) {
+        return false;
+
+Bonsai 2 declares `qwen35.rope.dimension_sections = [11, 11, 10]` - **mRoPE**,
+i.e. multi-dimensional positions. K-shift assumes a single scalar `n_rot`, so it
+is refused.
+
+Note this is **mRoPE, not the Gated DeltaNet hybrid**. `llama_memory_recurrent::
+get_can_shift()` returns true with the comment "shifting the pos is trivial for
+recurrent models". An earlier draft of this section blamed the recurrent state;
+that was wrong.
+
+### What it means
+
+| agent operation | cost |
+|---|---|
+| append to context (normal turn) | **242 ms** |
+| edit anything earlier | **~8700 ms**, and no flag fixes it |
+
+A 36x cliff on an operation agents perform constantly - replacing a file's
+contents, dropping a stale tool result, rewriting a plan. At 256k the same cliff
+is minutes rather than seconds.
+
+This is the clearest engine-class gap found in this project. It is not a 15%
+tuning win: it is a 36x difference on a common operation that llama.cpp cannot
+currently address for this architecture. Handling it needs either per-boundary
+state snapshots that can be rolled back to (Inco's `StateCache` approach) or
+mRoPE-aware K-shifting, neither of which exists upstream today.

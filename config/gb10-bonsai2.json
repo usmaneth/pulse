@@ -434,5 +434,29 @@
       "caveat": "at 50% acceptance (what the drafter currently degrades to by 4k) q4_0 gives 47 tok/s and misses the target. Both levers are needed."
     },
     "quality_caveat": "these are throughput measurements only. q4_0 KV carries an accuracy cost that has NOT been measured here. TurboQuant's contribution is better distortion at low bit-width, which is exactly what a naive q4_0 does not give you."
+  },
+  "prefix_caching": {
+    "enabled_by_default_in_pulse": true,
+    "measured_8k": {
+      "cold_prefill_ms": 11443.5,
+      "append_only_ms": 242.2,
+      "mid_context_edit_ms": 8702.0,
+      "early_chunk_dropped_ms": 8124.7,
+      "append_only_speedup": 47.2
+    },
+    "measured_16k": {
+      "cold_prefill_ms": 22321.6,
+      "exact_replay_ms": 169.4,
+      "agentic_turn_ms": 321.0,
+      "exact_replay_speedup": 131.7
+    },
+    "cache_reuse_unavailable": {
+      "flag": "--cache-reuse",
+      "status": "silently disabled at load on this model",
+      "reason": "server-context.cpp:1132 gates it on llama_memory_can_shift(); llama-kv-cache.cpp:1176 returns false when hparams.n_pos_per_embd() > 1. Bonsai 2 uses mRoPE (rope.dimension_sections = [11,11,10]), so K-shift is refused. This is mRoPE, NOT the Gated DeltaNet hybrid - recurrent memory reports shifting as trivially supported.",
+      "consequence": "any edit before the tail costs a full re-prefill: 242 ms vs ~8700 ms at 8k, a 36x cliff"
+    },
+    "cache_ram_default_mib": 8192,
+    "cache_ram_warning": "KV at 256k is 17 GB, more than double the default prompt-cache budget. Raise --cache-ram for long-context deployments."
   }
 }
