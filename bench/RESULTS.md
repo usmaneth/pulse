@@ -3196,3 +3196,51 @@ determined afternoon.** Every shortcut that looked available - layout freedom,
 occupancy tuning, cliff avoidance - measured negative when tested.
 
 That is worth recording precisely because the opposite is so easy to assume.
+
+---
+
+# Round 43 - the multi-token GDN path is a different algorithm, not a longer loop
+
+The single-token GDN recurrence is exact (9.169e-08, Round 13). The natural
+assumption is that two tokens is that recurrence applied twice. It is not.
+
+| reconstruction | worst rel vs `new_state-0` (2 tokens) |
+|---|---|
+| sequential chain over both tokens | **8.866e-01** |
+| last token only, no state carry | 1.015e+00 |
+
+The chain beats ignoring the carry, so state does propagate - but sequential
+application is not what produces `new_state`.
+
+## Why
+
+`qwen35.cpp` dispatches on token count:
+
+- `n_tokens == 1` -> `LLM_FUSED_OP_GDN_AR`, the autoregressive path
+- `n_tokens > 1`  -> `LLM_FUSED_OP_GDN_CH`, the **chunked** path
+
+`delta-net-base.cpp` is 648 lines implementing the chunked form: cumulative
+decay products within a chunk, a decay mask, a UT transform, and a chunked
+attention solve. It is mathematically equivalent to the recurrence over a whole
+sequence, and it does **not** decompose into per-token steps with the same
+intermediate states - which is exactly why chaining the AR form does not
+reproduce its output.
+
+## What this means for the engine
+
+**Decode is complete. Prefill is not.**
+
+- Token generation - one token per step - uses the AR path, which this engine
+  implements and validates end to end, including the state layout, the gates,
+  and the head-dimension-scaled epsilon.
+- Processing a multi-token prompt uses the chunked path, which is a separate
+  algorithm and has not been written here.
+
+That is a real and precisely located boundary rather than a vague remainder. It
+also reframes the effort estimate: the remaining work on the GDN side is not
+"extend the loop", it is "implement a second algorithm", and Round 35's pattern
+(four iterations to reach 96% of a mature implementation, never passing it)
+applies to it as well.
+
+Recorded because "it works for one token, so N tokens is a loop" is exactly the
+assumption this whole project keeps finding to be false.

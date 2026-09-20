@@ -302,10 +302,32 @@ both keys are genuinely live.
 That also confirms the RoPE implementation in composition at a nonzero position,
 which the single-token run could not do.
 
-## Open items
+## Open item: the multi-token GDN path is a DIFFERENT algorithm
 
-- **Multi-token GDN.** The recurrence is validated from a zero state. Carrying
-  state across tokens, and the conv1d window growing (it becomes `[5, 10240]`
-  at two tokens), need a longer run.
+The single-token recurrence is exact (9.169e-08). Chaining it sequentially over
+two tokens does **not** reproduce `new_state`:
+
+| reconstruction | worst rel vs `new_state-0` |
+|---|---|
+| sequential chain over both tokens | 8.866e-01 |
+| last token only, no state carry | 1.015e+00 |
+
+The chain is better than ignoring the carry, so state clearly propagates - but
+it is not plain sequential application.
+
+The reason is in `qwen35.cpp`: `n_tokens == 1` dispatches
+`LLM_FUSED_OP_GDN_AR` (autoregressive), and `n_tokens > 1` dispatches
+`LLM_FUSED_OP_GDN_CH` (**chunked**). `delta-net-base.cpp` is 648 lines of
+chunked parallel scan - cumulative decay products, a decay mask, a UT transform -
+which is mathematically equivalent to the recurrence over a full sequence but
+does not decompose into per-token steps with the same intermediate states.
+
+**So decode is complete and prefill is not.** The autoregressive path - one token
+at a time, which is what token generation uses - is validated end to end. The
+chunked path, used when a prompt is processed in a batch, is a separate
+implementation that has not been written here.
+
+That is the honest boundary: this engine can generate, and cannot yet prefill a
+multi-token prompt through the GDN layers without falling back.
 - **Attention output projection + gate.** Mapping confirmed; projection not yet
   checked against `attn_output`.
