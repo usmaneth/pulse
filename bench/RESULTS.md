@@ -1038,3 +1038,77 @@ kernel-level mechanism is still open.
 
 `DSPARK_DRAFT_WINDOW` (0 = full prefix, the default) has **no measurable effect**
 at any value from 16 to 512 - all within 73.28 +/- 0.5.
+
+---
+
+# Round 12 - protocol, and two more dead levers
+
+## The noise floor depends on the protocol
+
+Round 11 put the floor at 10.2%. That was measured cold - quiesced, but with no
+warmup discarded, on runs that were still climbing. With warmup discarded and
+configs interleaved, the same config gives a 3.4% spread.
+
+Identical config, identical command, three protocols:
+
+| protocol | median tok/s | spread |
+|---|---|---|
+| n=3, favourable machine state | 73.30 | 1.5% (luck; does not reproduce) |
+| n=6, quiesced, no warmup discard | 66.31 | 10.2% (cold; runs climbing) |
+| n=4, 2 warmup discarded, interleaved | **71.45** | **3.4%** (warm steady state) |
+
+Both cold and warm are real and answer different questions: ~66 is first use
+after CPU activity, ~71.5 is sustained serving. `bench/ab.py` enforces the warm
+protocol and gates on 3.4%; `PULSE_NOISE_FLOOR` overrides it.
+
+The practical consequence is that **smaller optimisations are detectable than
+Round 11 concluded** - but only under the warm protocol.
+
+## Dead lever: CPU thread count
+
+Hypothesis: `llama-speculative-simple` defaults to 20 CPU threads on this box,
+and since the CPU and GPU share one LPDDR5X bus (Round 11), those threads should
+be stealing bandwidth from a fully GPU-offloaded decode.
+
+Measured, 2 warmup + 5 interleaved repeats:
+
+| config | median | spread | vs default |
+|---|---|---|---|
+| t=20 (default) | 69.55 | 7.2% | - |
+| t=8 | 69.23 | 12.1% | -0.5% |
+| t=4 | 70.75 | 7.0% | +1.7% |
+| t=2 | 69.73 | 5.9% | +0.3% |
+
+**No effect.** Everything is inside the 3.4% floor. The threads are blocked
+waiting on the GPU, not streaming memory, so they do not contend for the bus.
+Under a careless single-run protocol the +1.7% would have been reported as a win.
+
+## Dead lever: DSPARK_DRAFT_WINDOW
+
+`draft_window = 0` (the default) means full prefix. Values from 16 to 512 all
+measure 73.28 +/- 0.5 - no effect at any setting. Reading the source explains
+why: the drafter's context decode is already incremental. It stages only the rows
+since its own cache position (`n_cache[seq_id] = start` at the end of each
+round), so it replays the full prefix once on the first step and roughly the
+accepted-token count thereafter - about 5 context rows plus 7 draft rows.
+
+## Correction to the drafter-overhead arithmetic
+
+Rounds 9-10 computed drafter overhead by subtracting the Round 8 design curve
+from the measured dspark step time. The curve was measured on a **repetitive**
+prompt and the dspark figure on a **code** prompt, and that transfer is not
+clean: running the model-free n-gram drafter on the code prompt shows the curve
+under-predicting by roughly 19 ms there.
+
+So the precise "30 ms of overhead" and "~39 GB/s effective" figures are not
+supportable as stated. What survives is the **same-prompt differential**:
+
+| drafter | size | ms/step | delta |
+|---|---|---|---|
+| v1 | 603 MB | 60.3 | - |
+| v2 | 1.10 GB | 78.3 | +18.0 |
+
+Overhead scales ~1.81x for a 1.75x larger drafter on the same prompt, so the cost
+is the drafter's own forward pass and is roughly proportional to its weight
+volume. That much is solid. The absolute effective-bandwidth figure is not, and
+the kernel-level mechanism remains open.
