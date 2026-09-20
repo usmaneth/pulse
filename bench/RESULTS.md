@@ -1163,3 +1163,61 @@ Each grid cell is a single run, so cells carry roughly the cold noise band. The
 *pattern* is trustworthy because it is monotonic across five points and the
 crossover reproduces an independent earlier measurement taken with a different
 server invocation.
+
+---
+
+# Round 14 - the drafter cost, fully decomposed
+
+All rows below: same prompt (1359-token code context), same binary, warm
+interleaved protocol (2 warmup discarded, 5 repeats).
+
+## Inputs
+
+| measurement | value |
+|---|---|
+| no-drafter baseline at 1359-token context | 24.67 tok/s = **40.50 ms/step** |
+| v1 (0.632 GB) K=3 | 53.62 tok/s, 61.95 ms/step, spread 2.9% |
+| v2 (1.105 GB) K=3 | 53.19 tok/s, 65.46 ms/step, spread 3.0% |
+| v1 K=1 | 33.90 tok/s, 56.38 ms/step, **91.09% acceptance** |
+| v1 K=3 (repeat) | 53.05 tok/s, 62.61 ms/step, spread 1.0% |
+
+## Two clean differentials
+
+**Drafter size**, at matched K=3: `3.51 ms / 0.473 GB` = **7.42 ms/GB**, i.e.
+~135 GB/s on the drafter's weights - 73% of the 184.6 GB/s sustained.
+
+**Verify row cost**, same drafter at two depths (block size 4, so K=1 and K=3
+both run exactly one block pass and the drafter term cancels):
+`(62.61 - 56.38) / 2` = **3.11 ms per verify row**.
+
+That second number independently validates the Round 8 design curve, whose
+fitted slope was **2.9 ms/row** on a completely different, repetitive prompt.
+The curve's slope transfers; only its base does not, because the base includes
+KV-cache reads that grow with context - 36.6 ms at 256 tokens, 40.5 ms at 1359.
+Rounds 9-11 were right to distrust subtracting the curve's *base* from
+code-context numbers, and wrong to distrust its *slope*.
+
+## The decomposition
+
+    step(v1, K=3) = 62.61 ms
+      base, no drafter, 1359-token context      40.50 ms   64.7%
+      3 verify rows x 3.11 ms                    9.33 ms   14.9%
+      drafter                                   12.77 ms   20.4%
+        weights: 0.632 GB x 7.42 ms/GB           4.69 ms   physics
+        fixed orchestration                      8.08 ms   RECOVERABLE
+
+**Removing the fixed orchestration term: 62.61 -> 54.53 ms/step, +15%.**
+
+That is the measured value of the one genuine engine-class win - fusing draft and
+verify into a single graph instead of running the drafter in a separate
+`llama_context` with its own feature staging and KV add/remove every step.
+
+Caveat: the fixed/size split leans on a no-drafter baseline taken with a
+*different binary* (`llama-batched-bench`), which carries its own overhead.
+Honest range for the recoverable term is roughly 6-10 ms, i.e. **+11% to +19%**.
+
+## Incidental finding
+
+v1 at K=1 reaches **91.09% acceptance** - the highest measured in this project -
+but only 1.96 tok/step, so it yields 33.90 tok/s. Acceptance and depth trade off
+sharply: K=3 drops acceptance to 78.29% while raising throughput 56.5%.

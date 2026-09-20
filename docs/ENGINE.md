@@ -63,23 +63,52 @@ No-drafter baseline on the **same context length** (1359 tokens, B=1,
 rather than the 36.6 ms measured at 256-token context - KV cache reads add
 roughly 4 ms at this context.
 
-**What is solid:** the size slope (7.42 ms/GB) and the per-verify-row cost, both
-same-binary same-prompt differentials.
+### Isolating the per-verify-row cost
 
-**What is weaker:** splitting the drafter cost into a fixed orchestration term
-plus a size term requires a no-drafter baseline from a *different binary*
-(`llama-batched-bench` vs `llama-speculative-simple`), which carries its own
-overhead. The fixed term is therefore indicative, not precise.
+Differencing the **same drafter at two depths** cancels the drafter term entirely
+(block size is 4, so K=1 and K=3 both run one block pass):
+
+| config | tok/s | acceptance | ms/step | spread |
+|---|---|---|---|---|
+| v1 K=1 | 33.90 | **91.09%** | 56.38 | 6.6% |
+| v1 K=3 | 53.05 | 78.29% | 62.61 | 1.0% |
+
+`R = (62.61 - 56.38) / 2` = **3.11 ms per verify row**.
+
+This independently validates the Round 8 design curve, whose fitted slope was
+**2.9 ms/row** - measured on a completely different (repetitive) prompt. The
+curve's *slope* transfers; only its *base* does not, because the base contains
+KV-cache reads that grow with context (36.6 ms at 256 tokens, 40.5 ms at 1359).
+
+### The full decomposition
+
+    step(v1, K=3) = 62.61 ms
+      base (no drafter, 1359-tok context)   40.50 ms
+      3 verify rows x 3.11 ms                9.33 ms
+      drafter                               12.77 ms
+        of which weights: 0.632 GB x 7.42    4.69 ms   physics, irreducible
+        of which fixed orchestration         8.08 ms   RECOVERABLE by fusion
+
+**Removing the fixed term gives 62.61 -> 54.53 ms/step, or +15% throughput.**
+
+**What is solid:** the size slope (7.42 ms/GB) and the per-verify-row cost
+(3.11 ms), both same-binary same-prompt differentials, the latter cross-validated
+against an independent prompt.
+
+**What is weaker:** the fixed/size split uses a no-drafter baseline from a
+*different binary* (`llama-batched-bench` vs `llama-speculative-simple`), which
+carries its own overhead. Treat the 8.08 ms as indicative - the honest range is
+roughly 6-10 ms, i.e. **+11% to +19%**.
 
 ## So what would an engine actually buy?
 
 | change | measured payoff | note |
 |---|---|---|
-| fuse draft+verify into one graph | 60.3 -> ~54.1 ms, **~+11%** | this is the real one |
+| fuse draft+verify into one graph | 62.6 -> 54.5 ms, **+15%** (range +11-19%) | measured; this is the real one |
 | `mmvq` kernels for 9-16 columns | ~13%, but only at 9-15 rows | our drafters give 5 and 8 rows, so it does not apply |
 | CUDA Graphs over the whole step | unmeasured | llama.cpp cannot: Gated DeltaNet nodes fail `ggml_cuda_graph_check_compability`. A static-shape engine could |
 
-**Roughly 1.1-1.2x on single-stream, for months of work.** That is the honest
+**Roughly 1.15x on single-stream (measured range 1.11-1.19x), for months of work.** That is the honest
 number, and it is not 10x. It is also not nothing.
 
 ## What an engine would NOT fix
