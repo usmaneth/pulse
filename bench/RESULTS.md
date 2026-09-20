@@ -468,3 +468,122 @@ roughly 128 tok/s.
 
 Item 1 is a kernel engineering task with a measured floor and a known failure mode to
 avoid. Item 2 is a training run. Neither is speculative any more.
+
+---
+
+# Round 6 - audit of Rounds 1-5, and the batching finding
+
+Every number in this round was measured on an idle GB10 (0 other compute apps).
+Three conclusions published in earlier rounds are wrong. They are corrected here
+with the evidence that overturns them.
+
+## Correction 1: the LM head is NOT re-read per verification position
+
+Round 5 concluded that llama.cpp re-reads the whole 248,320-entry output head
+once per speculative verification row, costing 26.03 ms of a 79.63 ms step, and
+that a batched head kernel would recover it. That was inferred from a timing
+residual and supported with a cuBLAS comparison.
+
+It is false. In `ggml/src/ggml-cuda/mmvq.cu` the inner loop is:
+
+    for (int j = 0; j < ncols_dst; ++j)
+        for (int i = 0; i < rows_per_cuda_block; ++i)
+            tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], ...);
+
+`vx` (the quantized weight) does not depend on `j`. `mul_mat_vec_q` already
+amortizes the weight read across every verification column inside one kernel.
+GB10 has its own dispatch branch (`GGML_CUDA_CC_DGX_SPARK = 1210`) which routes
+PQ2_0 to this path for `ne11 <= 8`, so K=7 uses exactly it.
+
+Measured confirmation, same kernel, from an nsys profile of real decode:
+
+| ncols_dst | avg kernel duration |
+|---|---|
+| 2 | 87.6 us |
+| 4 | 90.8 us |
+| 5 | 96.8 us |
+
++10% for 2.5x the columns. A per-position re-read would be +150%.
+
+The cuBLAS "proof" benchmarked 8 separate GEMV launches. llama.cpp never issues
+that. The proposed CUTLASS mixed-input head kernel would have returned nothing.
+
+## Correction 2: concurrency DOES scale - the earlier test used one slot
+
+Round 3 measured aggregate throughput saturating at 65.8 tok/s and concluded
+"concurrency adds no aggregate throughput... one stream already pulls ~160 of
+184 GB/s", and that this was a hardware property distinguishing GB10 from an
+M5 Max.
+
+The `llama-server` used for that test was launched with `-np 1`. That is a
+single slot: 16 clients queued on one lane. It measured queueing, not batching.
+
+`llama-batched-bench`, true batched decode, no speculation, 256-token prompts:
+
+| B | S_PP t/s | S_TG t/s | S total t/s |
+|---|---|---|---|
+| 1 | 994.80 | 27.54 | 123.99 |
+| 2 | 980.48 | 46.53 | 195.52 |
+| 4 | 976.54 | 78.92 | 298.21 |
+| 8 | 945.06 | 106.09 | 366.06 |
+| 16 | 881.44 | 133.08 | 414.87 |
+
+Decode scales 4.83x from B=1 to B=16. Batching amortizes the 6.70 GB weight
+sweep across sequences; the bandwidth wall binds only at batch 1.
+
+Prefill is ~995 tok/s, not the 646 tok/s published earlier.
+
+## Correction 3: K saturates at the drafter's block size
+
+Round 4 fit `t_step = 48.3 + 4.47*K` and reasoned about K=8.5 as if K were free.
+K is capped by the drafter's block size. The v1 drafter has block size 4, so
+`--spec-draft-n-max 7` is a no-op past 4, and several "K=7" rows in earlier
+rounds are really K=4.
+
+## New: step time is independent of context length
+
+Same drafter and K, two context lengths 325x apart:
+
+| ctx tok | K | tok/s | accept% | tok/step | ms/step |
+|---|---|---|---|---|---|
+| 5 | 1 | 39.48 | 96.97 | 1.97 | 49.89 |
+| 5 | 3 | 61.11 | 87.16 | 3.57 | 58.38 |
+| 5 | 5 | 64.50 | 77.52 | 4.03 | 62.48 |
+| 5 | 7 | 64.53 | 77.52 | 4.03 | 62.45 |
+| 1625 | 1 | 38.11 | 91.18 | 1.91 | 50.16 |
+| 1625 | 3 | 58.05 | 79.49 | 3.38 | 58.31 |
+| 1625 | 5 | 59.27 | 67.83 | 3.69 | 62.33 |
+| 1625 | 7 | 58.80 | 67.83 | 3.69 | 62.83 |
+
+ms/step matches within 1% at every K. The per-row cost is not attention and not
+KV traffic. Acceptance does fall with context on these prompts.
+
+## Confirmed: single-stream decode is memory-bandwidth bound
+
+Two independent decode processes, each K=7, 96 tokens:
+
+    single       : 63.14 tok/s
+    2x aggregate : 63.88 tok/s   (1.01x)
+
+Flat. Single-stream is bandwidth bound, which is why only batching helps.
+
+## Measurement hazard: nsys under-reports GPU busy time on GB10
+
+An nsys trace of real decode reported the GPU 92.2% idle (95.7 ms of kernel
+time inside a 1281.8 ms window). That is a CUPTI artifact on GB10 unified
+memory - kernel durations do not capture fabric stalls. The 1.01x
+two-process result above disproves it directly. Do not publish GPU-idle
+percentages from nsys on this machine.
+
+Separately: `[CUDA memcpy Host-to-Device]` totals ~160 ms but is model load, not
+per-step. It is 153.6 ms at n=32 and 160.6 ms at n=128 - flat in token count.
+
+## Where the time actually goes (nsys, real decode, K=7)
+
+PQ2_0 `mul_mat_vec_q` is 58% of all kernel time (186 ms of 320 ms), split across
+the ncols=2/4/5 variants. It is the single dominant kernel.
+
+Note a real gap: `vec_dot_ptq1_0_q8_1_multi` exists in `vecdotq.cuh:809` and
+fuses dequantization across columns for PTQ1_0. PQ2_0 - the format Bonsai 2 uses
+for every layer and the head - has no equivalent and goes through the generic
+per-column path.
