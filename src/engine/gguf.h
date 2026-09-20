@@ -58,6 +58,7 @@ public:
 
         for (uint64_t i = 0; i < n_kv_; ++i) {
             std::string key = str();
+            cur_key_ = key;
             uint32_t t = u32();
             std::string val = read_value(t);
             if (!val.empty()) kv_[key] = val;
@@ -96,6 +97,30 @@ public:
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     const std::map<std::string,std::string>& kv() const { return kv_; }
 
+    // Raw access to array-valued metadata. prism.hadamard.sign_values is 28672
+    // entries and must be used, not printed.
+    struct ArrRef { uint32_t type; uint64_t n; const uint8_t* data; };
+    const ArrRef* array(const std::string& k) const {
+        auto it = arrays_.find(k); return it == arrays_.end() ? nullptr : &it->second;
+    }
+    // Reads an integer array of any width into int32.
+    bool array_i32(const std::string& k, std::vector<int32_t>& out) const {
+        const ArrRef* a = array(k); if (!a) return false;
+        out.resize(a->n);
+        for (uint64_t i = 0; i < a->n; ++i) {
+            switch (a->type) {
+                case GT_INT8:   out[i] = (int8_t)a->data[i]; break;
+                case GT_UINT8:  out[i] = a->data[i]; break;
+                case GT_INT16:  { int16_t v; memcpy(&v,a->data+i*2,2); out[i]=v; } break;
+                case GT_UINT16: { uint16_t v; memcpy(&v,a->data+i*2,2); out[i]=v; } break;
+                case GT_INT32:  { int32_t v; memcpy(&v,a->data+i*4,4); out[i]=v; } break;
+                case GT_UINT32: { uint32_t v; memcpy(&v,a->data+i*4,4); out[i]=(int32_t)v; } break;
+                default: return false;
+            }
+        }
+        return true;
+    }
+
 private:
     uint8_t  u8()  { uint8_t v; memcpy(&v,p_,1); p_+=1; return v; }
     uint16_t u16() { uint16_t v; memcpy(&v,p_,2); p_+=2; return v; }
@@ -129,6 +154,8 @@ private:
             case GT_ARRAY: {
                 uint32_t et = u32();
                 uint64_t n  = u64();
+                cur_arr_type_ = et; cur_arr_n_ = n;
+                cur_arr_begin_ = p_;
                 // Keep short numeric arrays verbatim - rope.dimension_sections
                 // and friends are configuration the engine must honour exactly.
                 std::string joined; bool keep = (n <= 8 && et != GT_STRING);
@@ -137,6 +164,9 @@ private:
                     std::string v = read_value(et);
                     if (i == 0) first = v;
                     if (keep) { if (i) joined += ", "; joined += v; }
+                }
+                if (cur_key_.size()) {
+                    arrays_[cur_key_] = ArrRef{ cur_arr_type_, cur_arr_n_, cur_arr_begin_ };
                 }
                 if (keep) return "[" + joined + "]";
                 snprintf(buf,sizeof buf,"[%llu items", (unsigned long long)n);
@@ -157,8 +187,11 @@ private:
     uint32_t version_ = 0;
     uint64_t n_tensors_ = 0, n_kv_ = 0;
     size_t data_start_ = 0;
+    std::string cur_key_;
+    uint32_t cur_arr_type_ = 0; uint64_t cur_arr_n_ = 0; const uint8_t* cur_arr_begin_ = nullptr;
     std::vector<TensorInfo> tensors_;
     std::map<std::string,std::string> kv_;
+    std::map<std::string,ArrRef> arrays_;
 };
 
 } // namespace pulse

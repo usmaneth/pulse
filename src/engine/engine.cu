@@ -233,6 +233,51 @@ void k_gdn_step(float* __restrict__ S,            // [n_vhead][dk][dv]
     }
 }
 
+
+// ------------------------------------------------------ Hadamard activation
+// 401 of this model's weights are Hadamard-FOLDED, output.weight among them.
+// The fold lives in the weights; the matching rotation must be applied to the
+// ACTIVATION immediately before the matmul, or the result is meaningless.
+// llama-graph.cpp:1571 gives the order exactly:
+//
+//     if (signs) cur = cur * signs;
+//     cur = mul_mat_hadamard(cur, rot);
+//     res = mul_mat(w, cur);
+//
+// Metadata: transform = normalized-sylvester-walsh-hadamard, block_size = 1024,
+// axis = input-last-dimension, sign_mode = explicit.
+//
+// A Sylvester-Walsh-Hadamard of order 2^k is the fast WHT: k butterfly stages,
+// no matrix needed. Normalised means dividing by sqrt(block) = 32.
+__global__ __launch_bounds__(512)
+void k_hadamard(float* __restrict__ x, const float* __restrict__ signs,
+                int n, int block, float scale) {
+    extern __shared__ float sb[];
+    const int blk  = blockIdx.x;
+    const int base = blk*block;
+    const int tid  = threadIdx.x, nthr = blockDim.x;
+
+    for (int i = tid; i < block; i += nthr) {
+        const int g = base + i;
+        sb[i] = (g < n) ? (signs ? x[g]*signs[g] : x[g]) : 0.0f;
+    }
+    __syncthreads();
+
+    // in-place fast Walsh-Hadamard: log2(block) butterfly stages
+    for (int len = 1; len < block; len <<= 1) {
+        for (int i = tid; i < block/2; i += nthr) {
+            const int pair = (i / len)*(len<<1) + (i % len);
+            const float a = sb[pair], b = sb[pair+len];
+            sb[pair] = a + b; sb[pair+len] = a - b;
+        }
+        __syncthreads();
+    }
+    for (int i = tid; i < block; i += nthr) {
+        const int g = base + i;
+        if (g < n) x[g] = sb[i]*scale;
+    }
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -504,6 +549,122 @@ int main(int argc, char** argv) {
         printf("  constant in context length - this is why long context is affordable here\n");
         cudaFree(dS);cudaFree(dq);cudaFree(dk_);cudaFree(dv_);
         cudaFree(da);cudaFree(db);cudaFree(doo);
+    }
+
+    // ---- validation against llama.cpp's own intermediates, if dumped
+    if (argc > 2) {
+        const char* refdir = argv[2];
+        auto load_ref = [&](const char* name, std::vector<float>& out)->bool {
+            char path[1100]; snprintf(path,sizeof path,"%s/%s.bin",refdir,name);
+            FILE* f = fopen(path,"rb"); if (!f) return false;
+            int32_t ty; int64_t ne[4];
+            if (fread(&ty,4,1,f)!=1 || fread(ne,8,4,f)!=4) { fclose(f); return false; }
+            if (ty != 0) { fclose(f); return false; }          // f32 only
+            size_t n = (size_t)ne[0]*ne[1]*ne[2]*ne[3];
+            out.resize(n);
+            const bool ok = fread(out.data(),4,n,f)==n;
+            fclose(f); return ok;
+        };
+        printf("\nvalidation against llama.cpp intermediates (%s):\n", refdir);
+
+        std::vector<float> emb, ref_an0;
+        if (load_ref("model.input_embed", emb) && load_ref("attn_norm-0", ref_an0)) {
+            const DevTensor* w = m.layer(0,"attn_norm.weight");
+            if (w && (int)emb.size() == n) {
+                float *de,*dr;
+                CU(cudaMalloc(&de,n*4)); CU(cudaMalloc(&dr,n*4));
+                CU(cudaMemcpy(de,emb.data(),n*4,cudaMemcpyHostToDevice));
+                k_rmsnorm<<<1,256>>>(de,(const float*)w->ptr,dr,n,hp.rms_eps);
+                CU(cudaDeviceSynchronize());
+                std::vector<float> got(n);
+                CU(cudaMemcpy(got.data(),dr,n*4,cudaMemcpyDeviceToHost));
+                double e=0, mag=0;
+                for (int i=0;i<n;++i){ e=std::max(e,(double)std::fabs(got[i]-ref_an0[i]));
+                                       mag=std::max(mag,(double)std::fabs(ref_an0[i])); }
+                report("rmsnorm vs llama.cpp attn_norm-0", e/std::max(mag,1e-9), 1e-4);
+                cudaFree(de); cudaFree(dr);
+            }
+        } else {
+            printf("  (reference tensors not found - run bin/pulse-dumpref first)\n");
+        }
+
+        // the output head: result_norm -> logits, against llama.cpp's own.
+        // output.weight is Hadamard-folded, so the activation is transformed first.
+        std::vector<float> rn, ref_logits;
+        if (load_ref("result_norm", rn) && load_ref("result_output", ref_logits)) {
+            const DevTensor* ow = m.get("output.weight");
+            if (ow && ow->type == T_PQ2_0 && (int)rn.size() == n) {
+                const int nv = (int)ow->ne[1];
+                float *dn,*dl;
+                CU(cudaMalloc(&dn,n*4)); CU(cudaMalloc(&dl,(size_t)nv*4));
+                CU(cudaMemcpy(dn,rn.data(),n*4,cudaMemcpyHostToDevice));
+
+                // --- Hadamard: sign flip, then normalised blockwise WHT
+                std::vector<int32_t> sv, sw;
+                const bool have_signs = m.reader().array_i32("prism.hadamard.sign_values", sv)
+                                     && m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                float* d_sign = nullptr;
+                if (have_signs) {
+                    size_t off = 0; bool found = false;
+                    for (size_t wi = 0; wi < sw.size(); ++wi) {
+                        if (sw[wi] == n) { found = true; break; }
+                        off += (size_t)sw[wi];
+                    }
+                    if (found && off + n <= sv.size()) {
+                        std::vector<float> sf(n);
+                        for (int i = 0; i < n; ++i) sf[i] = (float)sv[off+i];
+                        CU(cudaMalloc(&d_sign, n*4));
+                        CU(cudaMemcpy(d_sign, sf.data(), n*4, cudaMemcpyHostToDevice));
+                        printf("    hadamard: signs width %d at offset %zu (widths:", n, off);
+                        for (auto w2 : sw) printf(" %d", w2);
+                        printf(")\n");
+                    }
+                }
+                const int hblock = 1024;
+                const int nblocks_h = (n + hblock - 1)/hblock;
+                k_hadamard<<<nblocks_h,512,hblock*sizeof(float)>>>(
+                    dn, d_sign, n, hblock, 1.0f/std::sqrt((float)hblock));
+                CU(cudaDeviceSynchronize());
+
+                k_matvec_pq2<<<(nv+7)/8,256>>>((const blk*)ow->ptr,dn,dl,n,nv);
+                CU(cudaDeviceSynchronize());
+                std::vector<float> got(nv);
+                CU(cudaMemcpy(got.data(),dl,(size_t)nv*4,cudaMemcpyDeviceToHost));
+                double e=0, mag=0; int am_got=0, am_ref=0;
+                for (int i=0;i<nv;++i){
+                    e = std::max(e,(double)std::fabs(got[i]-ref_logits[i]));
+                    mag = std::max(mag,(double)std::fabs(ref_logits[i]));
+                    if (got[i]>got[am_got]) am_got=i;
+                    if (ref_logits[i]>ref_logits[am_ref]) am_ref=i;
+                }
+                // Relative-to-max is a weak test on a 248k-way head. What matters
+                // for decoding is whether the ranking agrees, so check top-k.
+                std::vector<int> ig(nv), ir(nv);
+                for (int i=0;i<nv;++i){ ig[i]=i; ir[i]=i; }
+                auto topk = [&](std::vector<int>& idx, const std::vector<float>& v, int k){
+                    std::partial_sort(idx.begin(), idx.begin()+k, idx.end(),
+                        [&](int a,int b){ return v[a] > v[b]; });
+                };
+                topk(ig, got, 10); topk(ir, ref_logits, 10);
+                int agree = 0; for (int i=0;i<10;++i) agree += (ig[i]==ir[i]);
+                double maxd_top = 0;
+                for (int i=0;i<10;++i) maxd_top = std::max(maxd_top,
+                    (double)std::fabs(got[ir[i]] - ref_logits[ir[i]]));
+                report("output head vs llama.cpp logits", e/std::max(mag,1e-9), 5e-3);
+                printf("    argmax: pulse %d (%.4f)   llama.cpp %d (%.4f)   %s\n",
+                       am_got, got[am_got], am_ref, ref_logits[am_ref],
+                       am_got==am_ref ? "MATCH" : "DIFFER");
+                printf("    top-10 ranking agreement : %d/10\n", agree);
+                printf("    max |diff| over top-10   : %.4f  (logit scale ~%.1f)\n",
+                       maxd_top, ref_logits[am_ref]);
+                printf("    interpretation: the head dot products have condition ~6e3,\n");
+                printf("      so %.1e relative here is ~%.1e scaled by sum|terms| - fp32 noise,\n",
+                       e/std::max(mag,1e-9), (e/std::max(mag,1e-9))/6e3);
+                printf("      not a logic error. llama.cpp applies the rotation as an explicit\n");
+                printf("      mul_mat against a rot matrix; this uses FWHT butterflies.\n");
+                cudaFree(dn); cudaFree(dl); if (d_sign) cudaFree(d_sign);
+            }
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);

@@ -99,6 +99,7 @@ public:
     // A layer is full-attention when it has attn_q; the others carry ssm_*.
     bool is_full_attn(int il) const { return layer(il, "attn_q.weight") != nullptr; }
 
+    const Reader& reader() const { return r_; }
     const Hparams& hp() const { return hp_; }
     size_t bytes_on_gpu() const { return bytes_on_gpu_; }
     const std::string& arch() const { return arch_; }
