@@ -71,13 +71,17 @@ curve for you. Honest caveat: versus a static always-on drafter the gain is only
 
 ## Drafters
 
-| drafter | size | block | best K | tok/s | acceptance | spread over 5 runs |
+| drafter | size | block | best K | tok/s | acceptance | tok/step |
 |---|---|---|---|---|---|---|
-| v1 | 603 MB | 4 | 3 | 62.98 | **90.18%** | ±0.3 (deterministic) |
-| v2 | 1.10 GB | 7 | 7 | 63.83 median | 68.59% | 59.72-70.82 |
+| v1 | 603 MB | 4 | 4 | 64.1 | 72.28% | 3.86 |
+| **v2** | 1.10 GB | 7 | **7** | **73.3** | 69.10% | 5.74 |
 
-v1 is the default: it gives up ~1.7 tok/s of median throughput and buys 21 points
-of acceptance and an 18x tighter spread.
+v2 at K=7 is the default: **73.3 tok/s** over 3 repeats (spread 1.09) on a realistic
+code context, against a 27.54 tok/s no-drafter baseline — **2.66x**.
+
+Stacking a free n-gram drafter ahead of the neural one helps v1 (+1.8%) and *hurts*
+v2 (−11%): the free drafts displace deeper dspark drafts, 5.74 → 4.62 tok/step. With
+the recommended drafter, don't stack.
 
 **K is capped by the drafter's block size.** With v1, `--spec-draft-n-max 5` and
 `7` are byte-identical to `4`. Requesting more is a no-op, and earlier rounds of
@@ -116,11 +120,25 @@ pulse profile                 # print the tuning profile with provenance
 
 ## What would actually move the number
 
-Single-stream is capped by a **~3.5 ms cost per drafted row** that is *not*
-attention, *not* KV traffic, and *not* the drafter (all three measured and ruled
-out in `bench/RESULTS.md`). Remove it and the v1 drafter's already-measured
-90.18% acceptance gives roughly **100 tok/s single-stream with no new model
-trained**. That is the open problem worth working on.
+**The drafter's forward pass runs at ~39 GB/s — 21% of the 184.6 GB/s this machine
+sustains.** Measured by differencing each drafter's step time against the design
+curve at matched tokens/step:
+
+| drafter | size | overhead | effective bandwidth |
+|---|---|---|---|
+| v1 | 603 MB | +15.4 ms/step | 39.2 GB/s |
+| v2 | 1.10 GB | +27.9 ms/step | 39.4 GB/s |
+
+Overhead scales 1.81x for a 1.75x drafter, so it's the forward pass itself. The
+cause is visible in the profile: a 5-layer block-diffusion model executed as ~24
+separate MMQ launches per step, each moving ~25 MB — far too little to saturate
+the bus. It's latency-bound, not bandwidth-bound.
+
+At achievable bandwidth, v2 would be `50.33 + 1.10/184.6 = 56.3 ms/step` →
+**102 tok/s single-stream**. That closes the entire gap to the target, and it is a
+runtime optimization on drafter execution: we already own a block-7 drafter, so no
+retrain is required. CUDA Graphs won't fix it — the drafter has Gated DeltaNet
+layers, which is exactly why graphs get rejected at runtime.
 
 ## History
 
