@@ -1701,3 +1701,66 @@ is not free - at 256k each is 17.2 GB.
 
 This is the mechanism Inco's `StateCache` implements natively. llama.cpp already
 exposes the primitive; nothing in this repo was using it.
+
+---
+
+# Round 22 - the checkpoint layer, built and honestly assessed
+
+`src/server/checkpoint.ts` implements the Round 21 mechanism: checkpoints keyed
+by a prefix hash, longest-prefix matching against the incoming prompt, restore
+before forwarding, save after responding, LRU eviction against a retention
+budget. Wired into both streaming and non-streaming paths, stats on `/status`.
+
+## What is verified
+
+The mechanism works end to end. A 4-turn conversation whose final turn edits
+turn 2 correctly identified the turn-1 boundary as the longest matching prefix
+and restored it:
+
+    checkpoints: entries=3 saves=5 restores=3 hits=3 misses=4
+    last restore: 31.574 ms
+    last_checkpoint_restore: {chars: 6035, bytes: 275361704}
+
+31.6 ms to restore 275 MB, consistent with the isolated Round 21 figures
+(28.5-90.8 ms).
+
+## What is NOT demonstrated
+
+**A large end-to-end wall-clock win.** On a fresh backend:
+
+| turn | wall |
+|---|---|
+| 1 (cold) | 7221.8 ms |
+| 2 (append) | 3619.4 ms |
+| 3 (append) | 6727.2 ms |
+| **4 (edits turn 2)** | **13768.5 ms** |
+
+Turn 4 still cost 13.8 s despite a successful 31.6 ms restore, because the edit
+landed at turn 2 of 4 - so roughly three quarters of the context had to be
+re-prefilled after the rollback.
+
+This is exactly the bound stated in Round 21 before the layer was built: the
+saving depends on **where** the edit lands. The test scenario chose close to the
+worst case. An edit in the final turn would restore nearly everything; an edit in
+the first turn restores nothing.
+
+The paired A/B (identical sequence with the layer disabled) was **not** obtained:
+the disabled-arm proxy failed to bind port 8000 and returned HTTP 500. Three
+attempts were lost to process-management bugs, principally `pgrep -f <pattern>`
+matching the very shell that invoked it - a mistake repeated five times this
+session. Killing by listening port avoids it.
+
+## Honest status
+
+| claim | status |
+|---|---|
+| slot save/restore works on this model | **verified** |
+| restore is 28.5-90.8 ms vs 8702 ms re-prefill | **measured** |
+| checkpoint layer selects the right prefix and restores | **verified end to end** |
+| large end-to-end win on a realistic edit | **not demonstrated** |
+
+The layer is a correct implementation of a mechanism with a measured 96x
+advantage on the restore itself. Whether that converts into a user-visible win
+depends entirely on edit locality in real agent traffic, which has not been
+measured. That is the next thing to establish, and it should be measured on real
+transcripts rather than assumed.
