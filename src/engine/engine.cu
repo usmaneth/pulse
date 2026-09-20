@@ -736,6 +736,57 @@ int main(int argc, char** argv) {
                 if (sgn_in) cudaFree(sgn_in); if (sgn_ff) cudaFree(sgn_ff);
             }
         }
+        // ---- GDN entry: attn_norm-0 -> [hadamard?] -> attn_qkv
+        // Layer 0 is a gated-delta layer. Its qkv projection is the first step,
+        // and whether it needs the Hadamard rotation is exactly the kind of
+        // thing only ground truth settles.
+        std::vector<float> an0, ref_qkv;
+        if (load_ref("attn_norm-0", an0) && load_ref("linear_attn_qkv_mixed-0", ref_qkv)) {
+            const DevTensor* wq = m.layer(0,"attn_qkv.weight");
+            if (wq && (int)an0.size() == n) {
+                const int nout = (int)wq->ne[1];
+                std::vector<int32_t> sv, sw;
+                m.reader().array_i32("prism.hadamard.sign_values", sv);
+                m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                float* sgn = nullptr;
+                { size_t off=0;
+                  for (size_t i=0;i<sw.size();++i){ if (sw[i]==n){
+                        std::vector<float> f(n);
+                        for (int j=0;j<n;++j) f[j]=(float)sv[off+j];
+                        CU(cudaMalloc(&sgn,n*4));
+                        CU(cudaMemcpy(sgn,f.data(),n*4,cudaMemcpyHostToDevice)); break; }
+                      off += (size_t)sw[i]; } }
+                const int HB=1024; const float hs=1.0f/std::sqrt((float)HB);
+
+                // try both, and let the data say which is right
+                for (int variant = 0; variant < 2; ++variant) {
+                    float *dx,*dy;
+                    CU(cudaMalloc(&dx,n*4)); CU(cudaMalloc(&dy,(size_t)nout*4));
+                    CU(cudaMemcpy(dx,an0.data(),n*4,cudaMemcpyHostToDevice));
+                    if (variant == 1)
+                        k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dx,sgn,n,HB,hs);
+                    CU(cudaDeviceSynchronize());
+                    k_matvec_pq2<<<(nout+7)/8,256>>>((const blk*)wq->ptr,dx,dy,n,nout);
+                    CU(cudaDeviceSynchronize());
+                    std::vector<float> got(nout);
+                    CU(cudaMemcpy(got.data(),dy,(size_t)nout*4,cudaMemcpyDeviceToHost));
+                    const int cmp = std::min((int)ref_qkv.size(), nout);
+                    double e=0,mag=0,cn=0,ga=0,ra=0;
+                    for (int i=0;i<cmp;++i){
+                        e=std::max(e,(double)std::fabs(got[i]-ref_qkv[i]));
+                        mag=std::max(mag,(double)std::fabs(ref_qkv[i]));
+                        cn+=(double)got[i]*ref_qkv[i]; ga+=(double)got[i]*got[i];
+                        ra+=(double)ref_qkv[i]*ref_qkv[i]; }
+                    printf("    attn_qkv %-18s rel %.3e  cos %.8f\n",
+                           variant? "WITH hadamard":"WITHOUT hadamard",
+                           e/std::max(mag,1e-9), cn/std::sqrt(std::max(ga*ra,1e-30)));
+                    if (variant == 1)
+                        report("GDN qkv projection vs llama.cpp", e/std::max(mag,1e-9), 1e-2);
+                    cudaFree(dx); cudaFree(dy);
+                }
+                if (sgn) cudaFree(sgn);
+            }
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
