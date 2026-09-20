@@ -806,3 +806,71 @@ The design curve says 3.66 tok/step should cost ~44 ms/step, and this measures
 56.26. The remaining gap is the drafter's own forward pass, which is the price of
 its acceptance. Closing the gap means a cheaper or deeper drafter, not a runtime
 change - every runtime lever has now been measured and tabulated.
+
+---
+
+# Round 10 - the final measured state, and the one lever left
+
+## Best measured single-stream configuration
+
+v2 drafter (block 7) at K=7, realistic 5000-char code context, temp 0:
+
+| run | tok/s | accept% | tok/step | ms/step |
+|---|---|---|---|---|
+| 1 | 73.39 | 69.10% | 5.74 | 78.15 |
+| 2 | 73.20 | 69.10% | 5.74 | 78.35 |
+| 3 | 72.30 | 69.10% | 5.74 | 79.32 |
+
+**73.3 tok/s**, spread 1.09, against a 27.54 tok/s no-drafter baseline: **2.66x**.
+
+This supersedes the earlier "v1 at K=3 / K=4" recommendation. Earlier rounds
+preferred v1 because they measured v2 on a shorter, less representative context.
+
+Stacking an n-gram drafter helps v1 (+1.8%) and **hurts** v2 (-11%, 73.20 ->
+65.28): the free n-gram drafts displace deeper dspark drafts, 5.74 -> 4.62
+tok/step. With the recommended drafter, do not stack.
+
+## The one lever left, quantified
+
+Overhead is measured ms/step minus the Round 8 design curve at the same
+tokens/step - that is, the cost of the drafter path over a free drafter:
+
+| drafter | size | tok/step | ms/step | curve | overhead | effective bandwidth |
+|---|---|---|---|---|---|---|
+| v1 | 603 MB | 3.86 | 60.3 | 44.90 | +15.4 ms | **39.2 GB/s** |
+| v2 | 1.10 GB | 5.74 | 78.3 | 50.33 | +27.9 ms | **39.4 GB/s** |
+
+Overhead scales 1.81x for a 1.75x larger drafter, so it is the drafter's own
+forward pass rather than a fixed cost. Both land at **~39 GB/s, 21% of the
+184.6 GB/s this machine sustains.**
+
+The cause is visible in the profile: the drafter is a 5-layer block-diffusion
+model with its own Gated DeltaNet layers and Hadamard transforms, executed as
+~24 separate MMQ launches per step. Each moves ~25 MB, far too little to
+saturate the bus, so the pass is latency-bound rather than bandwidth-bound.
+
+**If the drafter forward ran at achievable bandwidth:**
+
+    50.33 ms (curve at 5.74 tok/step) + 1.10 GB / 184.6 GB/s = 56.3 ms
+    5.74 / 0.0563 = 102 tok/s single-stream
+
+That is the whole remaining gap to the 100 tok/s target, and it is a runtime
+optimization on drafter execution - not a new drafter, not a new target
+quantization, and not a deeper block. We already own a block-7 drafter.
+
+CUDA Graphs will not fix it: the drafter has Gated DeltaNet layers, which is
+exactly why graphs are rejected at runtime (Round 6).
+
+## Final scorecard
+
+| metric | measured | note |
+|---|---|---|
+| single-stream decode | **73.3 tok/s** | v2, K=7, 3 repeats |
+| no-drafter baseline | 27.54 tok/s | = 6.70 GB / 184.6 GB/s |
+| speedup from speculation | 2.66x | |
+| aggregate, 16 clients | 117.71 tok/s | 16 slots, no drafter |
+| batched decode, B=16 | 133.08 tok/s | llama-batched-bench |
+| prefill | ~995 tok/s | |
+| vs stock llama.cpp defaults | 1.53-1.61x | configuration only |
+| hardware ceiling at 5.74 tok/step | ~114 tok/s | if the drafter were free |
+| reachable by fixing drafter execution | ~102 tok/s | the open work |

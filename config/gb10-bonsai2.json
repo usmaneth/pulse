@@ -53,15 +53,17 @@
       "block_size": 7,
       "optimal_k": 7,
       "measured": {
-        "median_toks_sec": 63.83,
-        "min": 59.72,
-        "max": 70.82,
-        "acceptance": 0.6859,
-        "repeats": 5
+        "toks_sec": 73.3,
+        "acceptance": 0.691,
+        "tok_per_step": 5.74,
+        "ms_per_step": 78.3,
+        "repeats": 3,
+        "spread_toks_sec": 1.09,
+        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos"
       }
     },
-    "recommended": "v1",
-    "recommended_provenance": "v1 at K=4 is the measured best single-stream config on realistic code context"
+    "recommended": "v2",
+    "recommended_provenance": "v2 at K=7 is the measured best single-stream config on realistic code context: 73.2-73.4 tok/s over 3 repeats, vs 63.8-64.3 for v1 at K=4. Earlier rounds preferred v1 because they measured v2 on a shorter, less representative context."
   },
   "k_policy": {
     "rule": "never request K above the drafter's block_size",
@@ -105,7 +107,9 @@
     "ptq1_0_target": "smaller target measured 22% slower (51.73 vs 65.96 tok/s)",
     "kv_quant_q8_0": "65.53 vs 66.59 f16 - slightly worse",
     "ngram_stacking": "counters byte-identical to the drafter alone; never engaged",
-    "batched_lm_head_kernel": "no gain available. mul_mat_vec_q already amortises the weight read across ncols_dst; measured +10% kernel time for 2.5x the columns."
+    "batched_lm_head_kernel": "no gain available. mul_mat_vec_q already amortises the weight read across ncols_dst; measured +10% kernel time for 2.5x the columns.",
+    "drafter_stacking_with_ngram_cache": "40.18 vs 63.88 tok/s, -37%",
+    "forcing_mmq_earlier": "GGML_MMVQ_MAX below 8 measured 34% worse at 5 rows (100.78 -> 75.21)"
   },
   "vs_stock_defaults": {
     "$comment": "Measured today, idle GB10, same model, same harness (bench/conc.py), 128 tokens/request, temp 0.",
@@ -198,5 +202,44 @@
       "projected_toks_sec_at_block5": 96
     },
     "both": "~100+ tok/s single-stream, no change to the target model"
+  },
+  "spec_type": {
+    "recommended": "draft-dspark",
+    "measured": {
+      "toks_sec": 73.3,
+      "acceptance": 0.691,
+      "tok_per_step": 5.74,
+      "ms_per_step": 78.3
+    },
+    "provenance": "stacking an n-gram drafter helps the shallow v1 drafter (+1.8%: 63.88 -> 65.06) but HURTS the deep v2 drafter (-11%: 73.20 -> 65.28), because free n-gram drafts displace deeper dspark drafts (5.74 -> 4.62 tok/step). With the recommended v2 drafter, do not stack.",
+    "requires_real_context": "an n-gram drafter needs something to look up. On a 60-token prompt it never fires and stacking is a no-op - an earlier round concluded it was broken on exactly that basis.",
+    "do_not_use": {
+      "draft-dspark,ngram-cache": "measured 40.18 tok/s, -37%"
+    }
+  },
+  "the_one_remaining_lever": {
+    "finding": "the dspark drafter's forward pass runs at ~39 GB/s, 21% of the 184.6 GB/s this machine achieves",
+    "evidence": [
+      {
+        "drafter": "v1",
+        "bytes": 631713664,
+        "overhead_ms_per_step": 15.4,
+        "effective_gbs": 39.2
+      },
+      {
+        "drafter": "v2",
+        "bytes": 1104605632,
+        "overhead_ms_per_step": 27.9,
+        "effective_gbs": 39.4
+      }
+    ],
+    "method": "overhead = measured ms/step minus the n-gram design curve at the same tokens/step. Overhead scales 1.81x for a 1.75x larger drafter, so it is the drafter's forward pass, not a fixed cost.",
+    "cause": "the drafter is a 5-layer block-diffusion model split into ~24 small MMQ launches, none large enough to saturate the bus",
+    "if_fixed": {
+      "v2_ms_per_step": 56.3,
+      "v2_toks_sec": 102,
+      "calc": "50.33 ms curve + 1.1 GB / 184.6 GB/s = 56.3 ms; 5.74 / 0.0563 = 102 tok/s"
+    },
+    "note": "this is a runtime optimization on drafter execution, not a new model. CUDA Graphs will not help: the drafter has Gated DeltaNet layers, which is why graphs are rejected at runtime."
   }
 }
