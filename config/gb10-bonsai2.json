@@ -509,10 +509,13 @@
     "retention_cost": "157 MB + 64 KB/token per checkpoint; at 256k that is 17.2 GB each"
   },
   "speculation_by_context": {
-    "$comment": "Draft acceptance collapses as context grows, so speculation becomes a net loss past a crossover. See bench/RESULTS.md Round 27.",
-    "cutoff_tokens": 12288,
+    "$comment": "Draft acceptance decays with context, so the best K tapers and eventually reaches 0. See bench/RESULTS.md Rounds 27-28.",
+    "cutoff_tokens": 14336,
     "env_override": "PULSE_SPEC_CTX_CUTOFF",
-    "harness": "bench/acceptlong.py",
+    "harness": [
+      "bench/acceptlong.py",
+      "bench/ctxk.py"
+    ],
     "acceptance_by_context": [
       {
         "ctx": 531,
@@ -572,6 +575,66 @@
         "winner": "no_spec"
       }
     ],
-    "win": "1.37x at 34k context - the largest single-stream lever measured in this project"
+    "win": "1.37x at 34k context - the largest single-stream lever measured in this project",
+    "policy": [
+      {
+        "max_tokens": 8192,
+        "k": 4,
+        "why": "block-size knee"
+      },
+      {
+        "max_tokens": 10240,
+        "k": 3,
+        "why": "K=3 beats K=4 by 4.0% at 8.7k"
+      },
+      {
+        "max_tokens": 14336,
+        "k": 2,
+        "why": "K=2 beats K=0 by 7.1% at 12.3k"
+      },
+      {
+        "max_tokens": null,
+        "k": 0,
+        "why": "acceptance collapses; K=0 wins by 1.37x at 34k"
+      }
+    ],
+    "surface": [
+      {
+        "ctx": 8666,
+        "k0": 25.12,
+        "k1": 26.84,
+        "k2": 30.25,
+        "k3": 30.67,
+        "k4": 29.49,
+        "best": 3
+      },
+      {
+        "ctx": 12279,
+        "k0": 23.89,
+        "k1": 23.09,
+        "k2": 25.57,
+        "k3": 25.1,
+        "k4": 24.06,
+        "best": 2
+      },
+      {
+        "ctx": 16165,
+        "k0": 23.13,
+        "k1": 19.87,
+        "k2": 21.08,
+        "k3": 20.46,
+        "k4": 19.69,
+        "best": 0
+      },
+      {
+        "ctx": 35541,
+        "k0": 19.53,
+        "k1": 15.26,
+        "k2": 14.85,
+        "k3": 14.5,
+        "k4": 14.11,
+        "best": 0
+      }
+    ]
   }
 }

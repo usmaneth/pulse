@@ -177,7 +177,7 @@ export class PulseServer {
     const domain = isMath ? 'math' : isCode ? 'code' : 'chat';
 
     const t0 = performance.now();
-    const ckptKeyLength = messages.reduce(
+    const promptChars = messages.reduce(
       (n: number, m: { content?: string }) => n + (m.content?.length ?? 0), 0);
     const kDecision: SpeculationDecision = await this.jev.decideSpeculationK({
       promptSnippet: lastUserMessage,
@@ -186,29 +186,34 @@ export class PulseServer {
     });
     const jevLatency = performance.now() - t0;
 
-    // CONTEXT GATE. Draft acceptance collapses as context grows on this stack:
-    // measured 26.25% at 2.1k tokens, 11.54% at 12.3k, 6.67% at 14k and 0.00%
-    // at 34k. Past the crossover the drafter streams its weights every step and
-    // gets nothing back, so speculation costs throughput instead of adding it.
+    // CONTEXT TAPER. Draft acceptance decays as context grows - measured
+    // 26.25% at 2.1k tokens, 18.18% at 8.7k, 6.25% at 16k and 0.00% at 34k -
+    // so the best draft depth falls with context and eventually reaches zero.
+    // The full context x K surface (bench/ctxk.py, 3 interleaved repeats):
     //
-    //    ctx      spec K=4   no spec    winner
-    //    2,134      38.18     27.25     spec    +40.1%
-    //    8,666      29.86     25.52     spec    +17.0%
-    //   12,279      24.65     24.19     wash (inside the 3.4% noise floor)
-    //   14,036      21.24     24.04     no spec +13.2%
-    //   34,196      14.59     20.03     no spec +37.3%
+    //      ctx     K=0     K=1     K=2     K=3     K=4    best
+    //    8,666   25.12   26.84   30.25   30.67   29.49    K=3
+    //   12,279   23.89   23.09   25.57   25.10   24.06    K=2
+    //   16,165   23.13   19.87   21.08   20.46   19.69    K=0
+    //   35,541   19.53   15.26   14.85   14.50   14.11    K=0
     //
-    // Disabling speculation above the crossover is worth 1.37x at 34k, which is
-    // the largest single-stream lever measured in this project. n_max=0 turns
-    // drafting off for one request; it needs the per-request n_max patch.
-    const approxPromptTokens = ckptKeyLength / 3.6;
-    const ctxCutoff = Number(process.env.PULSE_SPEC_CTX_CUTOFF ?? 12288);
-    const longContext = approxPromptTokens > ctxCutoff;
-    if (longContext) {
-      kDecision.k = 0;
+    // Note this is a taper, not a cliff. An earlier revision cut straight from
+    // K=4 to K=0 at 12288 tokens, which gave up 7.1% at 12.3k where K=2 still
+    // beats no speculation, and 4.0% at 8.7k where K=3 beats K=4. Turning
+    // speculation off entirely is right only from ~14k up, where it costs
+    // 1.37x at 34k. K=0 needs the per-request n_max patch (Round 24).
+    const approxPromptTokens = promptChars / 3.6;
+    const off = Number(process.env.PULSE_SPEC_CTX_CUTOFF ?? 14336);
+    let ctxCap: number | null = null;
+    if (approxPromptTokens >= off)          ctxCap = 0;
+    else if (approxPromptTokens >= 10240)   ctxCap = 2;
+    else if (approxPromptTokens >= 8192)    ctxCap = 3;
+    if (ctxCap !== null && ctxCap < kDecision.k) {
+      kDecision.k = ctxCap;
       kDecision.reasoning =
-        `measured (bench/acceptlong.py): ~${Math.round(approxPromptTokens)} tokens is past the ` +
-        `${ctxCutoff}-token crossover where acceptance collapses; speculation disabled`;
+        `measured (bench/ctxk.py): ~${Math.round(approxPromptTokens)} tokens -> K=${ctxCap}` +
+        (ctxCap === 0 ? ' (acceptance collapses; speculation costs throughput here)'
+                      : ' (acceptance decays with context, so a shallower draft wins)');
     }
     this.lastJevDecision = kDecision;
 

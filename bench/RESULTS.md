@@ -2122,3 +2122,52 @@ condition is now measured and it is not a marginal gap: acceptance is **zero**
 at 34k. Fixing that is a drafter-quality problem, not a depth problem, which is
 consistent with Round 25's finding that block 7 buys nothing over block 4.
 Disabling speculation past the crossover is the cheaper fix and it ships today.
+
+---
+
+# Round 28 - the context gate is a taper, not a cliff
+
+Round 27 shipped a binary gate: K=4 below 12288 tokens, K=0 above. That assumed
+the best depth jumps straight from 4 to 0. It does not. `bench/ctxk.py` sweeps
+both axes, 3 interleaved repeats:
+
+| ctx | K=0 | K=1 | K=2 | K=3 | K=4 | best |
+|---|---|---|---|---|---|---|
+| 8,666 | 25.12 | 26.84 | 30.25 | **30.67** | 29.49 | K=3, +22.1% over K=0 |
+| 12,279 | 23.89 | 23.09 | **25.57** | 25.10 | 24.06 | K=2, +7.1% |
+| 16,165 | **23.13** | 19.87 | 21.08 | 20.46 | 19.69 | K=0 |
+| 35,541 | **19.53** | 15.26 | 14.85 | 14.50 | 14.11 | K=0 |
+
+**The optimum tapers 4 -> 3 -> 2 -> 0 as context grows.** Two errors in the
+Round 27 gate, both now fixed:
+
+1. It cut to K=0 at 12288 tokens. At 12,279 tokens K=2 still beats K=0 by
+   **7.1%**. The true off-switch is between 12.3k and 16.2k, so the cutoff moves
+   to 14336.
+2. It used K=4 everywhere below the cutoff. At 8,666 tokens K=3 beats K=4 by
+   **4.0%**.
+
+## Shipped policy
+
+| estimated prompt tokens | K |
+|---|---|
+| < 8,192 | 4 (the block-size knee) |
+| 8,192 - 10,239 | 3 |
+| 10,240 - 14,335 | 2 |
+| >= 14,336 | 0 (speculation off) |
+
+The taper only ever lowers K below whatever the workload heuristic chose, so a
+schema prompt already at K=3 stays at K=3 in the short band.
+
+## Verified end to end through the proxy
+
+| prompt | K chosen | tok/s | surface predicted |
+|---|---|---|---|
+| tiny | 4 | 38.82 | - |
+| ~5.5k | 3 | 35.58 | - |
+| ~8.6k | 3 | 31.03 | 30.67 |
+| ~11k | 2 | 26.52 | 25.57 (at 12.3k) |
+| ~15k | 0 | 23.42 | 23.13 (at 16.2k) |
+| ~35k | 0 | 19.41 | 19.53 (at 35.5k) |
+
+Every point matches the independently measured surface.

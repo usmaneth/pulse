@@ -131,9 +131,21 @@ speculation stops paying for itself:
 | 14,036 | 21.24 | **24.04** | no spec, +13.2% |
 | 34,196 | 14.59 | **20.03** | **no spec, +37.3%** |
 
-**The crossover is between 12.3k and 14k tokens**, and turning speculation off
-above it is worth **1.37x at 34k** — more than the entire configuration story,
-at the context length where agents actually run.
+**Turning speculation off above ~14k is worth 1.37x at 34k** — more than the
+entire configuration story, at the context length where agents actually run.
+
+It is a taper rather than a cliff. Sweeping both axes (`bench/ctxk.py`):
+
+| ctx | K=0 | K=1 | K=2 | K=3 | K=4 | best |
+|---|---|---|---|---|---|---|
+| 8,666 | 25.12 | 26.84 | 30.25 | **30.67** | 29.49 | K=3 |
+| 12,279 | 23.89 | 23.09 | **25.57** | 25.10 | 24.06 | K=2 |
+| 16,165 | **23.13** | 19.87 | 21.08 | 20.46 | 19.69 | K=0 |
+| 35,541 | **19.53** | 15.26 | 14.85 | 14.50 | 14.11 | K=0 |
+
+The optimum falls 4 → 3 → 2 → 0. A first revision of this gate cut straight to
+K=0 at 12,288 tokens and gave up 7.1% at 12.3k, where K=2 still beats no
+speculation.
 
 The serving policy below only ever considered *concurrency*. Context length is a
 second, independent axis and nobody had looked at it. `pulse serve` now gates on
