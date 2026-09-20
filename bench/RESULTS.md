@@ -256,3 +256,69 @@ Batch sizing matters: prompts above the batch size hard-fail with
 `the prompt exceeds the batch size`, so `-b` must be raised for long contexts.
 Raising `-ub` above 512 reduces prefill throughput (389 tok/s at `-ub 2048` versus
 656 tok/s at `-ub 512`).
+
+---
+
+# Round 3 — real concurrency
+
+Measured with `bench/sweep.py --mode concurrency` against a live `llama-server`
+(PQ2_0 target, DSpark v2 drafter, K=7, `-c 16384 -b 4096 -np 4`, `--jinja`).
+Aggregate is total generated tokens divided by the wall-clock span from first
+request submitted to last response completed.
+
+| N simultaneous | aggregate tok/s | mean per-stream tok/s | acceptance | failures |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 34.1 | 35.4 | 21.3% | 0 |
+| 2 | 48.6 | 24.8 | 21.7% | 0 |
+| 4 | 60.1 | 16.1 | 20.3% | 0 |
+| 8 | 65.1 | 17.0 | 20.7% | 0 |
+| 16 | **65.8** | 17.1 | 20.9% | 0 |
+
+## The headline result: concurrency does not add aggregate throughput
+
+Aggregate throughput saturates at **65.8 tok/s**, which is essentially the same as the
+best single-stream figure (73.00 tok/s). Going from 1 to 16 simultaneous streams buys
+roughly 1.9x, and almost all of that is realised by N=4; beyond that the curve is flat.
+
+The reason is visible in the cost model: a single stream already draws about
+160 GB/s out of a measured 184.6 GB/s ceiling on this device. There is no spare memory
+bandwidth for additional streams to consume. Batching helps when a system is
+launch-bound or compute-bound; this one is bandwidth-bound by a dense 6.70 GB weight
+sweep per step.
+
+This is the opposite of what published Apple-silicon results show for the same class of
+engine, and the difference is explainable by hardware rather than software: an M5 Max
+has roughly 614 GB/s of bandwidth against GB10's 273 GB/s peak (184.6 GB/s measured),
+so a Mac has headroom for concurrent streams that GB10 does not.
+
+**A previously published claim of "495 aggregate tok/s across 16 subagents" was
+fabricated. The measured value is 65.8 tok/s, 7.5x lower.**
+
+## Caveats on this run
+
+- The server was started with `-np 4`, so the N=8 and N=16 rows involve queueing rather
+  than 16 truly resident slots. The N=1 to N=4 progression (34.1 -> 48.6 -> 60.1) is
+  within the slot budget and already shows the saturation trend.
+- Acceptance here (~21%) is far below the 68-90% measured with
+  `llama-speculative-simple`, because `bench/sweep.py` sends short prose/chat prompts
+  through the server's `--jinja` chat template with reasoning enabled, whereas the
+  earlier runs used raw long code prompts. Acceptance is highly workload dependent;
+  do not compare these two figures directly.
+
+# FFI verification
+
+`nm -D bin/libpulse_engine.so` now lists all four symbols, and a Bun `dlopen` round trip
+succeeds end to end:
+
+```
+dlopen OK, symbols: pulse_engine_create, pulse_engine_destroy, pulse_engine_step, pulse_engine_last_rate
+engine handle acquired
+step 0: tokens=1 measured_gpu_ms=0.2436
+step 1: tokens=5 measured_gpu_ms=0.2036
+step 2: tokens=5 measured_gpu_ms=0.2051
+destroyed cleanly.
+```
+
+The reported milliseconds are real `cudaEventElapsedTime` readings. Note these measure
+the kernel-dispatch microbenchmark graph (one GEMV plus the scan kernel), not a
+62-layer model forward, so the implied token rate is not an inference figure.

@@ -386,7 +386,8 @@ def run_concurrency_mode(url: str, k: int) -> Dict[str, Any]:
         }
         results["levels"].append(record)
         
-        print(f"OK (aggregate={aggregate_throughput:.1f} tok/s, mean_stream={mean_per_stream:.1f} tok/s, acc={mean_acceptance:.3f if mean_acceptance else 'N/A'}, failures={failures})")
+        acc_str = f"{mean_acceptance:.3f}" if mean_acceptance else "N/A"
+        print(f"OK (aggregate={aggregate_throughput:.1f} tok/s, mean_stream={mean_per_stream:.1f} tok/s, acc={acc_str}, failures={failures})")
     
     return results
 
