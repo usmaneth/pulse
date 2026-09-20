@@ -2357,3 +2357,61 @@ Round 24 renamed `decideSpeculationK`'s return strings, which read "Jev local
 fast-path" while running a regex, and corrected `/status`, which advertised
 `jev_system_one_decisions_enabled: true`. This round supplies the number that
 justifies that design rather than merely describing it.
+
+---
+
+# Round 32 - v2 at long context: depth does help retention, just nowhere near enough
+
+Round 25 closed the retrain question on short-context sweeps and left one thing
+unverified: whether the deeper drafter holds acceptance better as context grows.
+That was the actual retrain hypothesis, so it deserved measuring.
+
+## It does hold better - and it is still useless
+
+`bench/acceptlong.py` on v2 (block 7, 1.03 GB) against the v1 curve from
+Round 27:
+
+| ctx | v1 accept | v2 accept | v1 tok/s | v2 tok/s |
+|---|---|---|---|---|
+| 2,134 | **26.25%** | 16.43% | **37.41** | 29.22 |
+| 8,666 | **18.18%** | 8.00% | **29.48** | 20.00 |
+| 16,165 | 6.25% | **6.40%** | **20.41** | 17.76 |
+| 34,196 | **0.00%** | **6.29%** | 14.41 | **16.91** |
+
+**v2 is the only drafter that retains any acceptance at 34k**, 6.29% against
+v1's zero, and it is correspondingly faster there (16.91 vs 14.41). So depth and
+size genuinely do improve long-context retention. This is the first evidence in
+the project for the retrain hypothesis.
+
+It also gives that up at short context, where it matters more: 16.43% against
+v1's 26.25% at 2.1k, and 8.00% against 18.18% at 8.7k.
+
+## But speculation still loses to turning it off
+
+| ctx | v2 spec K=7 | no spec | winner |
+|---|---|---|---|
+| 16,165 | 18.04 | **23.19** | no spec |
+| 35,541 | 15.39 | **19.58** | no spec |
+
+6.29% acceptance does not come close to covering a 1.03 GB drafter streamed
+every step plus ~3.11 ms per verify row. **The context policy from Rounds 27-29
+holds for both drafters**, which is why it is implemented without reference to
+which drafter is loaded. That is the right design and it is now verified rather
+than assumed.
+
+## The refined retrain criterion
+
+Round 25 said a retrain is worth running only for a cheaper drafter at equal
+depth, or one with materially better long-context acceptance. That second
+condition can now be stated precisely instead of vaguely:
+
+- v1 gives **0%** at 34k. v2 gives **6.29%**.
+- Breaking even against no speculation needs roughly **70%**.
+
+So the gap is an order of magnitude, not a margin. Scaling the drafter from
+0.59 GB to 1.03 GB - a 1.75x increase - bought 6.29 percentage points. Reaching
+70% by that route is not plausible. **A long-context drafter is a training-data
+and objective problem, not a capacity problem.**
+
+That is a firmer basis for "do not run the retrain" than Round 25 had, and it
+arrives at the same answer from the opposite direction.
