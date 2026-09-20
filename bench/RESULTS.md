@@ -2171,3 +2171,68 @@ schema prompt already at K=3 stays at K=3 in the short band.
 | ~35k | 0 | 19.41 | 19.53 (at 35.5k) |
 
 Every point matches the independently measured surface.
+
+---
+
+# Round 29 - the two policy axes interact, and the shipped gate was wrong under load
+
+The serving policy had two rules, each measured with the other held at its
+trivial value:
+
+- **concurrency** (Round 20): drafter below 12 clients, none above. Measured at
+  short context.
+- **context** (Round 28): K tapers 4 -> 3 -> 2 -> 0. Measured at 1 client.
+
+`bench/ctxconc.py` measures both together: aggregate throughput (total tokens /
+wall clock), 4 slots, a distinct prompt prefix per client so slots do not share
+a cache.
+
+| ctx | clients | spec K=4 | no spec | winner | delta |
+|---|---|---|---|---|---|
+| 2,048 | 1 | **75.30** | 26.27 | spec | +186.7% |
+| 2,048 | 4 | **84.46** | 64.74 | spec | +30.5% |
+| 8,192 | 1 | **30.18** | 24.11 | spec | +25.2% |
+| 8,192 | 4 | 51.89 | **54.80** | **no spec** | +5.6% |
+| 16,384 | 1 | 19.21 | **22.26** | no spec | +15.9% |
+| 16,384 | 4 | 31.27 | **46.85** | **no spec** | **+49.8%** |
+| 34,000 | 1 | 15.59 | **18.68** | no spec | +19.8% |
+| 34,000 | 4 | 22.16 | **34.82** | **no spec** | **+57.1%** |
+
+**The context crossover moves down under concurrency.** At 1 client it sits
+between 8k and 16k, which is what Round 28's 14336 cutoff encodes. At 4 clients
+it sits between 2k and 8k. The mechanism is the one from Round 20: batching
+already fills the weight sweep, so the drafter's extra rows stop being free -
+and that now coincides with acceptance decaying.
+
+The cost of getting it wrong compounds with load: **49.8% at 16k and 57.1% at
+34k with 4 clients**, against 15.9% and 19.8% at 1 client.
+
+The Round 28 gate used a single cutoff of 14336 regardless of load, so it
+speculated through the whole 8k-14k band at 4 clients, where speculation loses.
+
+## Shipped
+
+The cutoff is now a function of load. At 1 concurrent stream the Round 28 taper
+applies unchanged; above that the cutoff drops to 4096 and the intermediate
+taper steps are skipped, because the measurement shows no band where a shallow
+draft wins under concurrency.
+
+Verified end to end: a single request at ~8.2k tokens gets K=3; four concurrent
+requests at ~8.2k get `K=[3, 0, 0, 0]`.
+
+**Known imperfection, stated rather than hidden.** The signal is this process's
+own `activeStreams`. The first request of a burst sees a count of 1 and cannot
+know three more are arriving, so it gets the single-stream depth. The policy is
+therefore right for sustained load and one request late at the start of a burst.
+Fixing it properly needs the backend's slot occupancy, which would cost a poll
+per request.
+
+## A caveat on the absolute numbers
+
+Aggregate throughput here runs roughly 2x higher than `bench/acceptlong.py`
+reports on similar prompts (75.30 vs 37.41 at ~2k). The harnesses differ in
+continuation text and in what the denominator measures - `predicted_per_second`
+excludes prompt processing, wall clock does not. The discrepancy is not fully
+explained. **Only the within-harness spec-vs-no-spec comparisons are used to
+set policy**, because those are controlled. The cross-harness absolutes are not
+comparable and are not claimed as such.

@@ -635,6 +635,74 @@
         "k4": 14.11,
         "best": 0
       }
-    ]
+    ],
+    "concurrency_interaction": {
+      "$comment": "The context cutoff moves DOWN under concurrency. See bench/RESULTS.md Round 29.",
+      "cutoff_tokens_by_load": {
+        "1_stream": 14336,
+        "2_or_more_streams": 4096
+      },
+      "harness": "bench/ctxconc.py",
+      "measured": [
+        {
+          "ctx": 2048,
+          "clients": 1,
+          "spec_k4": 75.3,
+          "no_spec": 26.27,
+          "winner": "spec"
+        },
+        {
+          "ctx": 2048,
+          "clients": 4,
+          "spec_k4": 84.46,
+          "no_spec": 64.74,
+          "winner": "spec"
+        },
+        {
+          "ctx": 8192,
+          "clients": 1,
+          "spec_k4": 30.18,
+          "no_spec": 24.11,
+          "winner": "spec"
+        },
+        {
+          "ctx": 8192,
+          "clients": 4,
+          "spec_k4": 51.89,
+          "no_spec": 54.8,
+          "winner": "no_spec"
+        },
+        {
+          "ctx": 16384,
+          "clients": 1,
+          "spec_k4": 19.21,
+          "no_spec": 22.26,
+          "winner": "no_spec"
+        },
+        {
+          "ctx": 16384,
+          "clients": 4,
+          "spec_k4": 31.27,
+          "no_spec": 46.85,
+          "winner": "no_spec"
+        },
+        {
+          "ctx": 34000,
+          "clients": 1,
+          "spec_k4": 15.59,
+          "no_spec": 18.68,
+          "winner": "no_spec"
+        },
+        {
+          "ctx": 34000,
+          "clients": 4,
+          "spec_k4": 22.16,
+          "no_spec": 34.82,
+          "winner": "no_spec"
+        }
+      ],
+      "known_imperfection": "The signal is the proxy's own activeStreams. The first request of a burst sees 1 and gets the single-stream depth.",
+      "caveat": "Absolute aggregate figures are not comparable with bench/acceptlong.py. Only within-harness spec-vs-no-spec comparisons set policy."
+    }
   }
 }

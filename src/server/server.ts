@@ -203,15 +203,38 @@ export class PulseServer {
     // speculation off entirely is right only from ~14k up, where it costs
     // 1.37x at 34k. K=0 needs the per-request n_max patch (Round 24).
     const approxPromptTokens = promptChars / 3.6;
-    const off = Number(process.env.PULSE_SPEC_CTX_CUTOFF ?? 14336);
+    // The context cutoff MOVES DOWN under concurrency. Batching already fills
+    // the weight sweep, so the drafter's extra rows stop being free exactly when
+    // acceptance is also decaying. Measured aggregate throughput, spec K=4 vs
+    // K=0 (bench/ctxconc.py, 4 slots, distinct prefix per client):
+    //
+    //     ctx   clients   spec K=4   no spec    winner
+    //   2,048         1      75.30     26.27    spec    +186.7%
+    //   2,048         4      84.46     64.74    spec     +30.5%
+    //   8,192         1      30.18     24.11    spec     +25.2%
+    //   8,192         4      51.89     54.80    no spec   +5.6%
+    //  16,384         1      19.21     22.26    no spec  +15.9%
+    //  16,384         4      31.27     46.85    no spec  +49.8%
+    //  34,000         1      15.59     18.68    no spec  +19.8%
+    //  34,000         4      22.16     34.82    no spec  +57.1%
+    //
+    // At 1 client the crossover sits between 8k and 16k. At 4 it sits between
+    // 2k and 8k, and the cost of getting it wrong grows to 57%. activeStreams
+    // is this process's own view of load, which is the best signal available
+    // without polling the backend.
+    const concurrent = Math.max(1, this.activeStreams);
+    const off = Number(
+      process.env.PULSE_SPEC_CTX_CUTOFF ?? (concurrent > 1 ? 4096 : 14336),
+    );
     let ctxCap: number | null = null;
-    if (approxPromptTokens >= off)          ctxCap = 0;
-    else if (approxPromptTokens >= 10240)   ctxCap = 2;
-    else if (approxPromptTokens >= 8192)    ctxCap = 3;
+    if (approxPromptTokens >= off)                             ctxCap = 0;
+    else if (concurrent === 1 && approxPromptTokens >= 10240)  ctxCap = 2;
+    else if (concurrent === 1 && approxPromptTokens >= 8192)   ctxCap = 3;
     if (ctxCap !== null && ctxCap < kDecision.k) {
       kDecision.k = ctxCap;
       kDecision.reasoning =
-        `measured (bench/ctxk.py): ~${Math.round(approxPromptTokens)} tokens -> K=${ctxCap}` +
+        `measured (bench/ctxk.py, bench/ctxconc.py): ~${Math.round(approxPromptTokens)} tokens ` +
+        `at ${concurrent} concurrent -> K=${ctxCap}` +
         (ctxCap === 0 ? ' (acceptance collapses; speculation costs throughput here)'
                       : ' (acceptance decays with context, so a shallower draft wins)');
     }
