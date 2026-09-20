@@ -50,21 +50,32 @@ LPDDR5X, CUDA 13.0. Runs used `llama-speculative-simple`, temperature 0,
 `--ignore-eos`, 1854-token code prompt, **idle GPU**.
 
 | drafter | block | K | decode tok/s | acceptance | tok/step |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| v1 | 4 | 3 | 62.98 | **90.18%** | 3.72 |
-| v1 | 4 | 4 | 68.69 | 83.78% | 4.37 |
-| v2 | 7 | 6 | 71.09 | 71.81% | 5.31 |
-| v2 | 7 | 7 | **73.00** | 68.59% | 5.81 |
+|---|---|---|---|---|---|
+| v1 | 4 | 3 | 58.08 | 78.29% | 3.32 |
+| **v1** | 4 | **4** | **63.77** | 72.28% | 3.86 |
+| v2 | 7 | 7 | 63.83 median (59.72-70.82) | 68.59% | 5.81 |
 
-No-drafter baseline on the same target is 29.7 tok/s, so the best configuration is a
-**2.46x speedup**.
+Measured over 3-5 repeats on an idle GB10 with a realistic code context, temperature 0,
+`--ignore-eos`. Deterministic at temperature 0: spread is 0.37 tok/s for v1.
 
-Prefill on the same setup reaches **646 tok/s** at a 2756-token prompt.
+No-drafter baseline on the same target is **27.54 tok/s**, so the best configuration is
+a **2.3x** speedup. Prefill reaches **~995 tok/s** with a properly configured server.
 
-### Choosing a drafter
+> **Correction.** An earlier version of this card reported 73.00 tok/s as the headline.
+> That was a single best run, not a median; five repeats give 63.83 for that config. It
+> also reported 646 tok/s prefill, measured with a smaller batch setting than the tuned
+> configuration. Both are corrected above.
 
-- Want maximum throughput: **v2 at K=7** (73.00 tok/s).
-- Want maximum acceptance: **v1 at K=3** (90.18%).
+Higher acceptance is reachable at lower draft depth: **90.18%** at K=3 on some prompts,
+reproducible to the digit across five runs. Acceptance is strongly prompt-dependent
+(measured range 21% to 96% across workloads), so treat it as a property of the workload
+rather than of the drafter.
+
+### Which to use
+
+- Want maximum throughput: **v1 at K=4** (63.77 tok/s). Use the full block size; K past
+  the drafter's block size is a no-op.
+- Want maximum acceptance: **v1 at K=3** (78-90% depending on prompt).
 - Match K to the drafter's block size. Running v1 at K=6 costs 88.16 ms/step versus
   59.40 ms/step at K=4, because K above the block size forces a second draft pass.
 

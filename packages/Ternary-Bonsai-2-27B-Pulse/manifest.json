@@ -27,27 +27,36 @@
     "max_k": 7
   },
   "benchmarks": {
-    "note": "Measured on an idle NVIDIA GB10 with llama-speculative-simple, temperature 0, --ignore-eos, 1854-token code prompt. Nothing here is extrapolated. See https://github.com/usmaneth/pulse/blob/main/bench/RESULTS.md",
+    "note": "Measured on an idle NVIDIA GB10, llama-speculative-simple, temp 0, --ignore-eos, realistic code context, 3-5 repeats. Nothing extrapolated. See https://github.com/usmaneth/pulse/blob/main/bench/RESULTS.md",
     "device": "NVIDIA GB10 (48 SMs, sm_121, 121.7 GB unified LPDDR5X, CUDA 13.0)",
-    "no_drafter_baseline_toks_sec": 29.7,
+    "no_drafter_baseline_toks_sec": 27.54,
     "best_decode": {
-      "drafter": "v2",
-      "k": 7,
-      "toks_sec": 73.0,
-      "acceptance": 0.6859,
-      "tokens_per_step": 5.81
+      "drafter": "v1",
+      "k": 4,
+      "toks_sec": 63.77,
+      "acceptance": 0.7228,
+      "tok_per_step": 3.86,
+      "repeats": 3,
+      "spread": 0.37
     },
-    "best_acceptance": {
+    "highest_acceptance": {
       "drafter": "v1",
       "k": 3,
-      "toks_sec": 62.98,
       "acceptance": 0.9018,
-      "tokens_per_step": 3.72
+      "note": "reproducible to the digit over 5 runs; acceptance is prompt-dependent (21%-96% observed across workloads)"
     },
-    "prefill_toks_sec_at_2756_tokens": 646.2,
-    "aggregate_toks_sec_16_streams": 65.8,
-    "measured_memory_bandwidth_gbs": 184.6,
-    "cost_model": "t_step_ms = 48.3 + 4.47*K (long context fit)"
+    "prefill_toks_sec": 995,
+    "speedup_vs_no_drafter": 2.3,
+    "batched_decode_toks_sec": {
+      "b1": 27.54,
+      "b4": 78.92,
+      "b16": 133.08
+    },
+    "hardware_ceiling": {
+      "note": "measured with a model-free n-gram drafter at 100% acceptance",
+      "at_5_tok_per_step": 101.25,
+      "at_17_tok_per_step": 219.35
+    }
   },
-  "corrections": "An earlier manifest claimed 141.28 tok/s single-stream, 206.50 peak, 0.021 ms GDN restore and 495.20 aggregate tok/s across 16 subagents. Those were not measured and have been replaced with measured values."
+  "corrections": "Earlier manifests claimed 141.28 tok/s single-stream, 206.50 peak, 525 tok/s MoE and 495.20 aggregate across 16 subagents. None were measured. A later revision quoted 73.00 tok/s, which was a single best run rather than a median, and 646 tok/s prefill taken with an untuned batch setting. All are superseded by the measured values above."
 }
