@@ -492,7 +492,7 @@ int main(int argc, char** argv) {
     printf("  %-26s %7s   %6.1f GB/s\n", "achievable (bench/cuda/bw.cu)", "-", 216.0);
     // --- head batching: is the head re-read per position, and does batching fix it?
     {
-        const int NCMAX = 8;
+        const int NCMAX = 32;
         std::vector<float> X((size_t)ne0*NCMAX);
         for (int c = 0; c < NCMAX; ++c)
             for (int i = 0; i < ne0; ++i) X[(size_t)c*ne0+i] = sinf((i + c*7) * 0.01f);
@@ -518,6 +518,19 @@ int main(int argc, char** argv) {
         const double t2 = bench_nc(2, pq2_matvec_batched<2>);
         const double t4 = bench_nc(4, pq2_matvec_batched<4>);
         const double t8 = bench_nc(8, pq2_matvec_batched<8>);
+        // PAST llama.cpp's cliff. MMVQ_MAX_BATCH_SIZE = 8: above it llama.cpp
+        // dispatches to MMQ, whose base Round 20 measured at ~65 ms against
+        // mul_mat_vec_q's 36.6 ms. This kernel has no such threshold.
+        printf("\n  past llama.cpp's MMVQ_MAX_BATCH_SIZE = 8 cliff:\n");
+        const double t12 = bench_nc(12, pq2_matvec_batched<12>);
+        const double t16 = bench_nc(16, pq2_matvec_batched<16>);
+        const double t24 = bench_nc(24, pq2_matvec_batched<24>);
+        const double t32 = bench_nc(32, pq2_matvec_batched<32>);
+        printf("\n  cost per column:  1 col %6.3f ms | 8 col %6.3f | 16 col %6.3f | 32 col %6.3f\n",
+               t1, t8/8, t16/16, t32/32);
+        printf("  amortisation 1->32 columns : %.1fx\n", (t1*32)/t32);
+        (void)t12; (void)t24;
+
         printf("\n  8 separate 1-column passes : %7.3f ms\n", t1*8);
         printf("  1 batched 8-column pass    : %7.3f ms\n", t8);
         printf("  speedup from batching      : %7.2fx  (saves %.2f ms per step)\n",

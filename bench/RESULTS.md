@@ -2965,3 +2965,70 @@ have cost 16%.
 This is worth recording because the inference is natural, the source measurement
 is sound, and the result is still wrong. A GB10-specific optimisation was tested
 properly and measured negative.
+
+---
+
+# Round 41 - the batched regime is where this engine actually beats llama.cpp
+
+Every previous round measured single-stream decode and found parity at best. This
+one measures the regime llama.cpp has a documented discontinuity in, and the
+answer is different.
+
+## llama.cpp's cliff
+
+`ggml/src/ggml-cuda/mmvq.cuh:3` sets `MMVQ_MAX_BATCH_SIZE = 8`. At or below 8
+columns llama.cpp uses `mul_mat_vec_q`, which amortises the weight read across
+columns (`mmvq.cu:697`, `vx` invariant in the `j` loop). **Above 8 it dispatches
+to MMQ**, whose base Round 20 measured at ~65 ms against mmvq's 36.6 ms.
+
+Round 20 saw the consequence without naming the cause: the v2 drafter (block 7)
+loses under batching at every concurrency except 2, because batch rows are
+`clients x (K+1)` and cross 8 almost immediately.
+
+## Pulse has no such threshold
+
+`pq2_matvec_batched<NC>` reads the weights once and accumulates NC columns.
+Measured on `output.weight`, 0.338 GB:
+
+| columns | total ms | **ms per column** |
+|---|---|---|
+| 1 | 2.308 | 2.308 |
+| 2 | 2.151 | 1.076 |
+| 4 | 3.050 | 0.763 |
+| 8 | 4.333 | **0.542** |
+| 12 | 6.768 | 0.564 |
+| 16 | 8.180 | **0.511** |
+| 24 | 13.401 | 0.558 |
+| 32 | 16.929 | **0.529** |
+
+**Cost per column is flat from 8 to 32** at roughly 0.52 ms, against 2.308 ms at
+one column - a 4.4x amortisation, and no discontinuity anywhere. 32 separate
+passes would cost 541.7 ms; one batched pass costs 16.9 ms.
+
+## Why this is the real answer to "beat llama.cpp"
+
+Single-stream decode is a memory-bandwidth problem and llama.cpp is at 85% of
+what this machine achieves. Five independent attempts to beat it measured
+negative (Rounds 30, 35, 40, plus the layout and warp-geometry experiments).
+**That ceiling is real and it is not going to move.**
+
+The batched regime is a different problem, and it is the one that matters for:
+
+- **speculative decoding at K >= 8.** Round 25 found a block-7 drafter buys
+  nothing partly because depth past the cliff costs more than it returns. Without
+  the cliff, that calculus changes.
+- **multi-client serving.** Round 29 measured the context/concurrency policy
+  having to steer *around* this threshold: at 4 clients and 16k context,
+  speculating cost 49.8%.
+- **verification width.** Round 36 measured head batching as 4.41x; that stops
+  at 8 columns in llama.cpp and does not here.
+
+So the honest claim is narrow and defensible: **Pulse does not beat llama.cpp on
+single-stream decode and will not. It removes a structural cliff that llama.cpp
+has at batch width 8**, which is exactly where speculative and multi-client
+serving operate.
+
+That is worth building on, and it is a capability difference rather than a
+tuning difference - the same character as owning RoPE for text-path position
+shifting, and CUDA graphs on a model whose GDN nodes llama.cpp's graph check
+rejects.
