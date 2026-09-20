@@ -1281,3 +1281,75 @@ Against the 62.61 ms measured step at v1 K=3, recovering both would give roughly
 49 ms, about **+28%** rather than the +15% Round 14 concluded. The engine case is
 stronger than that round stated, though still far from the order-of-magnitude
 this project originally claimed.
+
+---
+
+# Round 16 - context, KV, and two methodology failures of my own
+
+## `-b` is not free: large batch roughly doubles decode step time
+
+| prompt | `-b` | ms/step |
+|---|---|---|
+| 1359 tok | 8192 | 66.44 |
+| 772 tok | 65536 | 128.61 |
+
+A *shorter* prompt with a larger `-b` took roughly twice as long per decode step.
+llama.cpp sizes compute buffers from `n_batch`, and the cost lands on decode, not
+just prefill. This compounds the Round 2 finding that `-ub` above 512 hurts
+prefill.
+
+**Keep `-b` only as large as the longest prompt requires.** The tuning profile's
+`-b 4096` is right for short prompts; long prompts force a larger `-b` and pay
+for it in decode throughput. That is a genuine tradeoff, not a free knob.
+
+## Methodology failure: cold-start per process invalidates context sweeps
+
+Several context sweeps in this round produced **non-monotonic step times** -
+128.61 ms at 772 tokens against 103.96 ms at 1989, and 108.41 against 92.65 in an
+earlier attempt. Step time cannot fall as context grows.
+
+Cause: each point was a separate process invocation, and each invocation reloads
+the 6.70 GB model. Round 11 established that this machine is slow on cold runs
+and *climbs* across consecutive ones as unified-memory pages migrate back to the
+GPU. Every such sweep was measuring warmup, not context.
+
+`bench/ab.py` is immune because it discards warmup runs - the machine-level page
+state warms during them - which is why it reports 1.0-3.0% spreads while these
+ad-hoc loops swing 25%. **Ad-hoc `for` loops over configurations are not a valid
+measurement on this machine.** Use `ab.py`.
+
+## KV cache is not a factor at or below ~7k context
+
+From the (cold, therefore noisy, but internally consistent) sweep:
+
+| prompt tok | ms/step | est. KV | KV as % of the 6.70 GB model |
+|---|---|---|---|
+| 772 | 128.61 | 0.20 GB | 3.0% |
+| 1989 | 103.96 | 0.52 GB | 7.8% |
+| 3778 | 106.75 | 0.99 GB | 14.8% |
+| 7266 | 99.62 | 1.90 GB | 28.4% |
+
+Step time shows **no upward trend** even with KV at 28% of the model's size. With
+flash attention the KV is streamed once per step: 1.90 GB at 216 GB/s is ~8.8 ms
+on a ~100 ms step, inside the noise.
+
+Extrapolating (arithmetic, **not measured**): at 32k tokens KV would be ~8.6 GB,
+larger than the model itself, and ~40 ms of a step. That is where KV compression
+of the TurboQuant kind - 3-bit keys, 2-bit values, ~6x - would be worth close to
+2x. Below ~8k it is worth approximately nothing here, which is consistent with
+our earlier measurement that KV `q8_0` was slightly *worse* than f16.
+
+**We still have no measurement above 7266 tokens.** Reaching 32k needs a larger
+`-c`, a bigger prompt pool, and - per the finding above - a larger `-b`, which
+itself costs decode throughput. That confound has to be controlled for before any
+long-context number from this repo is trustworthy.
+
+## Acceptance falls sharply with context on these prompts
+
+73.17% at 1359 tokens, 55.41% at 3237, 48.73% at 3778, 35.98% at 7266.
+
+Round 6 measured acceptance *rising* with context (74.84% at 65 tokens to 84.40%
+at 1854) on a different prompt. Both are real; acceptance is content-dependent
+across a measured 21%-96% range. It is a property of the workload, not of the
+drafter, and any single acceptance figure quoted without its prompt is close to
+meaningless.
