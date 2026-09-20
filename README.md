@@ -9,7 +9,7 @@
 
 Universal runtimes (llama.cpp, Ollama, vLLM) leave massive performance on the table because they treat all models as generic compute graphs and suffer from CPU driver dispatch latency. **Pulse turns this assumption upside down: the engine is built strictly around the model and the silicon.**
 
-It pairs **DFlash 2 block speculative decoding**, **Gated DeltaNet recurrent state snapshotting**, and a **hardware-aware memory plan** for the 128 GB unified LPDDR5X pool.\n\nMeasured single-stream decode on an idle GB10: **66.03 tok/s at 72.86% acceptance** (DSpark v1, K=5), against a 29.7 tok/s no-drafter baseline. Method, raw tables, cost model and negative results are in [bench/RESULTS.md](bench/RESULTS.md). Reaching 100 tok/s needs ~90% acceptance sustained to draft depth 7; that gap is drafter quality, not serving overhead.
+It pairs **DFlash 2 block speculative decoding**, **Gated DeltaNet recurrent state snapshotting**, and a **hardware-aware memory plan** for the 128 GB unified LPDDR5X pool.\n\nMeasured single-stream decode on an idle GB10: **~62-64 tok/s median** (five-run medians: 63.83 v2/K=7, 62.09 v1/K=3), with **90.18% acceptance** reproducible at v1/K=3, against a 29.7 tok/s no-drafter baseline. Method, raw tables, cost model and negative results are in [bench/RESULTS.md](bench/RESULTS.md). Reaching 100 tok/s needs ~90% acceptance sustained to draft depth 7; that gap is drafter quality, not serving overhead.
 
 ---
 
@@ -30,11 +30,11 @@ temperature 0, `-n 200`, `-c 4096`, `-fa on`, **idle GPU**.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | DSpark v1 | 603 MB | 4 | 3 | 60.92 | 77.60% | 3.33 | 54.62 |
 | DSpark v1 | 603 MB | 4 | 4 | 65.90 | 72.86% | 3.91 | 59.40 |
-| **DSpark v1** | 603 MB | 4 | 5 | **66.03** | 72.86% | 4.89 | 74.11 |
+| **DSpark v1** | 603 MB | 4 | 5 | 66.03 | 72.86% | 4.89 | 74.11 |
 | DSpark v2 | 1.1 GB | 7 | 6 | 65.75 | 60.34% | 4.62 | 70.28 |
 | Qwen3.8 DSpark | 1008 MB | - | 5 | 64.59 | 63.75% | 4.19 | 64.84 |
 
-Best measured single-stream decode: **66.03 tok/s at 72.86% acceptance**.
+Best *single-run* decode was 73.00 tok/s, but repeated five times that configuration medians at **63.83 tok/s** (range 59.72-70.82). Recommended default is **DSpark v1 at K=3: 62.09 tok/s median (+-0.3) at 90.18% acceptance**, reproducible with zero variance. See [bench/RESULTS.md](bench/RESULTS.md) Round 4.
 
 ### Acceptance decays with draft depth
 
@@ -139,7 +139,7 @@ To eliminate configuration traps and guarantee mathematical alignment, official 
 
 | Repository on Hugging Face | Architecture & Precision | Download Size | Verified Throughput |
 |---|---|:---:|:---:|
-| [**`asimfiles/Ternary-Bonsai-2-27B-Pulse`**](https://huggingface.co/asimfiles/Ternary-Bonsai-2-27B-Pulse) | 1.76-bit Ternary (`PQ2_0`) + DSpark v1/v2 drafts | **7.7 GB** | **66.03 tok/s measured** |
+| [**`asimfiles/Ternary-Bonsai-2-27B-Pulse`**](https://huggingface.co/asimfiles/Ternary-Bonsai-2-27B-Pulse) | 1.76-bit Ternary (`PQ2_0`) + DSpark v1/v2 drafts | **7.7 GB** | **62-64 tok/s median, 90.18% acceptance** |
 | `asimfiles/Qwen3.6-35B-A3B-Pulse` | Sparse MoE 35B (3B active) + DFlash 2 draft | 18.5 GB | not yet benchmarked |
 | `asimfiles/Qwen3.8-27B-Pulse` | Dense NVFP4 + DFlash 2 draft | 16.2 GB | not yet benchmarked |
 

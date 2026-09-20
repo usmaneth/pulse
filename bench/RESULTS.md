@@ -322,3 +322,55 @@ destroyed cleanly.
 The reported milliseconds are real `cudaEventElapsedTime` readings. Note these measure
 the kernel-dispatch microbenchmark graph (one GEMV plus the scan kernel), not a
 62-layer model forward, so the implied token rate is not an inference figure.
+
+---
+
+# Round 4 — repeatability (and a correction to our own headline)
+
+Five consecutive runs of each configuration, identical prompt (1854-token code
+context), idle GPU, temperature 0, `--ignore-eos`, 200 tokens.
+
+| config | tok/s runs | median | min | max | spread |
+| --- | --- | ---: | ---: | ---: | ---: |
+| v2 K=7 | 70.82, 63.83, 70.48, 59.72, 63.42 | **63.83** | 59.72 | 70.82 | 11.10 |
+| v1 K=3 | 61.97, 62.54, 62.51, 62.09, 61.92 | **62.09** | 61.92 | 62.54 | 0.62 |
+
+| config | acceptance runs | median | spread |
+| --- | --- | ---: | ---: |
+| v2 K=7 | 68.59 x5 | 68.59% | **0.00** |
+| v1 K=3 | 90.18 x5 | **90.18%** | **0.00** |
+
+## Correction to the previously reported 73.00 tok/s
+
+The 73.00 tok/s figure reported earlier in this document was a **single run**. Repeated
+five times, the same configuration has a median of **63.83 tok/s** and a range of
+59.72-70.82. 73.00 sits above the observed maximum of this five-run sample and should
+be treated as a favourable outlier, not a representative result.
+
+**Corrected headline: ~62-64 tok/s median**, against a 29.7 tok/s no-drafter baseline,
+i.e. roughly **2.1x**, not the 2.46x previously claimed.
+
+## Acceptance is deterministic per workload, not stable across workloads
+
+Acceptance has **zero** run-to-run variance (spread 0.00 over five runs for both
+configs). This is expected: at temperature 0 with exact-match verification and a fixed
+prompt, the token sequence is identical every run, so the drafted/accepted counters are
+identical.
+
+That determinism must not be mistaken for generality. The same v2/K=7 configuration
+measured 68.59%, 43.77% and 78.34% acceptance on three different prompts, and about 21%
+on short chat prompts through the server. **Acceptance is a property of the workload,
+not of the engine.** Any single acceptance figure is only meaningful alongside the exact
+prompt that produced it.
+
+## Throughput variance differs sharply by configuration
+
+v2/K=7 swings 17% run to run while v1/K=3 swings 1%. Deeper speculation produces more
+variable wall-clock time even when the accepted token sequence is identical, because
+more draft positions mean more work whose scheduling can vary. For a latency-sensitive
+deployment this argues for the shallower configuration independently of mean throughput.
+
+## Recommended default configuration
+
+**DSpark v1 at K=3.** It gives up about 1.7 tok/s of median throughput against v2/K=7
+but returns 21 points of acceptance and an 18x tighter throughput distribution.
