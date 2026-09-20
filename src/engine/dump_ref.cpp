@@ -50,7 +50,7 @@ static bool eval_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [token_id] [outdir] [name_filter]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> [token_id] [outdir] [name_filter] [n_tokens]\n", argv[0]);
         return 2;
     }
     const char* model_path = argv[1];
@@ -76,9 +76,15 @@ int main(int argc, char** argv) {
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
-    llama_token tok = (llama_token)token_id;
-    llama_batch batch = llama_batch_get_one(&tok, 1);
+    // A multi-token prompt exercises RoPE at nonzero positions, real attention
+    // over >1 key, and the GDN recurrence carrying state between tokens - all of
+    // which cancel at a single token.
+    const int n_tok = (argc > 5) ? atoi(argv[5]) : 1;
+    std::vector<llama_token> toks;
+    for (int i = 0; i < n_tok; ++i) toks.push_back((llama_token)(token_id + i));
+    llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
     if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "decode failed\n"); return 1; }
+    printf("decoded %d tokens starting at %d\n", n_tok, token_id);
 
     printf("dumped %d tensors for token %d to %s\n", g_count, token_id, g_outdir.c_str());
     const float* logits = llama_get_logits(ctx);

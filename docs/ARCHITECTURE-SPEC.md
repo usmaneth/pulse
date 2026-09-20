@@ -281,12 +281,31 @@ The sweep carries Pulse's own residual stream through all 64 layers and never
 re-seeds from the reference. **Error does not accumulate** - layer 32
 (0.99999704) is tighter than layer 2 (0.99999283).
 
+## The attention path at >1 token
+
+At a single token the softmax is over one element and Q, K, the q/k norms and
+RoPE all cancel. A two-token reference exercises them. Validated on layer 3,
+both tokens, all 24 heads, against `attn_pregate-3`:
+
+| Q source | RoPE | worst rel |
+|---|---|---|
+| `Qcur` | no | 9.122e-02 |
+| `Qcur` | yes | 1.613e-01 |
+| `Qcur_normed` | no | 1.043e-01 |
+| **`Qcur_normed`** | **yes** | **6.877e-04** |
+
+**Order is: q_norm / k_norm FIRST, then RoPE, then attention.** Both operands
+are normalised before rotation; using the pre-norm `Qcur` fails at 9e-02 whether
+or not RoPE is applied. At token 1 the softmax weights are 0.0657 / 0.9343, so
+both keys are genuinely live.
+
+That also confirms the RoPE implementation in composition at a nonzero position,
+which the single-token run could not do.
+
 ## Open items
 
-- **>1 token.** Q, K, the q/k norms and RoPE all cancel at a single token
-  (softmax over one element), so they are unit-validated but not exercised in
-  composition. A two-token run closes that.
 - **Multi-token GDN.** The recurrence is validated from a zero state. Carrying
-  state across tokens, and the conv1d window shifting, need a longer run.
+  state across tokens, and the conv1d window growing (it becomes `[5, 10240]`
+  at two tokens), need a longer run.
 - **Attention output projection + gate.** Mapping confirmed; projection not yet
   checked against `attn_output`.
