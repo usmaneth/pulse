@@ -6,7 +6,8 @@ Pulse is not an inference engine and does not replace llama.cpp. It is two thing
 
 1. A **benchmark suite** for speculative decoding on GB10, built after a previous
    iteration of this repo published numbers that turned out to be invented. Every
-   figure below was measured on an idle GPU and is reproducible from this repo.
+   figure below was measured on a quiesced GPU under a stated protocol
+   (see *Measurement hygiene*) and is reproducible via `bench/reproduce.sh`.
 2. A **tuning profile plus launcher** that starts llama.cpp with the configuration
    measured to be best on this hardware, instead of making you rediscover it.
 
@@ -118,6 +119,22 @@ Two traps that produced false results here, both now guarded by `pulse doctor`:
   idle during decode. CUPTI does not capture fabric stalls on unified memory.
   The two-process 1.01x result disproves it directly. Do not publish GPU-idle
   percentages from nsys on this machine.
+
+## Measurement protocol
+
+This machine is state-dependent, so the protocol changes the answer. The identical
+config and command, three ways:
+
+| protocol | median | spread |
+|---|---|---|
+| n=3, favourable machine state | 73.3 tok/s | 1.5% (luck, doesn't reproduce) |
+| n=6, quiesced, **no warmup discard** | 66.3 tok/s | 10.2% (cold; runs climb) |
+| n=4, **2 warmup + interleaved** | **71.5 tok/s** | **3.4%** (warm steady state) |
+
+Cold and warm are both real: ~66 is first use after CPU activity, ~71.5 is
+sustained serving. `bench/ab.py` enforces the warm protocol — it refuses a busy
+GPU, discards warmup, **interleaves configs** so drift can't masquerade as a
+difference, and won't call a delta real below the noise floor.
 
 ## Quick start
 
