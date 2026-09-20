@@ -279,6 +279,20 @@ void k_hadamard(float* __restrict__ x, const float* __restrict__ signs,
     }
 }
 
+// Tiled -> grouped head permutation, required before the Hadamard fold on
+// activations whose feature axis is laid out per head. llama-graph.cpp: "the
+// activation arrives with its feature axis in tiled head order [hd, nk, rep]
+// and must be permuted to the grouped order [hd, rep, nk] the fold was
+// computed in, before signs and rotation". For ssm_out that is 128 x 16 x 3.
+__global__ void k_perm_tiled_to_grouped(const float* __restrict__ in,
+                                        float* __restrict__ out,
+                                        int hd, int nk, int rep) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= hd*nk*rep) return;
+    const int d = i % hd, t = (i / hd) % nk, r = i / (hd*nk);   // [hd, nk, rep]
+    out[d + r*hd + t*hd*rep] = in[i];                            // [hd, rep, nk]
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -867,6 +881,62 @@ int main(int argc, char** argv) {
             printf("     confirms S_new == beta * outer(v,k) exactly)\n");
             const double best = eA/std::max(magA,1e-9); (void)eB;
             report("GDN recurrence formulation vs llama.cpp", best, 1e-3);
+        }
+        // ---- GDN exit: final_output [6144] -> [hadamard?] -> ssm_out -> linear_attn_out
+        std::vector<float> fo, lao;
+        if (load_ref("final_output-0", fo) && load_ref("linear_attn_out-0", lao)) {
+            const DevTensor* wo = m.layer(0,"ssm_out.weight");
+            if (wo && wo->type == T_PQ2_0) {
+                const int nin = (int)wo->ne[0], nout = (int)wo->ne[1];
+                if ((int)fo.size() == nin) {
+                    std::vector<int32_t> sv, sw;
+                    m.reader().array_i32("prism.hadamard.sign_values", sv);
+                    m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                    float* sgn = nullptr;
+                    { size_t off=0;
+                      for (size_t i=0;i<sw.size();++i){ if (sw[i]==nin){
+                            std::vector<float> f(nin);
+                            for (int j=0;j<nin;++j) f[j]=(float)sv[off+j];
+                            CU(cudaMalloc(&sgn,(size_t)nin*4));
+                            CU(cudaMemcpy(sgn,f.data(),(size_t)nin*4,cudaMemcpyHostToDevice)); break; }
+                          off += (size_t)sw[i]; } }
+                    const int HB=1024; const float hs=1.0f/std::sqrt((float)HB);
+                    double best = 1e30;
+                    for (int variant = 0; variant < 3; ++variant) {
+                        float *dx,*dy;
+                        CU(cudaMalloc(&dx,(size_t)nin*4)); CU(cudaMalloc(&dy,(size_t)nout*4));
+                        CU(cudaMemcpy(dx,fo.data(),(size_t)nin*4,cudaMemcpyHostToDevice));
+                        if (variant==2) {
+                            // tiled [128,16,3] -> grouped [128,3,16], then fold
+                            float* dp; CU(cudaMalloc(&dp,(size_t)nin*4));
+                            k_perm_tiled_to_grouped<<<(nin+255)/256,256>>>(dx,dp,128,16,3);
+                            CU(cudaDeviceSynchronize());
+                            CU(cudaMemcpy(dx,dp,(size_t)nin*4,cudaMemcpyDeviceToDevice));
+                            cudaFree(dp);
+                        }
+                        if (variant>=1)
+                            k_hadamard<<<(nin+HB-1)/HB,512,HB*4>>>(dx,sgn,nin,HB,hs);
+                        CU(cudaDeviceSynchronize());
+                        k_matvec_pq2<<<(nout+7)/8,256>>>((const blk*)wo->ptr,dx,dy,nin,nout);
+                        CU(cudaDeviceSynchronize());
+                        std::vector<float> got(nout);
+                        CU(cudaMemcpy(got.data(),dy,(size_t)nout*4,cudaMemcpyDeviceToHost));
+                        double e=0,mag=0,cn=0,ga=0,ra=0;
+                        for (int i=0;i<nout;++i){
+                            e=std::max(e,(double)std::fabs(got[i]-lao[i]));
+                            mag=std::max(mag,(double)std::fabs(lao[i]));
+                            cn+=(double)got[i]*lao[i]; ga+=(double)got[i]*got[i];
+                            ra+=(double)lao[i]*lao[i]; }
+                        static const char* vn[3] = {"plain","hadamard","permute+hadamard"};
+                        printf("    ssm_out %-18s rel %.3e  cos %.8f\n", vn[variant],
+                               e/std::max(mag,1e-9), cn/std::sqrt(std::max(ga*ra,1e-30)));
+                        best = std::min(best, e/std::max(mag,1e-9));
+                        cudaFree(dx); cudaFree(dy);
+                    }
+                    report("GDN ssm_out projection vs llama.cpp", best, 1e-2);
+                    if (sgn) cudaFree(sgn);
+                }
+            }
         }
     }
 
