@@ -75,10 +75,12 @@ export class PulseServer {
               total_requests: this.totalRequests,
               total_tokens_generated: this.totalTokensGenerated,
               peak_decode_toks_per_sec: this.peakTokensPerSec,
-              // Accurate rather than flattering: the hot-path K decision is a local
-              // regex, not a Jev call, and llama.cpp ignores per-request K anyway
-              // (`#if 0` in tools/server/server-schema.cpp). See src/jev/client.ts.
-              speculation_k_decision: 'local heuristic, advisory only (backend ignores per-request K)',
+              // Accurate rather than flattering: the hot-path K decision is a
+              // local regex, not a Jev call. It IS live against a backend
+              // carrying patches/llama-per-request-spec-n-max.patch, and is
+              // silently ignored by a stock llama.cpp, which drops per-request
+              // speculative params behind `#if 0`. See src/jev/client.ts.
+              speculation_k_decision: 'local measured heuristic (bench/kcurve.py): schema K=3, otherwise K=4; needs the per-request n_max patch on the backend',
               jev_gateway_used_for: ['memory_admission'],
               checkpoints: this.checkpoints.getStats(),
               last_checkpoint_restore: this.lastCheckpointRestore,
