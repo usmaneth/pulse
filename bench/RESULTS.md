@@ -2629,3 +2629,93 @@ worth doing for control - owning the KV cache, shipping fixes without patching
 upstream, scheduling policy - and those are product reasons, not speed reasons.
 Anyone proposing the rewrite on performance grounds now has four measured
 kernels and a failed layout experiment arguing against it.
+
+---
+
+# Round 36 - cross-checking the "head re-read" analysis against ground truth
+
+A parallel session produced an analysis concluding that llama.cpp re-reads the
+248,320-entry output head once per verification position, costing 26.03 ms of a
+79.63 ms step, and projecting 102-128 tok/s from a CUTLASS mixed-input INT4xFP16
+head kernel. Three of its inputs are checkable now that Pulse reads the model
+and runs its own head kernel.
+
+## 1. The head is not int4
+
+`output.weight` is **`ggml_type` 142 = PQ2_0 at 2.125 bits**, read directly from
+the file (Round 33): 1,271,398,400 elements in **337,715,200 bytes = 0.338 GB**.
+
+The analysis uses 0.592 GiB, which is this shape at **4 bits**. Every figure
+derived from it - the "3.21 ms theoretical read", the claim that a measured
+3.233 ms GEMV is therefore "already bandwidth-perfect" - is computed against a
+head roughly 1.9x larger than the one in the file.
+
+Measured here on that exact tensor: **1.919 ms** for a single-column head matvec
+(Round 35, v4). Not 3.233. The GEMV was never bandwidth-perfect; it was ~57% of
+achievable.
+
+## 2. The batching mechanism is real, and larger than claimed
+
+`pq2_matvec_batched<NC>` reads the weights once and accumulates NC columns:
+
+| columns | ms | ms/column |
+|---|---|---|
+| 1 | 2.347 | 2.35 |
+| 2 | 2.142 | 1.07 |
+| 4 | 3.001 | 0.75 |
+| 8 | **4.256** | **0.53** |
+
+8 separate passes: **18.776 ms**. One batched 8-column pass: **4.256 ms**.
+**4.41x, saving 14.52 ms.** Marginal cost per extra column is 0.273 ms, not a
+full sweep.
+
+This also makes the proposed CUTLASS work unnecessary. The analysis projects
+~3.21 ms for a mixed-input tensor-core head and 11.62 ms for the cuBLAS FP16
+path. A plain batched PQ2_0 matvec - no CUTLASS, no tensor cores, ~40 lines -
+gets **4.256 ms**, because it stays at 0.338 GB instead of expanding to 2.543 GB
+of FP16.
+
+## 3. But llama.cpp already does this
+
+`ggml/src/ggml-cuda/mmvq.cu:697`:
+
+```cpp
+for (int j = 0; j < ncols_dst; ++j)
+    for (int i = 0; i < rows_per_cuda_block; ++i)
+        tmp[j][i] += vec_dot_q_cuda(vx, &y[j*stride_col_y + kby], ...);
+```
+
+**`vx` is invariant in the `j` loop.** The weight is loaded once and reused
+across every column, with `MMVQ_MAX_BATCH_SIZE = 8`. For K+1 <= 8 verification
+positions the head read is already amortised, which is what this project
+recorded earlier as "batched LM-head kernel: no gain available".
+
+So the 26.03 ms is time that is not being lost, and the 102-128 tok/s
+projections recover it twice.
+
+**Where the concern is real:** above 8 columns `ncols_dst` crosses
+`MMVQ_MAX_BATCH_SIZE` and dispatch falls to MMQ, which has a ~65 ms base against
+mmvq's 36.6 ms (Round 20). At K >= 8 the amortisation does break. At K=7 it sits
+exactly at the limit and holds.
+
+## 4. This puts one of my own numbers back in doubt
+
+Round 33 corrected the output-head arithmetic to `0.338 GB / 216 GB/s = 1.56 ms`
+per row and concluded the head explains ~46% of the ~3.37 ms/row residual. That
+calculation **also assumed a per-row head read**. If mmvq amortises, the head's
+marginal contribution is nearer the 0.273 ms/column measured above - about 9% of
+the residual, not 46%.
+
+Round 33's correction of the *units* and the *head size* stands. Its
+attribution of the residual does not, and is withdrawn. The residual is once
+again unexplained, and the honest position is that neither session has yet
+accounted for it.
+
+## What survives from that analysis
+
+- Head batching being flat in column count: **confirmed, measured at 4.41x.**
+- Its three documented failed kernels (register spill, shared-memory bank
+  conflicts): valuable negative results.
+- Its own closing corrections - that 73.00 was a max rather than a median, and
+  that 63.83 with spread 11.10 is the honest figure - are exactly right, and the
+  same discipline applied earlier would have caught the head-size error.

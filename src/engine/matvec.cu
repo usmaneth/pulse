@@ -242,6 +242,48 @@ void pq2_matvec_split(const uint8_t* __restrict__ QS, const uint16_t* __restrict
     if (lane == 0) y[warp_id] = acc;
 }
 
+// Batched head: y[row][c] for c in 0..NC-1, reading W exactly ONCE.
+//
+// This tests the central claim of the "head re-read" analysis: that speculative
+// verification pays a full head read per draft position, so K+1 positions cost
+// K+1 full sweeps. If that is right, a kernel that reads W once and accumulates
+// NC columns should be nearly FLAT in NC - the weights dominate and x is tiny.
+template<int NC>
+__global__ __launch_bounds__(256)
+void pq2_matvec_batched(const blk* __restrict__ W, const float* __restrict__ X,
+                        float* __restrict__ Y, int ne0, int nrows) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane    = threadIdx.x & 31;
+    if (warp_id >= nrows) return;
+
+    const int nblk = ne0 / QK;
+    const blk* row = W + (size_t)warp_id * nblk;
+
+    float acc[NC];
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+
+    for (int b = 0; b < nblk; ++b) {
+        const uint8_t p = __ldg(&row[b].qs[lane]);       // weights read ONCE
+        const float   d = __half2float(__ushort_as_half(__ldg(&row[b].d)));
+        const int w0 = ((int)((p     ) & 3) - 1), w1 = ((int)((p >> 2) & 3) - 1);
+        const int w2 = ((int)((p >> 4) & 3) - 1), w3 = ((int)((p >> 6) & 3) - 1);
+        const int base = b*QK + lane*4;
+        #pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float4 xv = *reinterpret_cast<const float4*>(X + (size_t)c*ne0 + base);
+            acc[c] += (w0*xv.x + w1*xv.y + w2*xv.z + w3*xv.w) * d;
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        float v = acc[c];
+        #pragma unroll
+        for (int off = 16; off; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) Y[(size_t)c*nrows + warp_id] = v;
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr,"usage: %s <model.gguf> [tensor] [rows]\n",argv[0]); return 2; }
     const char* want = argc > 2 ? argv[2] : "output.weight";
@@ -390,6 +432,42 @@ int main(int argc, char** argv) {
     cudaFree(d_qs); cudaFree(d_ds);
     printf("  %-26s %7s   %6.1f GB/s\n", "llama.cpp decode", "-", 183.0);
     printf("  %-26s %7s   %6.1f GB/s\n", "achievable (bench/cuda/bw.cu)", "-", 216.0);
+    // --- head batching: is the head re-read per position, and does batching fix it?
+    {
+        const int NCMAX = 8;
+        std::vector<float> X((size_t)ne0*NCMAX);
+        for (int c = 0; c < NCMAX; ++c)
+            for (int i = 0; i < ne0; ++i) X[(size_t)c*ne0+i] = sinf((i + c*7) * 0.01f);
+        float *d_X, *d_Y;
+        CUDA_OK(cudaMalloc(&d_X, X.size()*sizeof(float)));
+        CUDA_OK(cudaMalloc(&d_Y, (size_t)nrows*NCMAX*sizeof(float)));
+        CUDA_OK(cudaMemcpy(d_X, X.data(), X.size()*sizeof(float), cudaMemcpyHostToDevice));
+        auto bench_nc = [&](int nc, auto kern) {
+            for (int i = 0; i < 5; ++i) kern<<<blocks,threads>>>(d_w,d_X,d_Y,ne0,nrows);
+            CUDA_OK(cudaDeviceSynchronize());
+            cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
+            cudaEventRecord(a);
+            for (int i = 0; i < 30; ++i) kern<<<blocks,threads>>>(d_w,d_X,d_Y,ne0,nrows);
+            cudaEventRecord(b); cudaEventSynchronize(b);
+            float ms=0; cudaEventElapsedTime(&ms,a,b);
+            const double per = ms/30.0;
+            printf("  %d column%-2s %7.3f ms   %6.1f GB/s   %5.2f ms/column   vs %d separate: %6.3f ms\n",
+                   nc, nc==1?" ":"s", per, wbytes/(per*1e-3)/1e9, per/nc, nc, per*nc/nc*nc);
+            return per;
+        };
+        printf("\nhead batching (weights read once, NC columns accumulated):\n");
+        const double t1 = bench_nc(1, pq2_matvec_batched<1>);
+        const double t2 = bench_nc(2, pq2_matvec_batched<2>);
+        const double t4 = bench_nc(4, pq2_matvec_batched<4>);
+        const double t8 = bench_nc(8, pq2_matvec_batched<8>);
+        printf("\n  8 separate 1-column passes : %7.3f ms\n", t1*8);
+        printf("  1 batched 8-column pass    : %7.3f ms\n", t8);
+        printf("  speedup from batching      : %7.2fx  (saves %.2f ms per step)\n",
+               t1*8/t8, t1*8 - t8);
+        (void)t2; (void)t4;
+        cudaFree(d_X); cudaFree(d_Y);
+    }
+
     printf("\n  best Pulse kernel reaches %.0f%% of llama.cpp, %.0f%% of achievable\n",
            100.0*std::max(std::max(b1,b2),std::max(std::max(b3,b4),b5))/183.0, 100.0*std::max(std::max(b1,b2),std::max(std::max(b3,b4),b5))/216.0);
 
