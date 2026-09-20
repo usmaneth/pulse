@@ -19,15 +19,32 @@ Everything below was measured on this GB10. Nothing is extrapolated.
 
 | quantity | value | how |
 |---|---|---|
-| sustained memory bandwidth | 184.6 GB/s | `bench_gb10_streaming`, idle GPU |
+| spec peak (256-bit LPDDR5X @ 8533 MT/s) | 273 GB/s | vendor |
+| **achievable** pure read at 6.70 GB | **~216 GB/s** | `bench/cuda/bw.cu`, MLP/occupancy sweep, 3 runs |
 | target model (`PQ2_0`) | 6.70 GB | file size |
-| predicted batch-1 step | 36.3 ms | 6.70 / 184.6 |
+| weight-sweep roofline | **30.9 ms** | 6.70 / 216 |
 | **measured** full decode step at 1 tok/step | **36.65 ms** | n-gram design curve |
+| llama.cpp decode efficiency | **85%** of achievable | 183 of 216 GB/s |
 | measured no-drafter decode | 27.54 tok/s | `llama-batched-bench` B=1 |
 
-The prediction and the measurement agree to 1%. **llama.cpp's batch-1 decode is
-already at the memory-bandwidth roofline.** There is no runtime overhead to
-reclaim in the target forward pass.
+**Correction.** An earlier revision of this document said the prediction and
+measurement "agree to 1%" and concluded llama.cpp was already at the roofline.
+That used a sustained-bandwidth figure of 184.6 GB/s taken from a single kernel
+configuration, which under-measured the hardware. Sweeping memory-level
+parallelism and occupancy gives ~216 GB/s at this working set (229 GB/s at 4 GB).
+
+There are two distinct gaps:
+
+- **273 -> 216 GB/s is the DRAM** - refresh, row activate/precharge over a
+  6.70 GB working set, read turnaround, a fabric shared with the Grace CPU.
+  70-85% of theoretical is the normal LPDDR5X range. **Not recoverable.**
+- **216 -> 183 GB/s is software.** The real roofline is 30.9 ms against a
+  measured 36.65 ms: a **16% gap**, not 1%.
+
+Not all 5.75 ms of that is waste - a decode step also reads KV, writes
+activations, and runs norms, Hadamard, `quantize_q8_1` and sampling. But it is
+not zero, and the earlier claim that there was nothing to reclaim in the target
+forward pass was wrong.
 
 ## Where the remaining time actually goes
 
@@ -108,7 +125,16 @@ roughly 6-10 ms, i.e. **+11% to +19%**.
 | `mmvq` kernels for 9-16 columns | ~13%, but only at 9-15 rows | our drafters give 5 and 8 rows, so it does not apply |
 | CUDA Graphs over the whole step | unmeasured | llama.cpp cannot: Gated DeltaNet nodes fail `ggml_cuda_graph_check_compability`. A static-shape engine could |
 
-**Roughly 1.15x on single-stream (measured range 1.11-1.19x), for months of work.** That is the honest
+Adding the base-step gap to the drafter term:
+
+    base step gap        ~5.75 ms   partly recoverable
+    drafter fixed cost    8.08 ms   recoverable by fusion
+
+Against the measured 62.61 ms step (v1, K=3), recovering both gives roughly
+49 ms - about **+28%**, not the +15% from the drafter alone.
+
+**So: roughly 1.3x on single-stream, for months of work.** Better than this
+document first claimed, and still nowhere near an order of magnitude. That is the honest
 number, and it is not 10x. It is also not nothing.
 
 ## What an engine would NOT fix
