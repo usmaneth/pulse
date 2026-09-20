@@ -293,6 +293,14 @@ __global__ void k_perm_tiled_to_grouped(const float* __restrict__ in,
     out[d + r*hd + t*hd*rep] = in[i];                            // [hd, rep, nk]
 }
 
+// Inverse Hadamard for the embedding table: h = s * (H z) - rotation FIRST,
+// then signs. That is the reverse order of the forward fold (signs then
+// rotation), per llama-graph.cpp build_embd_rows.
+__global__ void k_apply_signs(float* __restrict__ x, const float* __restrict__ s, int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n && s) x[i] *= s[i];
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -1101,6 +1109,59 @@ int main(int argc, char** argv) {
                     report("attention output projection vs llama.cpp", best, 1e-2);
                     if (sgn) cudaFree(sgn);
                 }
+            }
+        }
+        // ---- token embedding: inverse Hadamard, h = signs * WHT(z)
+        std::vector<float> ref_emb;
+        if (load_ref("model.input_embed", ref_emb)) {
+            const DevTensor* te = m.get("token_embd.weight");
+            if (te && te->type == T_PQ2_0 && (int)ref_emb.size() == n) {
+                const int tok = 100;                       // the dumped token
+                const int nblk_row = n / QK;
+                std::vector<int32_t> sv, sw;
+                m.reader().array_i32("prism.hadamard.sign_values", sv);
+                m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+                float* sgn = nullptr;
+                { size_t off=0;
+                  for (size_t i=0;i<sw.size();++i){ if (sw[i]==n){
+                        std::vector<float> f(n);
+                        for (int j=0;j<n;++j) f[j]=(float)sv[off+j];
+                        CU(cudaMalloc(&sgn,(size_t)n*4));
+                        CU(cudaMemcpy(sgn,f.data(),(size_t)n*4,cudaMemcpyHostToDevice)); break; }
+                      off += (size_t)sw[i]; } }
+                // dequantise the row on the host via ggml, then transform
+                std::vector<float> row(n);
+                const uint8_t* hd = m.host_data("token_embd.weight");
+                dequantize_row_pq2_0((const void*)(hd + (size_t)tok*nblk_row*34), row.data(), n);
+                float* dz; CU(cudaMalloc(&dz,(size_t)n*4));
+                const int HB=1024; const float hs=1.0f/std::sqrt((float)HB);
+                double best=1e30; int bestv=-1;
+                for (int variant = 0; variant < 2; ++variant) {
+                    CU(cudaMemcpy(dz,row.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+                    if (variant==0) {           // h = signs * WHT(z)   (documented order)
+                        k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dz,nullptr,n,HB,hs);
+                        CU(cudaDeviceSynchronize());
+                        k_apply_signs<<<(n+255)/256,256>>>(dz,sgn,n);
+                    } else {                    // h = WHT(signs * z)   (forward order)
+                        k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dz,sgn,n,HB,hs);
+                    }
+                    CU(cudaDeviceSynchronize());
+                    std::vector<float> got(n);
+                    CU(cudaMemcpy(got.data(),dz,(size_t)n*4,cudaMemcpyDeviceToHost));
+                    double e=0,mag=0,cn=0,ga=0,ra=0;
+                    for (int i=0;i<n;++i){
+                        e=std::max(e,(double)std::fabs(got[i]-ref_emb[i]));
+                        mag=std::max(mag,(double)std::fabs(ref_emb[i]));
+                        cn+=(double)got[i]*ref_emb[i]; ga+=(double)got[i]*got[i];
+                        ra+=(double)ref_emb[i]*ref_emb[i]; }
+                    printf("    embed %-22s rel %.3e  cos %.8f\n",
+                           variant? "WHT(signs*z)":"signs*WHT(z)",
+                           e/std::max(mag,1e-9), cn/std::sqrt(std::max(ga*ra,1e-30)));
+                    if (e/std::max(mag,1e-9) < best) { best = e/std::max(mag,1e-9); bestv = variant; }
+                }
+                report("token embedding (inverse hadamard)", best, 1e-2);
+                (void)bestv;
+                cudaFree(dz); if (sgn) cudaFree(sgn);
             }
         }
     }

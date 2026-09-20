@@ -55,6 +55,19 @@ y = W @ x
 `sign_values` is 28,672 entries; `sign_widths` is `[5120, 6144, 17408]` -
 **one sign vector per distinct activation width**: hidden, ssm-inner, ffn.
 
+### The embedding table is the INVERSE case
+
+`token_embd.weight` is in `prism.hadamard.inverse_weight_names`. It stores
+rotated rows, so the lookup restores the primal basis - and the order is
+**reversed**: rotation first, then signs.
+
+```
+h = signs * WHT(z)        # embedding lookup  -> rel 0.000e+00, cos 1.00000000
+h = WHT(signs * z)        # forward order     -> cos -0.0075, garbage
+```
+
+Getting this backwards poisons the residual stream from token 0.
+
 ### Conventions per weight, all measured
 
 | weight | in-width | convention | verified |
