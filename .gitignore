@@ -7,6 +7,7 @@ bin/*
 !bin/pulse-cli
 !bin/pulse-gguf
 !bin/pulse-matvec
+!bin/pulse-engine
 !bin/pulse-dequant
 *.gguf
 packages/**/*.gguf
