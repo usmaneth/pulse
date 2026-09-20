@@ -1938,7 +1938,35 @@ int main(int argc, char** argv) {
             }
             cudaStreamDestroy(st);
         }
-        printf("  per forward pass      : %7.2f ms\n", per);
+        // --- attribute the non-matvec cost: time each kernel class in isolation
+        {
+            auto bench_k = [&](const char* nm, int reps, auto&& fn){
+                fn(); CU(cudaDeviceSynchronize());
+                cudaEvent_t c,d; cudaEventCreate(&c); cudaEventCreate(&d);
+                cudaEventRecord(c);
+                for (int i=0;i<reps;++i) fn();
+                cudaEventRecord(d); cudaEventSynchronize(d);
+                float t=0; cudaEventElapsedTime(&t,c,d);
+                printf("    %-26s %7.3f us/call  x%4d/pass = %6.2f ms\n",
+                       nm, t/reps*1000.0, reps, t/reps*reps/reps*0);
+                return (double)(t/reps);
+            };
+            const double t_norm = bench_k("k_rmsnorm (1 blk, 256t)", 200, [&]{
+                k_rmsnorm<<<1,256,0,g_stream>>>(dx,(const float*)m.layer(0,"attn_norm.weight")->ptr,dh,n,hp.rms_eps); });
+            const double t_had  = bench_k("k_hadamard (5120)", 200, [&]{
+                k_hadamard<<<(n+HB-1)/HB,512,HB*4,g_stream>>>(dt,S5,n,HB,hs); });
+            const double t_mv   = bench_k("k_matvec_pq2 (5120x17408)", 20, [&]{
+                k_matvec_pq2<<<(nff+7)/8,256,0,g_stream>>>((const blk*)m.layer(0,"ffn_gate.weight")->ptr,dt,dg,n,nff); });
+            const double t_gdn  = bench_k("k_gdn_step (48 heads)", 100, [&]{
+                k_gdn_step<<<nvh,128,2*dk*sizeof(float),g_stream>>>(dstate,dconv,dconv+2048,
+                    dconv+4096,dgg,dbb,do1,nvh,nkh,dk,dv); });
+            printf("\n    per forward pass (64 layers):\n");
+            printf("      rmsnorm   x128 = %6.2f ms\n", t_norm*128);
+            printf("      hadamard  x~230 = %6.2f ms\n", t_had*230);
+            printf("      gdn_step  x48  = %6.2f ms\n", t_gdn*48);
+            printf("      (matvec 5120x17408 is %6.3f ms each; ~2.3 of those per layer)\n", t_mv);
+        }
+        printf("\n  per forward pass      : %7.2f ms\n", per);
         printf("  harness version       : %7.2f ms  (host round-trips + CPU recurrence)\n", 65.9);
         printf("  llama.cpp decode step : %7.2f ms\n", 36.65);
         printf("  weight-sweep bound    : %7.2f ms  (6.70 GB at 176 GB/s)\n", 6.70/176.0*1000.0);

@@ -2878,3 +2878,42 @@ structural freedom an engine has on that op - choosing the memory layout - came
 out 12% worse. Closing the remaining 15 ms lands Pulse at roughly llama.cpp's
 speed. It does not pass it, and nothing measured in this project suggests a
 route that does.
+
+## Round 39b - where the engine's non-matvec time goes
+
+Timed each kernel class in isolation, then scaled by calls per forward pass:
+
+| kernel | per call | calls/pass | total |
+|---|---|---|---|
+| `k_rmsnorm` (1 block, 256 threads) | 8.21 us | 128 | **1.05 ms** |
+| `k_hadamard` (5120) | 6.09 us | ~230 | **1.40 ms** |
+| `k_gdn_step` (48 heads) | 60.04 us | 48 | **2.88 ms** |
+
+Non-matvec total: **~5.3 ms** of a 53.3 ms pass.
+
+**A measurement artifact worth recording.** The isolated `k_matvec_pq2` on
+`ffn_gate` [5120 x 17408] measures 72.17 us for 23.67 MB, which is **328 GB/s** -
+above the 216 GB/s this machine can achieve. It is not real: the benchmark loop
+re-reads the same 23.67 MB tensor, which fits in cache. Matvecs in the actual
+forward pass run cold over 6.70 GB and get the 176 GB/s of Round 35. Any
+per-kernel microbenchmark on a tensor small enough to cache will over-report,
+and this one over-reports by 1.9x.
+
+## The budget, assembled
+
+| item | ms |
+|---|---|
+| weight sweep, 6.70 GB at 176 GB/s | 38.1 |
+| rmsnorm + hadamard + gdn_step | 5.3 |
+| ~10 further small kernels per layer (bf16 gates, conv, l2, perm, swiglu, adds) | ~4 |
+| device-to-device copies, 4 per layer | ~1 |
+| **accounted** | **~48** |
+| measured | 53.3 |
+
+The engine is within ~15 ms of llama.cpp and **the overhead is spread thin
+rather than concentrated** - roughly 25 kernel launches per layer, none of them
+individually large. That is the least convenient shape for optimisation: there
+is no hotspot to remove, only a long tail to fuse.
+
+`k_gdn_step` at 2.88 ms is the largest single non-matvec item, and most of it is
+genuine state traffic (600 MB across 48 layers) that llama.cpp also pays.
