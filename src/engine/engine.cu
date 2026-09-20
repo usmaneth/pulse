@@ -982,9 +982,15 @@ int main(int argc, char** argv) {
                             for (int j = 0; j < dk; ++j) acc += (double)Sn[(size_t)i*dk+j]*qq[j];
                             o[i] = acc; ss += acc*acc;
                         }
+                        // ssm_norm's epsilon is scaled by the head dimension:
+                        // eps_eff = dv * rms_eps = 128 * 1e-6 = 1.28e-4.
+                        // Solved independently on all 48 heads: mean 1.279996e-04,
+                        // std 5.63e-09. With plain rms_eps the cosine is 0.9279;
+                        // with dv*rms_eps it is 1.00000000.
+                        const double eps_ssm = (double)dv * hp.rms_eps;
                         const double sc = (variant==4)
-                            ? 1.0/std::sqrt(global_ss/(double)(dv*nvh) + hp.rms_eps)
-                            : 1.0/std::sqrt(ss/dv + hp.rms_eps);
+                            ? 1.0/std::sqrt(global_ss/(double)(dv*nvh) + eps_ssm)
+                            : 1.0/std::sqrt(ss/dv + eps_ssm);
                         for (int i = 0; i < dv; ++i) {
                             const double nm = o[i]*sc*(double)snw[i];
                             size_t zi = (size_t)h*dv + i;
@@ -1006,6 +1012,35 @@ int main(int argc, char** argv) {
                     static const char* vn[5] = {"silu(z)*norm","silu(norm)*z","z tiled->grouped","blocked q map","global rmsnorm"};
                     printf("    gate %-20s rel %.3e  cos %.8f\n", vn[variant], rel, cs);
                     if (rel < bestv) { bestv = rel; bestk = variant; bestcos = cs; }
+                }
+                // Diagnostic: invert the gate. implied_norm = final_output / silu(z).
+                // If that matches rmsnorm(S_new q) in DIRECTION, the gate and the
+                // norm are right and only the magnitude/derivation of o differs.
+                {
+                    double cn=0, ga=0, ra=0; int skipped=0;
+                    std::vector<double> o(dv);
+                    for (int h = 0; h < nvh; ++h) {
+                        const int g = h % nkh;
+                        const float* qq = qv.data()  + (size_t)g*dk;
+                        const float* Sn = nsv.data() + (size_t)h*dv*dk;
+                        double ss=0;
+                        for (int i = 0; i < dv; ++i) {
+                            double acc=0;
+                            for (int j = 0; j < dk; ++j) acc += (double)Sn[(size_t)i*dk+j]*qq[j];
+                            o[i]=acc; ss+=acc*acc;
+                        }
+                        const double sc = 1.0/std::sqrt(ss/dv + (double)dv*hp.rms_eps);
+                        for (int i = 0; i < dv; ++i) {
+                            const double zz = (double)zv[(size_t)h*dv+i];
+                            const double sil = zz/(1.0+std::exp(-zz));
+                            if (std::fabs(sil) < 1e-6) { ++skipped; continue; }
+                            const double implied = (double)fov2[(size_t)h*dv+i] / sil;
+                            const double mine    = o[i]*sc*(double)snw[i];
+                            cn += implied*mine; ga += mine*mine; ra += implied*implied;
+                        }
+                    }
+                    printf("    [diag] cos( rmsnorm(S_new q) , final/silu(z) ) = %.8f  (skipped %d)\n",
+                           cn/std::sqrt(std::max(ga*ra,1e-30)), skipped);
                 }
                 const double e = bestv, mag = 1.0; (void)bestk;
                 const double cn = bestcos, ga = 1.0, ra = 1.0;

@@ -128,8 +128,23 @@ costs nothing extra as context grows.
 2.6e-08) -> SiLU (6.9e-08) -> split q 2048 / k 2048 / v 6144.
 
 **Post-recurrence:** `silu(z) * rmsnorm_per_head(o, ssm_norm)` -> `ssm_out`.
-The RMSNorm is per-head over 128 (global over 6144 scores worse: 0.707 vs
-0.909). *This stage is not yet fully closed - see Open Items.*
+Validated at **9.788e-08, cosine 1.00000000**.
+
+**The ssm_norm epsilon is scaled by the head dimension.** This is the single
+subtlest thing in the whole model:
+
+```
+eps_ssm = head_v_dim * rms_eps = 128 * 1e-6 = 1.28e-4
+```
+
+With plain `rms_eps` the cosine is 0.9279; with `dv * rms_eps` it is exactly
+1.00000000. Solved independently on all 48 heads: mean 1.279996e-04, std
+**5.63e-09**.
+
+How it was found: the error ratio was ~1.0 for heads with large `||o||` and
+diverged for small ones, which is the fingerprint of an epsilon mismatch rather
+than a structural error. Solving `1/sc^2 - mean(o^2)` per head gave the same
+constant 48 times.
 
 ---
 
@@ -205,15 +220,15 @@ composition. Every one was caught the same way:
    softmax trivial and exposes the head mapping directly.
 5. **Validating against your own reference proves nothing about the model.**
    Step 8's GDN kernel passed its own test while being wrong three ways.
+6. **Read the error's SHAPE, not just its size.** The ssm_norm epsilon showed up
+   as an error that vanished for large-magnitude heads and grew for small ones.
+   That pattern says "additive constant in a denominator", which turns a search
+   over conventions into solving one equation.
 
 ---
 
 ## Open items
 
-- **GDN output gate.** Structure is confirmed - `silu(z) * rmsnorm_per_head` -
-  but reconstructing the fused op's `output` as `S_new q` reaches only cos
-  0.909. The state is not in doubt (9.169e-08). `output` is a view into
-  `ggml_gated_delta_net`'s result and is not separately dumped.
-- **Full 64-layer loop.** Components validated; not yet composed end to end.
+- **Full 64-layer loop.** Every component validated; not yet composed end to end.
 - **Attention output projection + gate.** Mapping confirmed; projection not yet
   checked against `attn_output`.
