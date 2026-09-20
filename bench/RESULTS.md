@@ -3032,3 +3032,36 @@ That is worth building on, and it is a capability difference rather than a
 tuning difference - the same character as owning RoPE for text-path position
 shifting, and CUDA graphs on a model whose GDN nodes llama.cpp's graph check
 rejects.
+
+## Round 41b - what the cliff is worth across the model
+
+Timed every major PQ2_0 weight of one layer plus the output head at NC=1 and
+NC=16:
+
+| tensor | NC=1 ms | NC=16 ms | per column | amortisation |
+|---|---|---|---|---|
+| `attn_qkv` | 0.042 | 0.322 | 0.020 | 2.09x |
+| `attn_gate` | 0.027 | 0.215 | 0.013 | 2.00x |
+| `ssm_out` | 0.027 | 0.193 | 0.012 | 2.23x |
+| `ffn_gate` | 0.073 | 0.525 | 0.033 | 2.21x |
+| `ffn_up` | 0.075 | 0.526 | 0.033 | 2.27x |
+| `ffn_down` | 0.090 | 0.530 | 0.033 | 2.71x |
+| **`output.weight`** | 2.216 | 7.869 | 0.492 | **4.51x** |
+| **total (0.439 GB)** | **2.549** | **10.179** | - | **4.01x** |
+
+Sixteen sequential passes would cost 40.8 ms; one batched pass costs 10.2 ms.
+
+**The amortisation is largest where it matters most.** The output head is 337 MB
+and cannot sit in cache, so its NC=1 baseline is honest and it gains 4.51x. The
+per-layer tensors are 12-24 MB and largely cache-resident during the benchmark,
+so their NC=1 time is already optimistic and their measured ratio (2.0-2.7x)
+understates what they would gain cold.
+
+llama.cpp cannot take this path above 8 columns. `MMVQ_MAX_BATCH_SIZE = 8`, and
+above it dispatch falls to MMQ with a ~65 ms base against `mul_mat_vec_q`'s
+36.6 ms (Round 20).
+
+**This is the one measured, defensible advantage over llama.cpp in this
+project**, and it is confined to the batched regime - speculative decoding at
+K >= 8, multi-client serving, and wide verification. Single-stream decode
+remains parity at best, tested five ways.
