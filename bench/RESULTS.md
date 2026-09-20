@@ -1764,3 +1764,80 @@ advantage on the restore itself. Whether that converts into a user-visible win
 depends entirely on edit locality in real agent traffic, which has not been
 measured. That is the next thing to establish, and it should be measured on real
 transcripts rather than assumed.
+
+---
+
+# Round 23 - the checkpoint layer loses to llama.cpp's own RAM cache
+
+Round 22 closed on an open question: the checkpoint layer's value depends on
+edit locality in real agent traffic, and nobody had measured it. This round
+measures it, then measures the layer itself. Both answers are negative.
+
+## Part A - a failed method, and what replaced it
+
+The first attempt (`bench/editlocality.py`) reconstructed the context at each
+turn from stored transcripts and compared each turn against the previous one
+with a longest-common-prefix test. The method is invalid. Transcript files are
+append-only by construction, so a reconstruction from them always reports 100%
+append, whatever the agent actually sent. The test cannot answer the question.
+The job was stopped.
+
+The replacement counts the events that actually mutate earlier context. A scan
+of **17,989 records across 23 Claude Code sessions**:
+
+| marker | hits |
+|---|---|
+| `truncat*` | 184 |
+| `elided` | 51 |
+| `compact_boundary` | 11 |
+| `isCompactSummary` | 3 |
+| **records with >= 1 marker** | **106 (0.59%)** |
+
+**Mid-context divergence is rare.** Roughly 99.4% of records append. Prefix
+caching, which Round 17 measured at 131.7x, already collects almost all of the
+available win. The checkpoint layer was built for the remaining 0.6%.
+
+## Part B - the paired A/B, on the case that does occur
+
+The mid-edit case is rare, but slot eviction is not. The server runs `-np 1`,
+so two interleaved sessions evict each other on every turn. `bench/ckpt_evict.py`
+drives that directly: session A, then session B, then a return to A and to B.
+The return is the measurement.
+
+| arm | `PULSE_CKPT` | return to an evicted session (median) |
+|---|---|---|
+| OFF | disabled | 814.2 ms |
+| **ON** | **enabled** | **3080.2 ms** |
+| OFF-confirm (re-run after ON) | disabled | 732.1 ms |
+| DEFAULT (new gate) | disabled | 705.3 ms |
+
+**The checkpoint layer is 4.2x slower.** The OFF arm ran again after the ON arm
+and reproduced, so run order does not explain the result. The effect is far
+outside the 3.4% noise floor.
+
+## Why it loses
+
+The restore primitive is fast in isolation. The stats report a 58.7 ms restore
+for 275 MB and a 150.4 ms save. The primitive is not the problem.
+
+llama.cpp already solves this. With `--cache-ram -1` the server keeps the state
+of an evicted slot in a RAM cache and restores it natively. The checkpoint layer
+does not know about that cache. It forces a disk restore, which discards the
+RAM-cached state, falls back to an older and shorter saved prefix, and then
+re-prefills the difference. It also writes ~300 MB per save. The layer competes
+with a better mechanism and loses.
+
+Round 21 reported "96x" for checkpointing. That figure measured the restore
+primitive against a cold re-prefill in isolation. It is correct as a
+micro-benchmark and irrelevant as a serving result, because the alternative in a
+real server is not a cold re-prefill - it is llama.cpp's RAM cache.
+
+## Action
+
+Checkpointing is now **off by default** and opt-in through `PULSE_CKPT=1`
+(`src/server/server.ts`). The code stays in the tree because the primitive is
+sound and may help a deployment without `--cache-ram`. It must not be enabled
+without a measurement on that deployment.
+
+**Use `--cache-ram -1` instead.** It is one flag, it is already in the launcher,
+and it beats the layer built to replace it.

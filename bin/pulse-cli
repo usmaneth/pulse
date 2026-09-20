@@ -1,0 +1,215 @@
+#!/usr/bin/env node
+/**
+ * Pulse CLI.
+ *
+ * Pulse is a measurement-driven serving configuration for speculative decoding
+ * on NVIDIA DGX Spark (GB10). It does not replace llama.cpp: it launches it with
+ * the configuration measured to be optimal on this hardware, and it ships the
+ * benchmark suite that produced those numbers.
+ *
+ * Every default in config/*.json carries its provenance. See bench/RESULTS.md.
+ */
+import { spawn, spawnSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const args = process.argv.slice(2);
+const command = args[0] || 'help';
+
+const flag = (name, dflt) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] ? args[i + 1] : dflt;
+};
+const has = (name) => args.includes(`--${name}`);
+
+function loadProfile(name) {
+  const p = path.join(rootDir, 'config', `${name}.json`);
+  if (!existsSync(p)) {
+    console.error(`no tuning profile at config/${name}.json`);
+    process.exit(1);
+  }
+  return JSON.parse(readFileSync(p, 'utf8'));
+}
+
+/** Refuse to measure on a busy GPU: contention swung an identical benchmark 4.4x. */
+function gpuBusy() {
+  const r = spawnSync('nvidia-smi', ['--query-compute-apps=pid,used_memory', '--format=csv,noheader']);
+  const out = (r.stdout || '').toString().trim();
+  return out ? out.split('\n').filter(Boolean) : [];
+}
+
+function sysLoad() {
+  try {
+    const la = readFileSync('/proc/loadavg', 'utf8').split(' ')[0];
+    return Number(la);
+  } catch { return null; }
+}
+
+/** Heavy CPU processes steal GPU bandwidth on GB10: the CPU and GPU share one LPDDR5X bus. */
+function cpuHogs(minPct = 5) {
+  const r = spawnSync('ps', ['-eo', 'pcpu,comm', '--sort=-pcpu']);
+  return (r.stdout || '').toString().trim().split('\n').slice(1, 8)
+    .map((l) => l.trim().split(/\s+/))
+    .filter((p) => Number(p[0]) >= minPct)
+    .map((p) => `${p[1]} (${p[0]}% cpu)`);
+}
+
+function doctor() {
+  const procs = gpuBusy();
+  const load = sysLoad();
+  const hogs = cpuHogs();
+  console.log('Pulse doctor\n');
+  const smi = spawnSync('nvidia-smi', ['--query-gpu=name,compute_cap,temperature.gpu', '--format=csv,noheader']);
+  console.log('  gpu           :', (smi.stdout || 'unknown').toString().trim());
+  console.log('  compute apps  :', procs.length === 0 ? '0 (clean)' : `${procs.length} RUNNING`);
+  for (const p of procs) console.log('                  ', p);
+  console.log('  load average  :', load ?? 'unknown');
+  console.log('  cpu hogs      :', hogs.length ? hogs.join(', ') : 'none above 5%');
+
+  let bad = 0;
+  if (procs.length) {
+    bad = 1;
+    console.log('\n  WARNING: other processes hold the GPU. An identical benchmark swung');
+    console.log('  33.79 ms -> 150.33 ms (4.4x) under contention.');
+  }
+  if ((load ?? 0) > 1.0 || hogs.length) {
+    bad = 1;
+    console.log('\n  WARNING: CPU activity steals GPU memory bandwidth on this machine.');
+    console.log('  GB10 shares one LPDDR5X bus between CPU and GPU. Measured: 8 CPU threads');
+    console.log('  streaming memory cost 16% of decode throughput (73.3 -> 61.0 tok/s), and');
+    console.log('  throughput did NOT recover immediately when the load stopped - unified');
+    console.log('  memory pages migrate and fault back lazily. Quiesce and settle before');
+    console.log('  measuring, and always take a median of several runs.');
+  }
+  if (!bad) console.log('\n  clean - safe to measure');
+  console.log('\n  note: do not trust nsys on GB10. CUPTI under-reports kernel duration on');
+  console.log('  unified memory - it showed 2.7 ms of kernel work inside a 73.4 ms step, and');
+  console.log('  92% GPU idle on a workload two independent processes proved was');
+  console.log('  bandwidth-saturated (1.01x aggregate). Use wall-clock differentials.');
+  return bad;
+}
+
+function buildServerArgs(profile, opts) {
+  const f = profile.launch_flags;
+  // v2's deeper block multiplies rows under batching (rows = clients x (K+1)) and
+  // crosses mmvq's ncols<=8 limit into MMQ. Measured: v2 loses to v1 at 1,4,8,16 clients.
+  const drafterKey = opts.drafter
+    || (opts.slots <= 1 ? (profile.serving_policy ? 'v2' : profile.drafters.recommended)
+                        : profile.drafters.recommended);
+  const d = profile.drafters[drafterKey];
+  // KV precision by context: f16 below ~8k (q8_0 measured slightly worse there),
+  // q4_0 at long context where KV dominates (+16.5% measured at 64k).
+  const kvType = opts.kvType || (opts.ctx >= 32768 ? 'q4_0' : 'f16');
+  const a = [
+    '-m', opts.model,
+    '-ctk', kvType, '-ctv', kvType,
+    '-ngl', String(f.n_gpu_layers),
+    '-fa', f.flash_attn,
+    '-c', String(opts.ctx),
+    '-np', String(opts.slots),
+    '-b', String(f.batch),
+    '-ub', String(f.ubatch),
+    '--host', opts.host, '--port', String(opts.port),
+    // Keeps evicted slot state in a RAM cache and restores it natively. This is
+    // what makes a return to an evicted session 732 ms instead of a re-prefill,
+    // and it beat this repo's own checkpoint layer by 4.2x (RESULTS.md Round 23).
+    // The default is 8192 MiB, which is far too small: KV at 256k is 17 GB.
+    '--cache-ram', '-1',
+  ];
+  if (opts.speculate && d) {
+    a.push('-md', path.join(path.dirname(opts.model), d.file));
+    // stacking a free n-gram drafter ahead of the neural one measured +1.8%
+    a.push('--spec-type', profile.spec_type?.recommended ?? 'draft-dspark');
+    a.push('--spec-ngram-simple-size-m', '4');
+    a.push('--spec-ngram-simple-size-n', '3');
+    // never request more than the drafter's block size: past it, K is a no-op
+    a.push('--spec-draft-n-max', String(Math.min(opts.k ?? d.optimal_k, d.block_size)));
+    a.push('-ngld', String(f.n_gpu_layers_draft));
+  }
+  return { argv: a, drafter: drafterKey, d, kvType };
+}
+
+function serve() {
+  const profile = loadProfile(flag('profile', 'gb10-bonsai2'));
+  const slots = Number(flag('slots', profile.parallel_slots.recommended));
+  const opts = {
+    model: flag('model', '/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/' + profile.model.target),
+    ctx: Number(flag('ctx', 65536)),
+    slots,
+    host: flag('host', '127.0.0.1'),
+    port: Number(flag('port', 8085)),
+    drafter: flag('drafter', null),
+    kvType: flag('kv', null),
+    k: flag('k', null) ? Number(flag('k')) : null,
+    // speculation is a net loss above the measured crossover
+    speculate: has('no-speculate') ? false : slots < profile.speculation_by_load.crossover_clients,
+  };
+  const bin = flag('llama-server', '/home/usman/Bonsai-demo/bin/cuda/llama-server');
+  const { argv, drafter, d, kvType } = buildServerArgs(profile, opts);
+
+  const c = profile.speculation_by_load;
+  console.log('pulse serve');
+  console.log(`  profile     : ${flag('profile', 'gb10-bonsai2')}`);
+  console.log(`  slots       : ${opts.slots}  (llama-server default is ${profile.parallel_slots.default_in_llama_server})`);
+  console.log(`  speculation : ${opts.speculate ? `on, drafter=${drafter} K=${Math.min(opts.k ?? d.optimal_k, d.block_size)} (block_size=${d.block_size})` : 'off'}`);
+  console.log(`  reason      : slots ${opts.speculate ? '<' : '>='} measured crossover of ${c.crossover_clients} clients`);
+  console.log(`                at 1 client: ${c.measured_curve[0].with_drafter} vs ${c.measured_curve[0].no_drafter} tok/s`);
+  console.log(`                at 16 clients: ${c.measured_curve[4].with_drafter} vs ${c.measured_curve[4].no_drafter} tok/s`);
+  console.log(`  kv cache    : ${kvType}  (q4_0 above 32k: +16.5% measured at 64k)`);
+  console.log(`  prefix cache: on (server-side cache_prompt) + --cache-ram -1`);
+  console.log(`  checkpoints : off (measured 4.2x slower than --cache-ram; PULSE_CKPT=1 to opt in)`);
+  console.log(`  backend     : ${bin}\n`);
+
+  const p = spawn(bin, argv, { stdio: 'inherit', cwd: path.dirname(path.dirname(opts.model)) });
+  process.on('SIGINT', () => p.kill('SIGINT'));
+  p.on('exit', (code) => process.exit(code ?? 0));
+}
+
+function bench() {
+  if (doctor() !== 0 && !has('force')) {
+    console.error('\nrefusing to benchmark on a busy GPU. pass --force to override.');
+    process.exit(1);
+  }
+  const url = flag('url', 'http://127.0.0.1:8085');
+  const levels = flag('levels', '1,2,4,8,16');
+  const n = flag('n', '128');
+  console.log(`\nrunning concurrency sweep against ${url}\n`);
+  const r = spawnSync('python3', [path.join(rootDir, 'bench', 'conc.py'), url, levels, n],
+                      { stdio: 'inherit' });
+  process.exit(r.status ?? 0);
+}
+
+function help() {
+  console.log(`pulse - measurement-driven speculative decoding for NVIDIA DGX Spark (GB10)
+
+  pulse serve     launch llama.cpp with the measured-optimal configuration
+    --slots N       parallel slots (default: profile recommendation, 16)
+    --ctx N         total context (default 65536)
+    --drafter v1|v2 override drafter choice
+    --kv f16|q8_0|q4_0  KV cache precision (default: f16, q4_0 above 32k ctx)
+    --k N           override draft depth (clamped to the drafter's block size)
+    --no-speculate  force speculation off
+    --port N        default 8085
+
+  pulse bench     concurrency sweep against a running server
+    --url U --levels 1,2,4,8,16 --n 128 --force
+
+  pulse doctor    check the GPU is clean enough to measure on
+  pulse profile   print the active tuning profile with provenance
+  pulse version
+
+Pulse does not replace llama.cpp. It encodes what was measured to work on this
+hardware, and ships the suite that measured it. See bench/RESULTS.md - including
+the negative results, which are the more useful half.`);
+}
+
+switch (command) {
+  case 'serve': serve(); break;
+  case 'bench': bench(); break;
+  case 'doctor': process.exit(doctor()); break;
+  case 'profile': console.log(JSON.stringify(loadProfile(flag('profile', 'gb10-bonsai2')), null, 2)); break;
+  case 'version': case '--version': case '-v': console.log('pulse 2.0.0 (GB10 / sm_121)'); break;
+  default: help();
+}

@@ -29,14 +29,20 @@ export class PulseServer {
       backendUrl: config.backendUrl ?? 'http://127.0.0.1:8085',
     };
     this.jev = new JevDecisionClient(2000);
-    // Mid-context edits cost a full re-prefill (8702 ms at 8k) because mRoPE
-    // blocks --cache-reuse. Slot checkpoints restore in 90.8 ms instead: 96x.
+    // DISABLED BY DEFAULT - measured slower, so this is opt-in via PULSE_CKPT=1.
+    // The restore primitive is fast in isolation (58.7 ms for 275 MB). But
+    // llama.cpp already keeps evicted slot state in a RAM cache under
+    // --cache-ram -1 and restores it natively. Forcing a disk restore throws
+    // that better cache away, falls back to an older and shorter saved prefix,
+    // then re-prefills the difference - and pays ~150 ms per save to write
+    // ~300 MB. Paired A/B over two mutually evicting sessions
+    // (bench/ckpt_evict.py, -np 1): 732 ms off vs 3080 ms on. 4.2x WORSE.
+    // See bench/RESULTS.md.
+    const ckptEnabled = process.env.PULSE_CKPT === '1';
     this.checkpoints = new CheckpointManager(
       this.config.backendUrl,
       process.env.PULSE_CKPT_PATH ?? '/tmp/slotsave/',
-      // PULSE_CKPT_MIN_CHARS=999999999 effectively disables checkpointing,
-      // which is how the A/B in bench/RESULTS.md was run.
-      Number(process.env.PULSE_CKPT_MIN_CHARS ?? 4000),
+      ckptEnabled ? Number(process.env.PULSE_CKPT_MIN_CHARS ?? 4000) : Number.MAX_SAFE_INTEGER,
     );
   }
 

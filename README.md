@@ -37,6 +37,13 @@ This is what makes long context usable. A cold 131k prefill genuinely takes
 211.7 s (256k ≈ 7 min), but an agent pays that **once** and every later turn is
 a few hundred ms to first token.
 
+And that covers nearly everything: across **17,989 records in 23 real Claude Code
+sessions**, only **0.59%** carry a marker that mutates earlier context
+(`truncated`, `elided`, `compact_boundary`). Agent traffic is ~99.4% append, so
+the prefix cache hits almost every turn. This is also why the slot-checkpointing
+layer below is off — it was built for the 0.6%, and it loses to `--cache-ram -1`
+even there.
+
 ## Measured: Pulse vs stock llama.cpp defaults
 
 Same model, same harness (`bench/conc.py`), 128 tokens/request, temperature 0,
@@ -57,11 +64,36 @@ and nothing here will make a bandwidth-bound machine go 10x.
 
 ## The physics, so the numbers make sense
 
-At batch 1 this is a memory-bandwidth problem and nothing else:
+At batch 1 this is a memory-bandwidth problem and nothing else. Bonsai 2 27B at
+`PQ2_0` is **6.70 GB**, so decode is set by how fast this machine sweeps those
+weights once per token.
 
-- Bonsai 2 27B at `PQ2_0` is **6.70 GB**. Measured sustained bandwidth is
-  **184.6 GB/s**. One weight sweep is therefore **36.3 ms**.
-- That predicts 27.5 tok/s with no drafter. Measured: **27.54 tok/s**.
+| | GB/s | % of spec peak |
+|---|---|---|
+| spec peak, 256-bit LPDDR5X @ 8533 MT/s | 273 | 100% |
+| **achievable** pure read at a 6.70 GB working set | **216** | 79% |
+| llama.cpp decode (6.70 GB / 36.65 ms measured) | 183 | 67% |
+
+Two separate gaps, and only one of them is a bug:
+
+- **273 -> 216 is the DRAM, and it is not recoverable.** Refresh, row
+  activate/precharge across a 6.70 GB working set, read turnaround, and a fabric
+  shared with the Grace CPU. 70-85% of theoretical is the normal LPDDR5X range.
+- **216 -> 183 is software, and it is 16%.** The true weight-sweep roofline is
+  `6.70 / 216 = 30.9 ms` against a measured 36.65 ms. Some of that 5.75 ms is real
+  non-weight work - KV reads, norms, Hadamard transforms, `quantize_q8_1`,
+  sampling - but not all of it is.
+
+**Correction.** Every earlier round of this repo quoted **184.6 GB/s** as the
+hardware ceiling and concluded llama.cpp decode was *at* the roofline ("1%
+agreement"). That 184.6 came from a single kernel configuration. Sweeping
+occupancy and memory-level parallelism (`bench/cuda/bw.cu`) reaches **229.0 GB/s**
+at a 4 GB working set and 212-218 GB/s at 6.70 GB. The real gap is 16%, not 1%.
+Curiously, the best configurations are **low occupancy**, often 1-2 blocks per SM.
+
+Two constraints that bound everything downstream:
+
+- No-drafter decode measures **27.54 tok/s** against 27.3 predicted.
 - Two *independent* decode processes give **1.01x** aggregate. There is no
   headroom at batch 1; only batching or speculation can help.
 
@@ -145,6 +177,7 @@ repo reported "K=7" numbers that were really K=4.
 | KV cache `q8_0` | 65.53 vs 66.59 f16 — slightly worse |
 | n-gram stacking | counters byte-identical to the drafter alone; never engaged |
 | `-ub` above 512 | prefill 389 vs 656 tok/s — worse |
+| **slot checkpointing** (this repo built it) | **4.2x slower.** 3080 ms vs 732 ms returning to an evicted session. llama.cpp's `--cache-ram -1` already restores evicted slot state from RAM; a forced disk restore discards it. Off by default |
 
 ## Measurement hygiene
 
@@ -156,8 +189,10 @@ Two traps that produced false results here, both now guarded by `pulse doctor`:
   memory cost **16%** of decode throughput (73.3 → 61.0 tok/s) — and throughput did
   **not** recover when the load stopped. Unified-memory pages migrate and fault back
   lazily, so throughput also *climbs* across consecutive runs.
-- **The noise floor is 10.2%.** Median of ≥6 runs after a quiesce, or you will
-  manufacture wins out of machine state. Any claimed optimisation must beat 10.2%.
+- **The noise floor depends on the protocol.** Cold, without a warmup discard, it
+  is **10.2%**; warm and interleaved (`bench/ab.py`) it is **3.4%**. Take the
+  median of >=6 runs after a quiesce, and do not call a delta real unless it beats
+  the floor for the protocol you actually ran.
 - **nsys under-reports GPU busy time on GB10.** A trace reported the GPU 92.2%
   idle during decode. CUPTI does not capture fabric stalls on unified memory.
   The two-process 1.01x result disproves it directly. Do not publish GPU-idle
@@ -190,25 +225,41 @@ pulse profile                 # print the tuning profile with provenance
 
 ## What would actually move the number
 
-**The drafter's forward pass runs at ~39 GB/s — 21% of the 184.6 GB/s this machine
-sustains.** Measured by differencing each drafter's step time against the design
-curve at matched tokens/step:
+**The drafter's forward pass is the cost, and it scales with its weight volume.**
+Measured on the *same* prompt at matched K=3, so nothing has to be subtracted
+across workloads:
 
-| drafter | size | overhead | effective bandwidth |
+| drafter | size | ms/step | delta |
 |---|---|---|---|
-| v1 | 603 MB | +15.4 ms/step | 39.2 GB/s |
-| v2 | 1.10 GB | +27.9 ms/step | 39.4 GB/s |
+| v1 | 603 MB | 60.3 | - |
+| v2 | 1.10 GB | 78.3 | +18.0 |
 
-Overhead scales 1.81x for a 1.75x drafter, so it's the forward pass itself. The
-cause is visible in the profile: a 5-layer block-diffusion model executed as ~24
-separate MMQ launches per step, each moving ~25 MB — far too little to saturate
-the bus. It's latency-bound, not bandwidth-bound.
+The clean differential is `3.51 ms / 0.473 GB` = **7.42 ms/GB**, i.e. roughly
+**135 GB/s** on the drafter's weights - 73% of what llama.cpp achieves on the
+target's. The drafter is somewhat less efficient, not catastrophically so.
 
-At achievable bandwidth, v2 would be `50.33 + 1.10/184.6 = 56.3 ms/step` →
-**102 tok/s single-stream**. That closes the entire gap to the target, and it is a
-runtime optimization on drafter execution: we already own a block-7 drafter, so no
-retrain is required. CUDA Graphs won't fix it — the drafter has Gated DeltaNet
-layers, which is exactly why graphs get rejected at runtime.
+A second differential, same drafter at two depths (block size 4, so K=1 and K=3
+both run exactly one block pass and the drafter term cancels):
+`(62.61 - 56.38) / 2` = **3.11 ms per verify row**. That independently confirms
+the design curve's fitted slope of 2.9 ms/row, measured on an unrelated prompt.
+
+**Retracted.** Earlier rounds claimed the drafter ran at **~39 GB/s** ("21% of
+bandwidth"), that it was "chopped into ~24 separate MMQ launches per step", and
+that a pure runtime fix would therefore reach 102 tok/s with no retrain. All of
+that is withdrawn. The 39 GB/s came from subtracting a design curve measured on a
+*repetitive* prompt from figures measured on a *code* prompt, where the curve
+under-predicts by ~19 ms - the slope transfers, the base does not. The "24 MMQ
+launches" were `ggml_type 142`, which is the **target**, not the drafter; `128`
+was MMQ's tile width `mmq_x`, not a row count; and they were prefill launches
+divided by the wrong step count. The kernel-level mechanism is still open.
+
+Remaining levers, in measured order:
+
+| lever | status |
+|---|---|
+| prefix caching | **shipped, 131.7x** on append-only turns |
+| the 16% software gap on the weight sweep | open, bounded at 1.19x |
+| block >=7 drafter holding >=70% acceptance at long context | needs a retrain |
 
 ## History
 

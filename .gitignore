@@ -3,7 +3,8 @@ dist
 .env
 .env.*
 *.log
-bin/
+bin/*
+!bin/pulse-cli
 *.gguf
 packages/**/*.gguf
 build/
