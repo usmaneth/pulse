@@ -16,6 +16,27 @@ half. Several widely-assumed optimisations measurably do nothing here.
 
 ---
 
+## The single biggest win: prefix caching (131.7x)
+
+llama.cpp's server has supported `cache_prompt` all along. It was **off** — and
+every benchmark in this repo before now measured the cold path exclusively.
+
+Measured at 16k context (`bench/cache.py`):
+
+| scenario | prefill | decode |
+|---|---|---|
+| cold (`cache_prompt=false`) | **22,321.6 ms** | 7.89 t/s |
+| exact replay, cached | 169.4 ms | 17.59 t/s |
+| **agentic turn (prefix + new message)** | **321.0 ms** | 22.70 t/s |
+
+**131.7x on exact replay, 69.5x on a realistic agentic turn** — and decode
+roughly doubles too, because the slot stops re-prefilling. `pulse serve` now
+enables it by default.
+
+This is what makes long context usable. A cold 131k prefill genuinely takes
+211.7 s (256k ≈ 7 min), but an agent pays that **once** and every later turn is
+a few hundred ms to first token.
+
 ## Measured: Pulse vs stock llama.cpp defaults
 
 Same model, same harness (`bench/conc.py`), 128 tokens/request, temperature 0,
