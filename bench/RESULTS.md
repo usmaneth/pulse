@@ -2496,3 +2496,68 @@ metadata: `block_count = 64`, `context_length = 262144`, `embedding_length =
 Hadamard transforms counted in the decode step.
 
 Architecture string is `qwen35`.
+
+---
+
+# Round 34 - the engine runs weights, at 92% of llama.cpp
+
+Step 3: the first real forward-pass arithmetic. `src/engine/matvec.cu` is a
+fused dequantise-and-matvec over PQ2_0 weights read straight from the mmap'd
+GGUF - no ggml, no llama.cpp in the compute path.
+
+## Correctness first, and a metric that was wrong
+
+The first run reported "worst relative error 2.276e-05, FAIL" against a 1e-5
+threshold. That threshold was the error, not the kernel.
+
+These dot products cancel heavily. The **condition number is 5,968**: the sum of
+`|w_i * x_i|` is ~6000x larger than the result. Relative error against the
+result is therefore meaningless as an acceptance test. Scaled against
+`sum|terms|`, which is how dot-product error actually behaves:
+
+| kernel | err / sum abs terms | fp32 epsilon |
+|---|---|---|
+| v3 | **7.659e-09** | 1.19e-07 |
+
+An order of magnitude *below* fp32 epsilon. Confirmed three ways - against a
+float64 accumulation, a naive float32 accumulation, and a float32 accumulation
+replaying the GPU's exact lane order. The kernel is as correct as fp32 permits.
+
+Worth recording that the GPU result was consistently **closer to exact** than
+naive CPU float32 accumulation (9.2e-06 vs 6.3e-05 relative), because the warp
+reduction is a tree rather than a serial chain.
+
+## Bandwidth, in three iterations
+
+`output.weight`, 0.338 GB of PQ2_0, 5120 x 248320:
+
+| kernel | ms | GB/s | note |
+|---|---|---|---|
+| v1 strided | 10.790 | **31.3** | each lane strides whole 34-byte blocks |
+| v2 warp-coalesced | 2.286 | **147.7** | warp cooperates on one block; lane i reads byte i |
+| v3 + `__ldg`, 2x unroll | 2.011 | **168.0** | read-only path, overlaps the scale load |
+| llama.cpp decode | - | 183.0 | measured, Round 16 |
+| achievable | - | 216.0 | `bench/cuda/bw.cu` |
+
+**v1 -> v2 is 4.7x from coalescing alone.** The 34-byte block is the whole
+story: striding it per lane scatters a warp across ~1 KB, while having the warp
+cooperate on one block makes `qs` exactly 32 bytes across 32 lanes - one
+transaction. v3 then recovers most of the scale-load cost, which sits 34 bytes
+from its data and so never coalesces with it.
+
+## What this says about building an engine
+
+**A from-scratch kernel reached 92% of llama.cpp's decode bandwidth in three
+iterations.** That cuts both ways, and the honest reading is the second one:
+
+- Feasible. There is no mystery in llama.cpp's performance, and the gap from a
+  naive start to near-parity is a day's work, not a year's.
+- **And it does not beat it.** 168.0 against 183.0 GB/s. The weight sweep is the
+  dominant term in decode, llama.cpp is already at 85% of achievable on it, and
+  a purpose-built kernel landing at 78% does not change the arithmetic.
+
+This is `docs/ENGINE.md`'s estimate arriving as a measurement rather than a
+projection. An engine is buildable. It is not where the throughput is.
+
+The remaining 8% to llama.cpp and 22% to the roofline is real and worth having,
+but it is the 1.19x software gap from Round 16, not a new lever.
