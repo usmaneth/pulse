@@ -52,14 +52,19 @@ LPDDR5X, CUDA 13.0. Runs used `llama-speculative-simple`, temperature 0,
 | drafter | block | K | decode tok/s | acceptance | tok/step |
 |---|---|---|---|---|---|
 | v1 | 4 | 3 | 58.08 | 78.29% | 3.32 |
-| **v1** | 4 | **4** | **63.77** | 72.28% | 3.86 |
-| v2 | 7 | 7 | 63.83 median (59.72-70.82) | 68.59% | 5.81 |
+| v1 | 4 | 4 | 64.1 | 72.28% | 3.86 |
+| **v2** | 7 | **7** | **66.31 median** (62.43-69.21) | 69.10% | 5.74 |
 
-Measured over 3-5 repeats on an idle GB10 with a realistic code context, temperature 0,
-`--ignore-eos`. Deterministic at temperature 0: spread is 0.37 tok/s for v1.
+Measured over 6 repeats after a 90 s quiesce on an idle GB10, realistic code context,
+temperature 0, `--ignore-eos`.
+
+> **This machine has a 10.2% noise floor.** GB10 shares one LPDDR5X bus between CPU and
+> GPU, so CPU activity steals GPU bandwidth (measured: 16%), and throughput climbs across
+> consecutive runs as unified-memory pages fault back to the GPU. Always take a median of
+> at least 6 runs. Single runs of this config have ranged 59.7 to 73.4 tok/s.
 
 No-drafter baseline on the same target is **27.54 tok/s**, so the best configuration is
-a **2.3x** speedup. Prefill reaches **~995 tok/s** with a properly configured server.
+a **2.4x** speedup. Prefill reaches **~995 tok/s** with a properly configured server.
 
 > **Correction.** An earlier version of this card reported 73.00 tok/s as the headline.
 > That was a single best run, not a median; five repeats give 63.83 for that config. It
@@ -73,7 +78,7 @@ rather than of the drafter.
 
 ### Which to use
 
-- Want maximum throughput: **v1 at K=4** (63.77 tok/s). Use the full block size; K past
+- Want maximum throughput: **v2 at K=7** (66.31 median). Use the full block size; K past
   the drafter's block size is a no-op.
 - Want maximum acceptance: **v1 at K=3** (78-90% depending on prompt).
 - Match K to the drafter's block size. Running v1 at K=6 costs 88.16 ms/step versus

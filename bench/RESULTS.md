@@ -964,3 +964,77 @@ shows no MMQ at all during decode. Dividing their total by step count was invali
 The wall-clock evidence for the drafter overhead is unaffected: it scales 1.81x
 for a 1.75x larger drafter, which is what identifies it as the drafter's own
 forward pass.
+
+---
+
+# Round 11 - the measurement floor, and a correction to Round 10
+
+## Correction: 73.3 tok/s was machine state, not a result
+
+Round 10 reported v2 at K=7 as **73.3 tok/s with a 1.09 spread over 3 repeats**.
+Re-running the identical command later, on a verified-clean GPU with no
+throttling, gave 65.06 / 68.94 / 61.05.
+
+A properly quiesced run - 90 s idle, then 6 repeats - gives:
+
+    63.37  62.43  64.62  68.10  69.21  67.99
+    n=6  min=62.43  median=66.31  max=69.21  spread=10.2%
+
+**The honest number is 66.31 tok/s median, 62.4-69.2.** The 73.3 figure was taken
+in an unusually favourable machine state and the tight spread was luck, not
+reproducibility. Corrected in the README, the config profile and the model card.
+
+## Why this machine is state-dependent
+
+**The CPU and GPU share one LPDDR5X bus.** Eight CPU threads streaming memory:
+
+| phase | tok/s |
+|---|---|
+| ambient load | 71.26, 73.30 |
+| + 8 CPU threads streaming memory | 61.79, 60.99 (**-16%**) |
+| after the load stopped | 60.04, 59.39 (**did not recover**) |
+
+CPU memory traffic costs 16% of decode throughput. More importantly it does not
+recover promptly: unified-memory pages migrate toward the CPU and fault back
+lazily. Throughput then *climbs* across consecutive runs, which is visible in the
+6-repeat sequence above (63.4 -> 69.2).
+
+A browser was running during the earlier measurements. That is enough to matter.
+
+## The protocol, now enforced in code
+
+`bench/ab.py` implements it:
+
+- refuse to run if any process holds the GPU; warn above load average 1.5
+- discard warmup runs
+- **interleave configs** rather than running all of A then all of B, so drift
+  hits every config equally instead of masquerading as a difference
+- report median, min, max and spread
+- refuse to call a difference real unless it exceeds the **10.2% noise floor**
+
+This matters for what comes next: the drafter overhead is 27.9 ms of a ~78 ms
+step (36%), comfortably above the floor, so it is a real target. But a careless
+single-run comparison on this machine can manufacture a 15% "win" out of nothing,
+which is structurally how this repo produced fabricated numbers in the first place.
+
+## Also retracted from Round 9/10
+
+The claim that the drafter is "chopped into ~24 MMQ launches of ~25 MB each" was
+wrong. Those `mul_mat_q<(ggml_type)142, (int)128>` kernels are on the *target*
+(type 142 = PQ2_0), the `128` is MMQ's tile width `mmq_x` rather than a row count,
+and 800 launches x 764 us in a ~3 s run is prefill - which I incorrectly divided
+by step count.
+
+A clean steady-state profile (5-token prompt, 320 generated) shows no MMQ at all
+during decode. It also shows only 2.7 ms of kernel time inside a 73.4 ms step and
+18 target matmul launches per step for a 64-layer model, which is not credible -
+nsys is missing most of the work. **nsys is now dropped entirely for attribution
+on GB10.** Wall-clock differentials only.
+
+What survives, because it rests on wall-clock: overhead is +15.4 ms/step for the
+603 MB drafter and +27.9 ms/step for the 1.10 GB drafter, scaling 1.81x for a
+1.75x drafter, both landing at ~39 GB/s effective. The cost is the drafter. The
+kernel-level mechanism is still open.
+
+`DSPARK_DRAFT_WINDOW` (0 = full prefix, the default) has **no measurable effect**
+at any value from 16 to 512 - all within 73.28 +/- 0.5.
