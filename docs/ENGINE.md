@@ -40,14 +40,36 @@ hardware verify cost from drafter quality):
 | measured, v1 drafter at K=4 | 60.3 | 64 |
 | **drafter cost** | **15.4** | -26% |
 
-Decomposing that 15.4 ms across two drafters at matched K, solving
-`overhead = F + size x B`:
+### Measured decomposition
 
-- **B ~ 5.2 ms/GB, i.e. ~191 GB/s.** The drafter's weights are read at
-  essentially full bandwidth. This is physics and is **not recoverable**.
-- **F ~ 6.2 ms/step of fixed orchestration.** llama.cpp runs the drafter as a
-  separate `llama_context` with its own graph, feature staging and KV add/remove
-  every step. **This is what engine fusion eliminates.**
+Two drafters at **matched K=3**, same prompt, warm interleaved protocol
+(2 warmup discarded, 5 repeats, spreads 2.9% and 3.0%):
+
+| drafter | size | tok/s | acceptance | ms/step |
+|---|---|---|---|---|
+| v1 | 0.632 GB | 53.62 | 78.29% | 61.95 |
+| v2 | 1.105 GB | 53.19 | 83.23% | 65.46 |
+
+Slope: `3.51 ms / 0.473 GB` = **7.42 ms/GB, i.e. ~135 GB/s** on the drafter's
+weights - 73% of the 184.6 GB/s this machine sustains.
+
+An earlier revision of this document claimed ~5.2 ms/GB (~191 GB/s, "essentially
+full bandwidth"). That was computed from numbers taken in different machine
+states and is withdrawn. The figure above is a same-prompt, matched-K,
+warm-protocol differential and is the trustworthy one.
+
+No-drafter baseline on the **same context length** (1359 tokens, B=1,
+`llama-batched-bench`): **24.67 tok/s = 40.5 ms/step**. Note this is 40.5 ms
+rather than the 36.6 ms measured at 256-token context - KV cache reads add
+roughly 4 ms at this context.
+
+**What is solid:** the size slope (7.42 ms/GB) and the per-verify-row cost, both
+same-binary same-prompt differentials.
+
+**What is weaker:** splitting the drafter cost into a fixed orchestration term
+plus a size term requires a no-drafter baseline from a *different binary*
+(`llama-batched-bench` vs `llama-speculative-simple`), which carries its own
+overhead. The fixed term is therefore indicative, not precise.
 
 ## So what would an engine actually buy?
 
