@@ -319,5 +319,56 @@
     ],
     "caveat": "the grid used short chat-style prompts and saw 29-43% acceptance; the single-stream code-context tests saw 69-72%. Acceptance is workload-dependent (measured range 21%-96%), so the optimal drafter depends on prompt type as well as concurrency.",
     "crossover_clients": 12
+  },
+  "context_model": {
+    "$comment": "Validated decode-throughput model vs context length. Measured with llama-batched-bench in a SINGLE process (model resident) so cold-start cannot confound it.",
+    "kv_bytes_per_token": 65536,
+    "kv_geometry": "16 attention layers (every 4th of 64, hybrid) x 4 kv heads x (key 256 + value 256) x 2 bytes",
+    "model_max_context": 262144,
+    "formula": "tok_s = (216 / (6.70 + ctx * 64KB_in_GB)) * efficiency",
+    "efficiency": {
+      "16k": 1.0,
+      "64k": 0.97,
+      "128k": 0.85,
+      "note": "drifts down at extreme context; use ~0.80 beyond 128k"
+    },
+    "validation": [
+      {
+        "ctx": 16384,
+        "step_gb": 7.77,
+        "predicted": 24.17,
+        "measured": 24.26,
+        "ratio": 1.0
+      },
+      {
+        "ctx": 65536,
+        "step_gb": 10.99,
+        "predicted": 17.09,
+        "measured": 16.5,
+        "ratio": 0.97
+      },
+      {
+        "ctx": 131072,
+        "step_gb": 15.29,
+        "predicted": 12.29,
+        "measured": 10.43,
+        "ratio": 0.85
+      }
+    ],
+    "below_16k_does_not_resolve": "rows at 128-4096 swing 2.1x non-monotonically (26.37, 19.08, 17.40, 12.40, 14.04) because KV is under 16% of the step and noise exceeds the effect. Do not read a context trend there.",
+    "prefill": {
+      "16384": 669.6,
+      "65536": 769.5,
+      "131072": 619.1,
+      "note": "cold prefill at 131072 takes 211.7 s, roughly 7 minutes at 256k. Prompt/prefix caching dominates long-context UX far more than decode speed. Unmeasured here."
+    },
+    "projection_256k": {
+      "step_gb": 23.88,
+      "raw_tok_s": 7.2,
+      "with_block7_69pct_accept": 41,
+      "with_block7_85pct_accept": 50,
+      "with_6x_kv_compression": 110,
+      "conclusion": "drafter alone does not reliably clear 50-70 tok/s at 256k; KV compression is required"
+    }
   }
 }
