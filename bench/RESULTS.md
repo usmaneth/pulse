@@ -2917,3 +2917,51 @@ is no hotspot to remove, only a long tail to fuse.
 
 `k_gdn_step` at 2.88 ms is the largest single non-matvec item, and most of it is
 genuine state traffic (600 MB across 48 layers) that llama.cpp also pays.
+
+---
+
+# Round 40 - the low-occupancy result does NOT transfer to matvec
+
+`bench/cuda/bw.cu` (Round 16) found this machine reaches peak memory bandwidth
+at **low occupancy** - often 1-2 blocks per SM - because a handful of resident
+warps already saturates the controller. That is a GB10-specific finding and the
+obvious next move is to apply it to the matvec, which currently launches
+`nrows/warps` blocks: ~31,000 blocks for the output head, about 646 per SM.
+
+Tested with a persistent-CTA variant, grid sized to the GPU and grid-striding
+over rows:
+
+| grid | blocks | per SM | GB/s |
+|---|---|---|---|
+| 1 block/SM | 48 | 1.0 | 87.6 |
+| **2 blocks/SM** | 96 | 2.0 | **147.0** |
+| 4 blocks/SM | 192 | 4.0 | 140.1 |
+| 8 blocks/SM | 384 | 8.0 | 143.3 |
+| 16 blocks/SM | 768 | 16.0 | 139.6 |
+| **grid-per-row (v4)** | ~31,040 | 646 | **170.3** |
+
+**The grid-per-row kernel wins by 16%.** Low occupancy is worse at every setting
+tried, and the best persistent configuration (2 blocks/SM) reproduces the shape
+of the bandwidth sweep's optimum while still losing.
+
+## Why the finding does not transfer
+
+`bw.cu` measures a **pure streaming** kernel: each warp issues a long run of
+independent loads with no dependency between them, so a few warps keep enough
+requests in flight to saturate the controller.
+
+The matvec is not that. Each warp reads one row - 40 blocks of 34 bytes - and
+then must reduce across lanes before it can retire. The loads are shorter-lived
+and the reduction serialises the tail. Memory-level parallelism therefore comes
+from having **many warps in flight**, not from each warp issuing many loads, and
+cutting the grid to 96 blocks removes exactly the parallelism the kernel depends
+on.
+
+So the rule is narrower than it looked: **on GB10, low occupancy is optimal for
+pure sequential streaming and wrong for dependent-load kernels like a quantised
+matvec.** Applying the bandwidth sweep's conclusion directly to the matvec would
+have cost 16%.
+
+This is worth recording because the inference is natural, the source measurement
+is sound, and the result is still wrong. A GB10-specific optimisation was tested
+properly and measured negative.

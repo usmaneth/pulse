@@ -284,6 +284,64 @@ void pq2_matvec_batched(const blk* __restrict__ W, const float* __restrict__ X,
     }
 }
 
+// v6: persistent CTAs, sized to the GPU rather than to the problem.
+//
+// bench/cuda/bw.cu found this machine reaches peak memory bandwidth at LOW
+// occupancy - often 1-2 blocks per SM - because a handful of resident warps
+// already saturates the controller. Every kernel above launches nrows/warps
+// blocks, which for the output head is ~31,000 blocks, about 646 per SM. That
+// is the opposite regime.
+//
+// This launches a fixed grid of blocks_per_sm * 48 and grid-strides over rows.
+template<int BPSM>
+__global__ __launch_bounds__(256)
+void pq2_matvec_persistent(const blk* __restrict__ W, const float* __restrict__ x,
+                           float* __restrict__ y, int ne0, int nrows) {
+    const int lane = threadIdx.x & 31;
+    const int warps_per_block = blockDim.x >> 5;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int global_warp = blockIdx.x*warps_per_block + warp_in_block;
+    const int total_warps = gridDim.x*warps_per_block;
+    const int nblk = ne0/QK;
+
+    for (int row = global_warp; row < nrows; row += total_warps) {
+        const blk* rp = W + (size_t)row*nblk;
+        float acc = 0.0f;
+        int b = 0;
+        for (; b + 3 < nblk; b += 4) {
+            const uint8_t p0 = __ldg(&rp[b  ].qs[lane]);
+            const uint8_t p1 = __ldg(&rp[b+1].qs[lane]);
+            const uint8_t p2 = __ldg(&rp[b+2].qs[lane]);
+            const uint8_t p3 = __ldg(&rp[b+3].qs[lane]);
+            float d0,d1,d2,d3;
+            if (lane == 0) {
+                d0 = __half2float(__ushort_as_half(__ldg(&rp[b  ].d)));
+                d1 = __half2float(__ushort_as_half(__ldg(&rp[b+1].d)));
+                d2 = __half2float(__ushort_as_half(__ldg(&rp[b+2].d)));
+                d3 = __half2float(__ushort_as_half(__ldg(&rp[b+3].d)));
+            }
+            d0=__shfl_sync(0xffffffff,d0,0); d1=__shfl_sync(0xffffffff,d1,0);
+            d2=__shfl_sync(0xffffffff,d2,0); d3=__shfl_sync(0xffffffff,d3,0);
+            const float4 x0=*reinterpret_cast<const float4*>(x+(b  )*QK+lane*4);
+            const float4 x1=*reinterpret_cast<const float4*>(x+(b+1)*QK+lane*4);
+            const float4 x2=*reinterpret_cast<const float4*>(x+(b+2)*QK+lane*4);
+            const float4 x3=*reinterpret_cast<const float4*>(x+(b+3)*QK+lane*4);
+            #define DP(p,xv) (((int)((p)&3)-1)*(xv).x + ((int)(((p)>>2)&3)-1)*(xv).y \
+                            + ((int)(((p)>>4)&3)-1)*(xv).z + ((int)(((p)>>6)&3)-1)*(xv).w)
+            acc += DP(p0,x0)*d0 + DP(p1,x1)*d1 + DP(p2,x2)*d2 + DP(p3,x3)*d3;
+        }
+        for (; b < nblk; ++b) {
+            const uint8_t p = __ldg(&rp[b].qs[lane]);
+            const float4 xv = *reinterpret_cast<const float4*>(x+b*QK+lane*4);
+            acc += DP(p,xv) * __half2float(__ushort_as_half(__ldg(&rp[b].d)));
+        }
+        #undef DP
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+        if (lane == 0) y[row] = acc;
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr,"usage: %s <model.gguf> [tensor] [rows]\n",argv[0]); return 2; }
     const char* want = argc > 2 ? argv[2] : "output.weight";
@@ -466,6 +524,33 @@ int main(int argc, char** argv) {
                t1*8/t8, t1*8 - t8);
         (void)t2; (void)t4;
         cudaFree(d_X); cudaFree(d_Y);
+    }
+
+    // --- persistent CTAs at GB10-appropriate occupancy
+    {
+        const int SMS = 48;
+        printf("\npersistent CTAs (grid sized to the GPU, not the problem):\n");
+        auto bp = [&](const char* nm, int blocks, auto kern) {
+            for (int i=0;i<5;++i) kern<<<blocks,threads>>>(d_w,d_x,d_y,ne0,nrows);
+            CUDA_OK(cudaDeviceSynchronize());
+            cudaEvent_t a2,b2; cudaEventCreate(&a2); cudaEventCreate(&b2);
+            cudaEventRecord(a2);
+            for (int i=0;i<30;++i) kern<<<blocks,threads>>>(d_w,d_x,d_y,ne0,nrows);
+            cudaEventRecord(b2); cudaEventSynchronize(b2);
+            float t=0; cudaEventElapsedTime(&t,a2,b2);
+            const double per=t/30.0;
+            printf("  %-24s %5d blocks (%4.1f/SM)  %7.3f ms  %6.1f GB/s\n",
+                   nm, blocks, (double)blocks/SMS, per, wbytes/(per*1e-3)/1e9);
+            return wbytes/(per*1e-3)/1e9;
+        };
+        const double p1 = bp("1 block/SM",  1*SMS, pq2_matvec_persistent<1>);
+        const double p2 = bp("2 blocks/SM", 2*SMS, pq2_matvec_persistent<2>);
+        const double p4 = bp("4 blocks/SM", 4*SMS, pq2_matvec_persistent<4>);
+        const double p8 = bp("8 blocks/SM", 8*SMS, pq2_matvec_persistent<8>);
+        const double p16= bp("16 blocks/SM",16*SMS,pq2_matvec_persistent<16>);
+        const double bestp = std::max(std::max(p1,p2),std::max(std::max(p4,p8),p16));
+        printf("  best persistent: %6.1f GB/s   vs v4 grid-per-row: %6.1f GB/s   %s\n",
+               bestp, b4, bestp>b4? "PERSISTENT WINS":"grid-per-row wins");
     }
 
     printf("\n  best Pulse kernel reaches %.0f%% of llama.cpp, %.0f%% of achievable\n",
