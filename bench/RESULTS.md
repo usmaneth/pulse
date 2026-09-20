@@ -140,3 +140,119 @@ close the gap.
   6.70 GB streaming kernel measured 35.49 / 150.33 / 84.85 / 77.99 / 33.79 ms across
   five consecutive runs depending on what else held GPU memory. Always benchmark on an
   idle device.
+
+---
+
+# Round 2 — long-context measurements
+
+## Measurement hazard found: EOS truncation
+
+An initial long-context sweep appeared to show acceptance collapsing to 0% and decode
+falling to 3.2 tok/s. That was an **artifact**. Truncated source-code prompts caused the
+model to emit EOS immediately, so `decoded` was ~1 token and both the speed and the
+acceptance counters were meaningless. The giveaway was non-monotonicity: a 668-token
+prompt worked fine at 56 tok/s while 65-token and 1257-token prompts "failed".
+
+All Round 2 numbers therefore use `--ignore-eos` so every run decodes the same token
+count and the figures are comparable.
+
+## Acceptance vs context length (DSpark v1, K=4, `--ignore-eos`, 155 tokens decoded)
+
+| prompt tokens | decode tok/s | accept% | prefill tok/s |
+| ---: | ---: | ---: | ---: |
+| 65 | 64.24 | 74.84% | 130.5 |
+| 668 | 60.45 | 69.94% | 335.1 |
+| 1257 | 65.76 | 80.82% | 481.0 |
+| 1854 | **67.11** | **84.40%** | 562.6 |
+| 2756 | 62.41 | 78.00% | 646.2 |
+
+Acceptance does **not** degrade with context on this stack; it is higher at agentic
+context lengths than on short prompts. Prefill throughput rises monotonically with
+prompt size, reaching **646 tok/s** at 2756 tokens.
+
+## Deep-K sweep at 1854-token context (`--ignore-eos`, 200 tokens decoded)
+
+| drafter | block | K | tok/s | accept% | tok/step | ms/step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| DSpark v1 | 4 | 3 | 62.98 | **90.18%** | 3.72 | 59.02 |
+| DSpark v1 | 4 | 4 | 68.69 | 83.78% | 4.37 | 63.59 |
+| DSpark v2 | 7 | 4 | 63.92 | 80.53% | 4.23 | 66.21 |
+| DSpark v2 | 7 | 5 | 68.91 | 76.08% | 4.81 | 69.78 |
+| DSpark v2 | 7 | 6 | 71.09 | 71.81% | 5.31 | 74.75 |
+| DSpark v2 | 7 | 7 | **73.00** | 68.59% | 5.81 | 79.63 |
+
+Best measured decode: **73.00 tok/s**. Best measured acceptance: **90.18%**.
+They occur at opposite ends of the K tradeoff and have not been achieved together.
+
+## KV cache quantization: no benefit
+
+| context | drafter/K | KV type | tok/s |
+| ---: | --- | --- | ---: |
+| 1854 tok | v2/K=7 | f16 | 66.59 |
+| 1854 tok | v2/K=7 | q8_0 | 65.53 |
+| 6052 tok | v2/K=7 | f16 | 70.24 |
+| 6052 tok | v2/K=7 | q8_0 | 69.49 |
+
+`-ctk q8_0 -ctv q8_0` is consistently marginally slower. Flash attention already keeps
+the KV read off the critical path at these context lengths.
+
+Also note `-c 8192` costs ms/step versus `-c 4096` (87.30 vs 79.63 for the identical
+v2/K=7 workload) — allocate only the context you need.
+
+## Updated cost model (long context)
+
+```
+t_step (ms) = 48.3 + 4.47 * K
+tok/s       = (1 + K*a) / (0.0483 + 0.00447*K)
+```
+
+100 tok/s requires `K = 3.83 / (a - 0.447)`:
+
+| acceptance | required K |
+| ---: | ---: |
+| 0.85 | 9.5 |
+| **0.90** | **8.5** |
+| 0.95 | 7.6 |
+
+## Status against the 100 tok/s @ 90% acceptance target
+
+**Not met.** Measured best is 73.00 tok/s at 68.59% acceptance, or 62.98 tok/s at
+90.18% acceptance.
+
+The blocker is now precisely characterised: reaching 100 tok/s at 90% acceptance
+requires sustaining that acceptance to **draft depth ~8.5**. The deepest drafter
+available has block size 7 (DSpark v2) and its acceptance at K=7 is 68.59%. DSpark v1
+reaches 90.18% but only at depth 3, where tok/step is capped at 3.72.
+
+Every runtime-side lever has now been measured and none closes the gap:
+
+| lever | result |
+| --- | --- |
+| CUDA Graphs (`GGML_CUDA_GRAPHS=ON`) | no change (61.84 vs 62.40) |
+| smaller target (PTQ1_0) | 22% slower |
+| smaller drafter (v1 603 MB) | best drafter, still capped by block size 4 |
+| KV quantization q8_0 | marginally slower |
+| n-gram stacking | counters unchanged; never engaged |
+| larger batch / ubatch | hurts decode; helps prefill only |
+| longer context | helps acceptance, does not reach 90% at depth 7+ |
+
+The remaining work is a **drafter training problem**: a DSpark v3 with block size >= 9
+holding ~90% acceptance across all 9 positions. The retrain pipeline exists at
+`Bonsai-demo/tools/dspark-retrain/`.
+
+## Prefill summary
+
+Prefill is healthy and scales with prompt size on this hardware:
+
+| prompt tokens | prefill tok/s |
+| ---: | ---: |
+| 65 | 130.5 |
+| 668 | 335.1 |
+| 1257 | 481.0 |
+| 1854 | 562.6 |
+| 2756 | 646.2 |
+
+Batch sizing matters: prompts above the batch size hard-fail with
+`the prompt exceeds the batch size`, so `-b` must be raised for long contexts.
+Raising `-ub` above 512 reduces prefill throughput (389 tok/s at `-ub 2048` versus
+656 tok/s at `-ub 512`).
