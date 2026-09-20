@@ -1515,3 +1515,51 @@ those rounds reflects a workload that re-prefills every turn, which is not how
 an agent behaves. `bench/conc.py` also passes `cache_prompt: false` deliberately,
 to isolate decode - that remains correct for its purpose but should not be read
 as end-to-end performance.
+
+---
+
+# Round 19 - long-context levers, and the caching flags nobody was using
+
+## At ~4k context, none of these levers move anything
+
+Same prompt, same binary, single runs (so read only the large deltas):
+
+| lever | tok/s | vs baseline |
+|---|---|---|
+| baseline (f16 KV, `-ub 512`) | 25.02 | - |
+| target KV `q4_0` | 23.44 | **-6.3%** |
+| draft KV `q4_0` (`-ctkd/-ctvd`) | 24.55 | -1.9% |
+| both KV `q4_0` | 24.30 | -2.9% |
+| `-ub 256` | 24.97 | -0.2% |
+| `-ub 1024` | 25.29 | +1.1% |
+
+Quantizing the **target's** KV costs 6.3% at this context, against **+16.5% at
+64k** (Round 17). At 4k the KV is ~0.25 GB against a 6.70 GB model, so you pay
+the dequantization and get nothing back. This validates the context threshold
+now wired into `pulse-cli`: f16 below 32k, `q4_0` above.
+
+Quantizing the **drafter's** KV (never tested before this round) is also a small
+loss. The drafter's KV is tiny.
+
+`-ub` is flat from 256 to 1024 at this context - the Round 2 finding that
+`-ub 1024` hurt applied to *prefill*, not decode.
+
+## Server caching flags we were not using
+
+| flag | default | what it does |
+|---|---|---|
+| `--cache-prompt` | **enabled** | server-side prompt caching. Our benchmarks overrode it per-request with `cache_prompt: false` |
+| `--cache-ram` | **8192 MiB** | maximum prompt-cache size. **KV at 256k is 17 GB - more than double this** |
+| `--cache-reuse N` | **0 (disabled)** | reuse via KV shifting when the prefix *diverges* |
+| `--slot-save-path` | disabled | persist slot KV to disk, i.e. cross-session caching |
+| `--ctx-checkpoints` | 32/slot | context checkpoints |
+
+The `--cache-ram` default is the one to watch: at long context the prompt cache
+cannot hold a single conversation, so it will evict. Any 256k deployment needs
+this raised.
+
+`--cache-reuse` matters because Round 18's 131.7x only applies to *append-only*
+growth. Real agents edit context - replace a file's contents, drop a tool
+result, rewrite a plan - and any change before the tail invalidates an exact
+prefix match. `bench/cachereuse.py` measures append-only vs mid-edit vs
+prefix-drop, with reuse disabled and enabled.
