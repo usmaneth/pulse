@@ -53,14 +53,14 @@
       "block_size": 7,
       "optimal_k": 7,
       "measured": {
-        "toks_sec_median": 66.31,
-        "min": 62.43,
-        "max": 69.21,
-        "repeats": 6,
-        "spread_pct": 10.2,
+        "toks_sec_cold_median": 66.31,
+        "toks_sec_warm_median": 71.45,
+        "warm_spread_pct": 3.4,
+        "cold_spread_pct": 10.2,
         "acceptance": 0.691,
         "tok_per_step": 5.74,
-        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos, 90s quiesce then 6 repeats"
+        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos",
+        "note": "cold = first use after CPU activity; warm = sustained serving. Both are real and answer different questions."
       },
       "correction": "an earlier measurement of this exact config reported 73.3 tok/s with a 1.09 spread. That was taken in an unusually favourable machine state. A properly quiesced 6-repeat run gives a 66.31 median with 10.2% spread."
     },
@@ -248,10 +248,30 @@
   "measurement_protocol": {
     "$comment": "This machine's throughput is state-dependent. Follow this or you will manufacture fake wins.",
     "noise_floor_pct": 10.2,
-    "rule": "any claimed optimisation must exceed 10.2% to be credible; take a median of >=6 runs",
+    "rule": "with 2 warmup runs discarded and configs interleaved, measured spread is 3.4%; without warmup on a cold machine it is 10.2%. Gate claims on 3.4% only if you followed the warm protocol.",
     "quiesce": "no GPU compute apps, load average below ~1, no heavy CPU processes",
     "warmup": "throughput climbs across consecutive runs (63.4 -> 62.4 -> 64.6 -> 68.1 -> 69.2 -> 68.0). Unified-memory pages migrate back to the GPU lazily. Discard the first runs.",
     "cpu_bus_contention": "GB10 shares one LPDDR5X bus between CPU and GPU. 8 CPU threads streaming memory cost 16% of decode throughput (73.3 -> 61.0), and throughput did not recover immediately when the load stopped.",
-    "do_not_use_nsys": "CUPTI under-reports kernel duration on GB10 unified memory: it showed 2.7 ms of kernel work inside a 73.4 ms step, and 92% GPU idle on a workload two independent processes proved bandwidth-saturated. Use wall-clock differentials."
+    "do_not_use_nsys": "CUPTI under-reports kernel duration on GB10 unified memory: it showed 2.7 ms of kernel work inside a 73.4 ms step, and 92% GPU idle on a workload two independent processes proved bandwidth-saturated. Use wall-clock differentials.",
+    "noise_floor_pct_cold": 10.2,
+    "noise_floor_pct_warm_interleaved": 3.4,
+    "cold_vs_warm": {
+      "$comment": "Identical config, identical command, three protocols.",
+      "n3_favourable_state": {
+        "median": 73.3,
+        "spread_pct": 1.5,
+        "note": "unreproducible; tight spread was luck"
+      },
+      "n6_quiesced_no_warmup": {
+        "median": 66.31,
+        "spread_pct": 10.2,
+        "note": "cold start; runs climb as pages migrate back"
+      },
+      "n4_warmup2_interleaved": {
+        "median": 71.45,
+        "spread_pct": 3.4,
+        "note": "warm steady state; the sustained-serving number"
+      }
+    }
   }
 }

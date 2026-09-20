@@ -76,6 +76,14 @@ reproducible to the digit across five runs. Acceptance is strongly prompt-depend
 (measured range 21% to 96% across workloads), so treat it as a property of the workload
 rather than of the drafter.
 
+> **Measurement note.** This machine is state-dependent: the CPU and GPU share one
+> LPDDR5X bus, so CPU memory traffic costs ~16% of decode throughput, and
+> unified-memory pages migrate and fault back lazily (throughput climbs across
+> consecutive runs). The measured run-to-run noise floor is **10.2%**. Numbers here
+> are medians of 6 runs after a 90 s quiesce. An earlier revision of this card quoted
+> 73.0 tok/s from a 3-run sample taken in an unusually favourable state; it does not
+> reproduce.
+
 ### Which to use
 
 - Want maximum throughput: **v2 at K=7** (66.31 median). Use the full block size; K past

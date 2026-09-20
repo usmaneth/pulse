@@ -18,7 +18,9 @@ BIN   = os.environ.get("SPEC_BIN", "/home/usman/Bonsai-demo/bin/cuda/llama-specu
 ROOT  = os.environ.get("SPEC_ROOT", "/home/usman/Bonsai-demo")
 MODEL = os.environ.get("SPEC_MODEL", "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf")
 DRAFT = os.environ.get("SPEC_DRAFT", "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf")
-NOISE_FLOOR_PCT = 10.2
+# Warm, interleaved, warmup-discarded: measured 3.4% spread.
+# Cold (no warmup, after CPU activity): measured 10.2% - pages migrate back lazily.
+NOISE_FLOOR_PCT = float(os.environ.get("PULSE_NOISE_FLOOR", "3.4"))
 
 BASE = ["-m", MODEL, "-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "7",
         "-ngl", "99", "-ngld", "999", "-fa", "on", "-c", "8192", "-b", "4096", "-ub", "512",
@@ -51,7 +53,11 @@ def one(env_extra, argv_extra, prompt_file, npred):
             "tok_step": dec/steps, "ms_step": 1000.0*secs/steps, "wall": time.perf_counter()-t0}
 
 def parse_config(spec):
-    label, rest = spec.split("=", 1)
+    # label is everything before the first ":" so labels may contain "="
+    if ":" in spec.split("--")[0]:
+        label, rest = spec.split(":", 1)
+    else:
+        label, rest = spec.split("=", 1)
     env_part, _, argv_part = rest.partition("--")
     env = {}
     for tok in shlex.split(env_part):
