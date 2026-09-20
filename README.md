@@ -74,10 +74,14 @@ curve for you. Honest caveat: versus a static always-on drafter the gain is only
 | drafter | size | block | best K | tok/s | acceptance | tok/step |
 |---|---|---|---|---|---|---|
 | v1 | 603 MB | 4 | 4 | 64.1 | 72.28% | 3.86 |
-| **v2** | 1.10 GB | 7 | **7** | **73.3** | 69.10% | 5.74 |
+| **v2** | 1.10 GB | 7 | **7** | **66.3** median | 69.10% | 5.74 |
 
-v2 at K=7 is the default: **73.3 tok/s** over 3 repeats (spread 1.09) on a realistic
-code context, against a 27.54 tok/s no-drafter baseline — **2.66x**.
+v2 at K=7 is the default: **66.3 tok/s median** (62.4–69.2 over 6 repeats after a 90 s
+quiesce) on a realistic code context, against a 27.54 tok/s no-drafter baseline — **2.4x**.
+
+> An earlier revision of this README reported **73.3 tok/s with a 1.09 spread** for this
+> exact config. That was measured in an unusually favourable machine state. See
+> *Measurement hygiene* — this machine has a **10.2% noise floor**.
 
 Stacking a free n-gram drafter ahead of the neural one helps v1 (+1.8%) and *hurts*
 v2 (−11%): the free drafts displace deeper dspark drafts, 5.74 → 4.62 tok/step. With
@@ -104,6 +108,12 @@ Two traps that produced false results here, both now guarded by `pulse doctor`:
 
 - **GPU contention.** An identical benchmark swung 33.79 ms → 150.33 ms (4.4x)
   with stray processes on the GPU. `pulse bench` refuses to run on a busy GPU.
+- **CPU steals GPU bandwidth.** GB10 shares one LPDDR5X bus. 8 CPU threads streaming
+  memory cost **16%** of decode throughput (73.3 → 61.0 tok/s) — and throughput did
+  **not** recover when the load stopped. Unified-memory pages migrate and fault back
+  lazily, so throughput also *climbs* across consecutive runs.
+- **The noise floor is 10.2%.** Median of ≥6 runs after a quiesce, or you will
+  manufacture wins out of machine state. Any claimed optimisation must beat 10.2%.
 - **nsys under-reports GPU busy time on GB10.** A trace reported the GPU 92.2%
   idle during decode. CUPTI does not capture fabric stalls on unified memory.
   The two-process 1.01x result disproves it directly. Do not publish GPU-idle

@@ -874,3 +874,93 @@ exactly why graphs are rejected at runtime (Round 6).
 | vs stock llama.cpp defaults | 1.53-1.61x | configuration only |
 | hardware ceiling at 5.74 tok/step | ~114 tok/s | if the drafter were free |
 | reachable by fixing drafter execution | ~102 tok/s | the open work |
+
+---
+
+# Round 11 - the measurement floor, and a correction to Round 10
+
+## Round 10's 73.3 tok/s was machine state, not a result
+
+Round 10 reported 73.39 / 73.20 / 72.30 tok/s for v2 at K=7 and called the 1.09
+spread reproducible. Re-running the identical command on a clean GPU an hour
+later gave **65.06 / 68.94 / 61.05**. Nothing was contending for the GPU
+(0 compute apps), the card was at 51 C and `clocks_event_reasons.active` was
+`0x0`, so it was neither contention nor throttling.
+
+Properly characterised - 90 s quiesce, then 6 repeats:
+
+    63.37  62.43  64.62  68.10  69.21  67.99
+    n=6  min=62.43  median=66.31  max=69.21  spread=10.2%
+
+**The honest single-stream figure is 66.31 tok/s median, not 73.3.** Corrected in
+the README, the tuning profile and the Hugging Face card.
+
+## Why: the CPU and GPU share one memory bus
+
+GB10 has unified LPDDR5X. CPU-side memory traffic directly steals GPU bandwidth.
+
+| phase | tok/s |
+|---|---|
+| ambient load | 71.26, 73.30 |
+| + 8 CPU threads streaming memory | 61.79, 60.99 |
+| after the load stopped | 60.04, 59.39 |
+
+CPU contention costs **16%**. More importantly, throughput **did not recover** when
+the load stopped, and it then **climbs across consecutive runs**
+(63.4 -> 62.4 -> 64.6 -> 68.1 -> 69.2). That is consistent with unified-memory
+pages migrating toward the CPU under pressure and faulting back to the GPU lazily.
+
+A browser was running during the earlier measurements. That is enough to matter
+on this machine.
+
+## The protocol this forces
+
+1. No GPU compute apps, load average below ~1, no heavy CPU processes.
+2. Settle, then discard the first runs - throughput climbs as pages migrate back.
+3. Take a **median of at least 6 runs**.
+4. **Any claimed optimisation must exceed 10.2% to be credible.**
+5. Do not use nsys for attribution on this machine (Round 6, and again here: it
+   reported 2.7 ms of kernel work inside a 73.4 ms step).
+
+`pulse doctor` now checks load average and CPU hogs, not just GPU compute apps.
+
+## What this does and does not change
+
+It does **not** change the structural results, which were cross-validated by
+independent means:
+
+- the 36.3 ms weight sweep, confirmed by `llama-batched-bench` at 27.54 tok/s
+  from a different binary
+- the batching curve (4.83x), a single sweep in one machine state
+- the two-process 1.01x bandwidth-bound result, a within-run comparison
+- every negative result, all within-run A/Bs
+
+It **does** mean single-run cross-time comparisons anywhere in Rounds 1-10 carry
+about +/-10%, and the drafter overhead figures (+15.4 and +27.9 ms/step) should be
+treated as approximate. They remain well above the noise floor - 27.9 ms of a
+~78 ms step is 36% - so the lever is real, but validating any fix requires the
+protocol above rather than single runs.
+
+## Dead end recorded: DSPARK_DRAFT_WINDOW
+
+`draft_window = 0` means full prefix, so the drafter conditions on the whole
+context. Capping it changes nothing measurable:
+
+| window | 0 | 512 | 256 | 128 | 64 | 32 | 16 |
+|---|---|---|---|---|---|---|---|
+| tok/s | 73.28 | 73.31 | 73.31 | 72.84 | 73.45 | 72.95 | 73.01 |
+
+Identical acceptance and tok/step throughout. The knob does not reach the
+graph-corrected v2 path.
+
+## Correction to Round 9's kernel attribution
+
+Round 9 attributed the drafter overhead to "~24 MMQ launches of ~25 MB". That was
+wrong twice over: the `mul_mat_q<(ggml_type)142, (int)128>` kernels are on the
+**target** (PQ2_0), and `128` is MMQ's tile width `mmq_x`, not a row count. They
+are also **prefill**, not per-step - a steady-state profile with a 5-token prompt
+shows no MMQ at all during decode. Dividing their total by step count was invalid.
+
+The wall-clock evidence for the drafter overhead is unaffected: it scales 1.81x
+for a 1.75x larger drafter, which is what identifies it as the drafter's own
+forward pass.

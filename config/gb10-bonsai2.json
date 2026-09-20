@@ -53,14 +53,16 @@
       "block_size": 7,
       "optimal_k": 7,
       "measured": {
-        "toks_sec": 73.3,
+        "toks_sec_median": 66.31,
+        "min": 62.43,
+        "max": 69.21,
+        "repeats": 6,
+        "spread_pct": 10.2,
         "acceptance": 0.691,
         "tok_per_step": 5.74,
-        "ms_per_step": 78.3,
-        "repeats": 3,
-        "spread_toks_sec": 1.09,
-        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos"
-      }
+        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos, 90s quiesce then 6 repeats"
+      },
+      "correction": "an earlier measurement of this exact config reported 73.3 tok/s with a 1.09 spread. That was taken in an unusually favourable machine state. A properly quiesced 6-repeat run gives a 66.31 median with 10.2% spread."
     },
     "recommended": "v2",
     "recommended_provenance": "v2 at K=7 is the measured best single-stream config on realistic code context: 73.2-73.4 tok/s over 3 repeats, vs 63.8-64.3 for v1 at K=4. Earlier rounds preferred v1 because they measured v2 on a shorter, less representative context."
@@ -240,6 +242,16 @@
       "v2_toks_sec": 102,
       "calc": "50.33 ms curve + 1.1 GB / 184.6 GB/s = 56.3 ms; 5.74 / 0.0563 = 102 tok/s"
     },
-    "note": "this is a runtime optimization on drafter execution, not a new model. CUDA Graphs will not help: the drafter has Gated DeltaNet layers, which is why graphs are rejected at runtime."
+    "note": "this is a runtime optimization on drafter execution, not a new model. CUDA Graphs will not help: the drafter has Gated DeltaNet layers, which is why graphs are rejected at runtime.",
+    "caveat": "the drafter overhead (27.9 ms of a ~78 ms step, 36%) is well above the 10.2% noise floor, so it is a real target - but it must be validated with the median-of-6 protocol, not single runs."
+  },
+  "measurement_protocol": {
+    "$comment": "This machine's throughput is state-dependent. Follow this or you will manufacture fake wins.",
+    "noise_floor_pct": 10.2,
+    "rule": "any claimed optimisation must exceed 10.2% to be credible; take a median of >=6 runs",
+    "quiesce": "no GPU compute apps, load average below ~1, no heavy CPU processes",
+    "warmup": "throughput climbs across consecutive runs (63.4 -> 62.4 -> 64.6 -> 68.1 -> 69.2 -> 68.0). Unified-memory pages migrate back to the GPU lazily. Discard the first runs.",
+    "cpu_bus_contention": "GB10 shares one LPDDR5X bus between CPU and GPU. 8 CPU threads streaming memory cost 16% of decode throughput (73.3 -> 61.0), and throughput did not recover immediately when the load stopped.",
+    "do_not_use_nsys": "CUPTI under-reports kernel duration on GB10 unified memory: it showed 2.7 ms of kernel work inside a 73.4 ms step, and 92% GPU idle on a workload two independent processes proved bandwidth-saturated. Use wall-clock differentials."
   }
 }
