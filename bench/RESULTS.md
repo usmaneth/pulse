@@ -2236,3 +2236,68 @@ excludes prompt processing, wall clock does not. The discrepancy is not fully
 explained. **Only the within-harness spec-vs-no-spec comparisons are used to
 set policy**, because those are controlled. The cross-harness absolutes are not
 comparable and are not claimed as such.
+
+---
+
+# Round 30 - the GB10 kernel tuning is already right, and the 16% gap is not in it
+
+Round 16 found the true weight-sweep roofline is 30.9 ms against a measured
+36.65 ms: a **16% software gap**. This round tests the most obvious hypothesis
+for where that gap lives and rules it out.
+
+## llama.cpp already has DGX Spark kernel tuning
+
+`ggml/src/ggml-cuda/mmvq.cu` carries a `MMVQ_PARAMETERS_GB10` table, selected by
+`__CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK` (1210). Every measurement in this
+project has been running on top of it. The Spark-specific tuning is not missing.
+
+That table gives `GGML_TYPE_PQ2_0` - the exact quantisation of our target -
+`nwarps = generic + generic/2` = **6**, where every other quantised type gets
+`2 * generic` = 8. The source marks this "(observation)", not a measurement.
+
+## Measured
+
+Target-only decode, speculation disabled so this isolates the target's matvec
+path, short context so KV reads do not dominate. Three variants built as
+separate `libggml-cuda.so`, deployed by swapping the library and restarting,
+interleaved across 3 rounds.
+
+| nwarps | round 1 | round 2 | round 3 | median |
+|---|---|---|---|---|
+| 4 (`generic`) | 28.35 | 28.40 | 28.38 | **28.38** |
+| 6 (upstream) | 28.32 | 28.27 | 28.23 | 28.27 |
+| 8 (`2 * generic`) | 28.27 | 28.19 | 28.17 | 28.19 |
+
+The ordering is 4 > 6 > 8 in **every** round, so the effect is real rather than
+noise. It is also **+0.39%**, which is not worth carrying a divergence from
+upstream for.
+
+**Conclusion: the upstream GB10 warp tuning for PQ2_0 is already essentially
+optimal, and the 16% software gap is not in mmvq's launch configuration.** The
+source was restored to upstream and nothing is shipped from this round.
+
+## Why this was worth testing
+
+`bench/cuda/bw.cu` found peak memory bandwidth at **low occupancy**, often 1-2
+blocks per SM. `calc_launch_params` launches `nrows_x / rows_per_block` blocks,
+which for a 27B model is thousands - far from that regime. The hypothesis was
+that the decode kernel was over-subscribed. It is not: varying the warp count
+per block by 2x in either direction moves throughput by under half a percent.
+
+That narrows where the remaining 5.75 ms per step can be. It is not warp
+geometry. The remaining candidates are the non-weight work a decode step does
+anyway - KV reads, norms, Hadamard transforms, `quantize_q8_1` and sampling -
+and whatever is left is smaller than previously assumed.
+
+## Method note
+
+An earlier attempt deployed only the `llama-server` executable and reported a
+difference. That was wrong in a way worth recording: the kernel lives in
+`libggml-cuda.so`, and the executable resolves it through RUNPATH to the build
+directory. Copying the 72 KB executable changes nothing. The comparison above
+swaps the 62 MB library instead.
+
+It also showed **inter-instance variance of ~1.9%** - two runs of the identical
+binary in different server processes gave 27.34 and 27.86 tok/s - against
+within-run spreads of 0.2-0.8%. Any kernel comparison must therefore restart and
+interleave, not measure once per build.
