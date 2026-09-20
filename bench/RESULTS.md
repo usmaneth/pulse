@@ -1563,3 +1563,35 @@ growth. Real agents edit context - replace a file's contents, drop a tool
 result, rewrite a plan - and any change before the tail invalidates an exact
 prefix match. `bench/cachereuse.py` measures append-only vs mid-edit vs
 prefix-drop, with reuse disabled and enabled.
+
+---
+
+# Round 20 - the prefix cache has a cliff, and it is the agent's normal case
+
+Round 18 measured 131.7x for exact replay. That is the **append-only** case: the
+context grows at the end and the cached prefix stays valid.
+
+Agents do not only append. They replace a file's contents, drop a stale tool
+result, rewrite a plan - all of which change something *before* the tail.
+
+Measured at 8192-token context, `--cache-reuse 0` (the llama.cpp default):
+
+| scenario | prefill |
+|---|---|
+| baseline (prefix already cached) | 150.7 ms |
+| **A. append-only** (prefix + new suffix) | **254.2 ms** |
+| **B. mid-context edit** (a block in the middle replaced) | **8647.3 ms** |
+| **C. early chunk dropped** | **8101.3 ms** |
+
+**Any edit before the tail costs a full re-prefill** - 34x worse than the
+append-only case at only 8k context. At 256k that is minutes rather than
+milliseconds.
+
+So the Round 18 headline needs a qualifier: 131.7x applies to append-only
+growth. The moment the agent edits earlier context, the cache is worth nothing
+unless `--cache-reuse` is enabled.
+
+(Note: the "baseline" row here is not truly cold - the 8192-token prompt is a
+prefix of the 16384-token prompt used in Round 18, built from the same pool in
+the same order, so it hit the existing cache. The relative comparison between
+A, B and C is unaffected, since all four rows ran against the same server state.)
