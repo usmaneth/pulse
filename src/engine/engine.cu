@@ -166,6 +166,73 @@ void k_attention(const float* __restrict__ Q,      // [n_head][head_dim]
     for (int i = tid; i < head_dim; i += nthr) O[(size_t)h*head_dim+i] = acc[i]*inv;
 }
 
+
+// --------------------------------------------- Gated DeltaNet, decode path
+// 48 of the 64 layers. Shapes read from the file:
+//   attn_qkv [5120,10240] = q 2048 + k 2048 + v 6144
+//     -> 16 q-heads, 16 k-heads, 48 v-heads, all 128-dim (3 v per k)
+//   ssm_a / alpha / beta / dt.bias : [48], one per v-head
+//   ssm_norm : [128], over head_dim
+//   state    : [128 k-dim x 128 v-dim] per v-head
+//
+// llama.cpp's delta-net is a 648-line CHUNKED parallel scan, which is the right
+// shape for prefill. Decode is one token, so the chunk machinery collapses to
+// the plain recurrence:
+//
+//   S <- S * a                              gated decay, a in (0,1)
+//   S <- S + beta * k (v - S^T k)^T         delta rule: replace, don't append
+//   o  = S^T q
+//
+// The delta term is what distinguishes this from a linear-attention state: it
+// subtracts what the state already predicts for k before writing v, so
+// repeated keys overwrite instead of accumulating.
+__global__ __launch_bounds__(128)
+void k_gdn_step(float* __restrict__ S,            // [n_vhead][dk][dv]
+                const float* __restrict__ q,      // [n_khead][dk]
+                const float* __restrict__ k,      // [n_khead][dk]
+                const float* __restrict__ v,      // [n_vhead][dv]
+                const float* __restrict__ a,      // [n_vhead] decay
+                const float* __restrict__ beta,   // [n_vhead]
+                float* __restrict__ o,            // [n_vhead][dv]
+                int n_vhead, int n_khead, int dk, int dv) {
+    const int h  = blockIdx.x;                 // v-head
+    if (h >= n_vhead) return;
+    const int g  = h / (n_vhead / n_khead);    // which k/q head feeds it
+    const int tid = threadIdx.x;               // one thread per dv column
+
+    float* Sh = S + (size_t)h*dk*dv;
+    const float ah = a[h], bh = beta[h];
+
+    extern __shared__ float sh2[];
+    float* sk = sh2;            // dk - the key
+    float* sq = sh2 + dk;       // dk - the query
+    for (int i = tid; i < dk; i += blockDim.x) {
+        sk[i] = k[(size_t)g*dk + i];
+        sq[i] = q[(size_t)g*dk + i];
+    }
+    __syncthreads();
+
+    // Each thread owns one v column j: S[:, j].
+    for (int j = tid; j < dv; j += blockDim.x) {
+        // decay, then read what the state currently predicts for this key
+        float pred = 0.0f;
+        for (int i = 0; i < dk; ++i) {
+            const float sij = Sh[(size_t)i*dv + j] * ah;
+            Sh[(size_t)i*dv + j] = sij;
+            pred += sij * sk[i];
+        }
+        // delta rule: write only the residual, scaled by beta
+        const float resid = bh * (v[(size_t)h*dv + j] - pred);
+        float out = 0.0f;
+        for (int i = 0; i < dk; ++i) {
+            const float sij = Sh[(size_t)i*dv + j] + resid * sk[i];
+            Sh[(size_t)i*dv + j] = sij;
+            out += sij * sq[i];
+        }
+        o[(size_t)h*dv + j] = out;
+    }
+}
+
 } // namespace pulse
 
 using namespace pulse;
@@ -372,6 +439,71 @@ int main(int argc, char** argv) {
         printf("  as f16        : %.1f GB at 32k, %.1f GB at 256k\n",
                per_tok*32768/2e9, per_tok*262144/2e9);
         cudaFree(kv.k); cudaFree(kv.v);
+    }
+
+    // ---- Gated DeltaNet recurrent step
+    {
+        const int n_vhead = 48, n_khead = 16, dk = 128, dv = 128;
+        const size_t sn = (size_t)n_vhead*dk*dv;
+        std::vector<float> hS(sn), hq((size_t)n_khead*dk), hk((size_t)n_khead*dk),
+                           hv((size_t)n_vhead*dv), ha(n_vhead), hb(n_vhead);
+        for (size_t i=0;i<sn;++i)        hS[i] = sinf(i*0.0007f)*0.1f;
+        for (size_t i=0;i<hq.size();++i) hq[i] = cosf(i*0.013f)*0.3f;
+        for (size_t i=0;i<hk.size();++i) hk[i] = sinf(i*0.017f)*0.3f;
+        for (size_t i=0;i<hv.size();++i) hv[i] = cosf(i*0.011f)*0.4f;
+        for (int i=0;i<n_vhead;++i){ ha[i] = 0.90f + 0.001f*i; hb[i] = 0.5f + 0.002f*i; }
+
+        float *dS,*dq,*dk_,*dv_,*da,*db,*doo;
+        CU(cudaMalloc(&dS,sn*4));            CU(cudaMalloc(&dq,hq.size()*4));
+        CU(cudaMalloc(&dk_,hk.size()*4));    CU(cudaMalloc(&dv_,hv.size()*4));
+        CU(cudaMalloc(&da,n_vhead*4));       CU(cudaMalloc(&db,n_vhead*4));
+        CU(cudaMalloc(&doo,hv.size()*4));
+        CU(cudaMemcpy(dS,hS.data(),sn*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dq,hq.data(),hq.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dk_,hk.data(),hk.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dv_,hv.data(),hv.size()*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(da,ha.data(),n_vhead*4,cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(db,hb.data(),n_vhead*4,cudaMemcpyHostToDevice));
+        k_gdn_step<<<n_vhead,128,2*dk*sizeof(float)>>>(dS,dq,dk_,dv_,da,db,doo,
+                                                       n_vhead,n_khead,dk,dv);
+        CU(cudaDeviceSynchronize());
+        std::vector<float> gotS(sn), gotO(hv.size());
+        CU(cudaMemcpy(gotS.data(),dS,sn*4,cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(gotO.data(),doo,hv.size()*4,cudaMemcpyDeviceToHost));
+
+        // CPU reference, in double
+        double eS=0, magS=0, eO=0, magO=0;
+        std::vector<double> Sr(dk);
+        for (int h = 0; h < n_vhead; ++h) {
+            const int g = h/(n_vhead/n_khead);
+            for (int j = 0; j < dv; ++j) {
+                double pred = 0;
+                for (int i = 0; i < dk; ++i) {
+                    Sr[i] = (double)hS[(size_t)h*dk*dv + (size_t)i*dv + j]*ha[h];
+                    pred += Sr[i]*hk[(size_t)g*dk+i];
+                }
+                const double resid = hb[h]*((double)hv[(size_t)h*dv+j]-pred);
+                double out = 0;
+                for (int i = 0; i < dk; ++i) {
+                    const double sij = Sr[i] + resid*hk[(size_t)g*dk+i];
+                    out += sij*hq[(size_t)g*dk+i];
+                    const double got = gotS[(size_t)h*dk*dv + (size_t)i*dv + j];
+                    eS = std::max(eS, std::fabs(got-sij)); magS = std::max(magS, std::fabs(sij));
+                }
+                eO = std::max(eO, std::fabs((double)gotO[(size_t)h*dv+j]-out));
+                magO = std::max(magO, std::fabs(out));
+            }
+        }
+        report("gdn state update (48 heads)",  eS/std::max(magS,1e-9), 1e-5);
+        report("gdn output projection",        eO/std::max(magO,1e-9), 1e-5);
+
+        int n_gdn = 0; for (int il=0; il<hp.n_layer; ++il) n_gdn += !m.is_full_attn(il);
+        const double st = (double)n_gdn*n_vhead*dk*dv*4;
+        printf("\nGDN recurrent state: %d layers x %d v-heads x %dx%d f32 = %.1f MB\n",
+               n_gdn, n_vhead, dk, dv, st/1e6);
+        printf("  constant in context length - this is why long context is affordable here\n");
+        cudaFree(dS);cudaFree(dq);cudaFree(dk_);cudaFree(dv_);
+        cudaFree(da);cudaFree(db);cudaFree(doo);
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
