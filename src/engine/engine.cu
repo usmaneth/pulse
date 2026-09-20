@@ -1529,6 +1529,8 @@ int main(int argc, char** argv) {
             double worst_layer_cos = 1.0; int worst_layer = -1;
             int layers_checked = 0;
 
+            cudaEvent_t sw0, sw1; CU(cudaEventCreate(&sw0)); CU(cudaEventCreate(&sw1));
+            CU(cudaEventRecord(sw0));
             for (int il = 0; il < hp.n_layer; ++il) {
                 std::vector<float> res(x);
                 CU(cudaMemcpy(dx,x.data(),(size_t)n*4,cudaMemcpyHostToDevice));
@@ -1642,8 +1644,16 @@ int main(int argc, char** argv) {
                                m.is_full_attn(il)?"attn":"gdn ", cs);
                 }
             }
+            CU(cudaEventRecord(sw1)); CU(cudaEventSynchronize(sw1));
+            float sweep_ms = 0; CU(cudaEventElapsedTime(&sweep_ms, sw0, sw1));
             printf("    --- %d layers checked, worst cosine %.8f at layer %d ---\n",
                    layers_checked, worst_layer_cos, worst_layer);
+            printf("    --- forward pass wall time: %.1f ms  (llama.cpp decode step: 36.65 ms) ---\n",
+                   sweep_ms);
+            printf("    --- NOTE: this includes per-stage host round-trips and the\n");
+            printf("        per-layer reference comparison, neither of which belongs\n");
+            printf("        in a serving path. It is a correctness harness, not a\n");
+            printf("        decode loop. ---\n");
             report("FULL 64-LAYER SWEEP (worst layer cos)", 1.0-worst_layer_cos, 1e-2);
 
             // --- final norm + output head, on top of Pulse's own 64-layer result

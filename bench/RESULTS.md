@@ -2750,3 +2750,59 @@ even though the answer came back clean.
 The residual 3-5e-04 is not machine precision because `attn_pregate` is not raw
 V; it is the attention result before the output gate. The mapping question is
 settled regardless, by four orders of magnitude.
+
+---
+
+# Round 38 - the engine is correct; now here is what it costs
+
+The forward pass matches llama.cpp end to end (argmax match, top-10 10/10,
+logit cosine 0.99999318). This round measures it.
+
+| | ms |
+|---|---|
+| Pulse forward pass, as built | **65.9** |
+| llama.cpp decode step | **36.65** |
+
+**Pulse is 1.8x slower.** That is the honest number and it is not a mystery.
+
+## Where the 29 ms goes
+
+The sweep is a correctness harness, not a decode loop. Per layer it:
+
+- copies intermediates to the host between stages (`cudaMemcpy` D2H then H2D
+  around every sub-block)
+- computes the **entire gated-delta recurrence on the CPU in double precision**
+- loads `l_out-N` from disk and compares
+
+None of that belongs in a serving path. It was the right shape for finding eight
+architectural bugs; it is the wrong shape for running.
+
+## The bound this sets
+
+Weights are 6.70 GB. The best Pulse matvec measures 176 GB/s (Round 35). So a
+forward pass that touches each weight once and stays on device is:
+
+    6.70 GB / 176 GB/s = 38.1 ms
+
+against llama.cpp's 36.65 ms. So a device-resident version of this engine lands
+at roughly **1.04x slower than llama.cpp** - consistent with the kernel
+measurement (176 vs 183 GB/s, 96%) and with Round 35's conclusion that a
+from-scratch engine converges to llama.cpp from below rather than beating it.
+
+**The ~28 ms gap between 65.9 and 38.1 is implementation, not physics.** It is
+recoverable by keeping the residual stream on device and moving the recurrence
+into the existing `k_gdn_step` kernel, which is already written and validated
+(9.169e-08) but is not what the sweep calls.
+
+## What this does not change
+
+Round 35 measured four kernel iterations converging to 96% of llama.cpp, and a
+layout experiment - the one structural freedom an engine has on the dominant op
+- coming out 12% **worse**. Fixing the harness overhead gets Pulse to parity,
+not past it. The decode roofline is unchanged: llama.cpp is at 85% of the
+216 GB/s this machine achieves, and there is no slack in the weight sweep.
+
+The case for this engine remains capability rather than throughput: owning RoPE
+makes text-path position shifting possible, which llama.cpp refuses for any
+model with `n_pos_per_embd() > 1` and which costs a full re-prefill on every
+mid-context edit today.
