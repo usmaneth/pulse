@@ -6,8 +6,11 @@
     "sms": 48,
     "unified_memory_gb": 121.7,
     "peak_bandwidth_gbs": 273.0,
-    "measured_sustained_bandwidth_gbs": 184.6,
-    "provenance": "bench_gb10_streaming on an idle GPU; peak is the vendor figure"
+    "measured_sustained_bandwidth_gbs": 216.0,
+    "provenance": "bench_gb10_streaming on an idle GPU; peak is the vendor figure",
+    "bandwidth_provenance": "bench/cuda/bw.cu sweeping MLP, block count and occupancy at the model's 6.70 GB working set: 216.9 / 217.6 / 212.4 GB/s over three runs, 79-80% of the 273 GB/s spec peak. At a 4 GB working set the best config reached 229.0 GB/s (84%). An earlier figure of 184.6 GB/s came from a single kernel configuration and under-measured the hardware.",
+    "weight_sweep_roofline_ms": 30.9,
+    "llama_cpp_decode_efficiency": "183 GB/s achieved = 85% of the 216 GB/s achievable; a 16% software gap"
   },
   "model": {
     "target": "Ternary-Bonsai-2-27B-PQ2_0.gguf",

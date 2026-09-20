@@ -1221,3 +1221,63 @@ Honest range for the recoverable term is roughly 6-10 ms, i.e. **+11% to +19%**.
 v1 at K=1 reaches **91.09% acceptance** - the highest measured in this project -
 but only 1.96 tok/step, so it yields 33.90 tok/s. Acceptance and depth trade off
 sharply: K=3 drops acceptance to 78.29% while raising throughput 56.5%.
+
+---
+
+# Round 15 - the bandwidth ceiling was under-measured
+
+## The correction
+
+Every round so far quoted **184.6 GB/s** as this machine's sustained memory
+bandwidth, and Round 14 concluded from it that llama.cpp's decode was *at* the
+roofline ("36.3 ms predicted, 36.65 ms measured, 1% agreement").
+
+That 184.6 came from a single kernel configuration (192 blocks, ILP=1). Sweeping
+memory-level parallelism, block count and occupancy (`bench/cuda/bw.cu`) shows
+the hardware does considerably better.
+
+At a 4 GB working set the best config reached **229.0 GB/s (84% of spec peak)**.
+At the model's actual 6.70 GB working set, three consecutive runs:
+
+    216.9 GB/s   217.6 GB/s   212.4 GB/s      (79-80% of spec peak)
+
+Interesting: the best configurations are **low occupancy** - often 1-2 blocks per
+SM - and extra ILP does not reliably help. This is a latency-tolerant streaming
+workload where a handful of resident warps per SM already saturates the
+controller.
+
+## Two gaps, not one
+
+| | GB/s | % of spec | % of achievable |
+|---|---|---|---|
+| spec peak, 256-bit LPDDR5X @ 8533 MT/s | 273 | 100% | - |
+| achievable pure read at 6.70 GB | **~216** | 79% | 100% |
+| llama.cpp decode (6.70 GB / 36.65 ms) | 183 | 67% | **85%** |
+
+**Gap 1 (273 -> 216): the DRAM, and it is normal.** Refresh, row
+activate/precharge across a 6.70 GB working set, read turnaround, and a fabric
+shared with the Grace CPU. 70-85% of theoretical is the usual LPDDR5X range.
+Not recoverable.
+
+**Gap 2 (216 -> 183): software.** The true weight-sweep roofline is
+`6.70 / 216 = 30.9 ms`, against a measured 36.65 ms. That is a **16% gap**, not
+the 1% Round 14 claimed.
+
+Not all of it is waste. A decode step also reads the KV cache, writes
+activations, and runs norms, Hadamard transforms, `quantize_q8_1` and sampling -
+real work that is not weight streaming. But the gap is 5.75 ms per step and some
+fraction of it is recoverable, which Round 14 asserted was not the case.
+
+## Consequence for the engine question
+
+Round 14 recommended against a rewrite largely because llama.cpp appeared to be
+at the bandwidth roofline, leaving only the drafter's 8.08 ms of orchestration.
+With the corrected ceiling there are two recoverable terms:
+
+    base step gap      ~5.75 ms   (partly recoverable; some is legitimate work)
+    drafter fixed cost  8.08 ms   (recoverable by fusing draft+verify)
+
+Against the 62.61 ms measured step at v1 K=3, recovering both would give roughly
+49 ms, about **+28%** rather than the +15% Round 14 concluded. The engine case is
+stronger than that round stated, though still far from the order-of-magnitude
+this project originally claimed.
