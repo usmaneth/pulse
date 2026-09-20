@@ -54,6 +54,44 @@ enum class TaskDomain {
     TOOL_CALL
 };
 
+enum class TensorParallelMode {
+    DISABLED,
+    DUAL_SPARK_SHARDED,      // 2 nodes over 400G QSFP fabric (spark1 + spark2)
+    MULTI_GPU_NVLINK         // Intra-node multi-GPU NVLink / P2P
+};
+
+struct TensorParallelConfig {
+    bool enabled{false};
+    TensorParallelMode mode{TensorParallelMode::DISABLED};
+    uint32_t world_size{1};
+    uint32_t rank{0};
+    std::string peer_host{"10.99.0.2"};
+    uint16_t peer_port{50055};
+
+    // Sharded geometry metrics
+    uint32_t sharded_hidden_dim{QWEN_HIDDEN_DIM};
+    uint32_t sharded_intermediate_dim{QWEN_INTERMEDIATE_DIM};
+    uint32_t sharded_num_heads{QWEN_NUM_HEADS};
+    uint32_t sharded_kv_heads{QWEN_NUM_KV_HEADS};
+    size_t sharded_model_bytes{6700000000ULL}; // 6.7 GB full
+    double target_sweep_ms{35.5};
+
+    void configure(uint32_t ws, uint32_t r, TensorParallelMode m = TensorParallelMode::DUAL_SPARK_SHARDED) {
+        enabled = (ws > 1);
+        world_size = ws;
+        rank = r;
+        mode = m;
+        if (enabled) {
+            sharded_hidden_dim = QWEN_HIDDEN_DIM / ws;
+            sharded_intermediate_dim = QWEN_INTERMEDIATE_DIM / ws;
+            sharded_num_heads = QWEN_NUM_HEADS / ws;
+            sharded_kv_heads = std::max(1U, QWEN_NUM_KV_HEADS / ws);
+            sharded_model_bytes = (6700000000ULL / ws);
+            target_sweep_ms = 35.5 / ws; // 17.75 ms on 2 nodes
+        }
+    }
+};
+
 struct SpeculativeStepResult {
     uint32_t draft_tokens_count;
     uint32_t accepted_tokens_count;
