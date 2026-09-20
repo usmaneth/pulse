@@ -587,3 +587,67 @@ Note a real gap: `vec_dot_ptq1_0_q8_1_multi` exists in `vecdotq.cuh:809` and
 fuses dequantization across columns for PTQ1_0. PQ2_0 - the format Bonsai 2 uses
 for every layer and the head - has no equivalent and goes through the generic
 per-column path.
+
+---
+
+# Round 7 - Pulse vs stock llama.cpp defaults
+
+All four rows measured the same afternoon on an idle GB10 (0 other compute
+apps), same model, same harness (`bench/conc.py`), 128 tokens per request,
+temperature 0.
+
+Stock:  `llama-server -m <model> -ngl 99 -c 65536`   (n_slots=4, no drafter, no -fa)
+Tuned:  16 slots, `-fa on`, `-b 4096`, `-ub 512`, drafter chosen by load policy
+
+| clients | stock tok/s | pulse tok/s | speedup |
+|---|---|---|---|
+| 1 | 26.58 | 40.71 | 1.53x |
+| 4 | 72.93 | 79.61 | 1.09x |
+| 16 | 73.08 | 117.71 | 1.61x |
+
+Stock saturates at 73.08 because it has 4 slots; the 16 clients queue.
+
+## The speculation / batching crossover
+
+Speculation and batching are substitutes on a bandwidth-bound machine, not
+complements. The drafter buys tokens per weight sweep while the sweep is
+under-occupied; once batching has filled it, the drafter's extra rows are cost.
+
+| clients | with drafter | no drafter |
+|---|---|---|
+| 1 | 40.71 | 26.46 |
+| 2 | 56.48 | 44.09 |
+| 4 | 79.61 | 72.24 |
+| 8 | 98.17 | 94.80 |
+| 16 | 111.99 | 117.71 |
+
+Crossover is between 8 and 16 clients. Note the gain over a static
+always-on-drafter policy is only ~5%, at 16 clients only - this is a real
+effect but a small one, and it is reported as such.
+
+Caveat: llama-server cannot toggle speculation per request. The schema fields
+`speculative.n_max` / `n_min` sit behind `#if 0` in
+`tools/server/server-schema.cpp` (one of them also has a syntax error - a
+missing closing paren on line 205 - which is presumably why it was disabled),
+and the decode path reads `params_base.speculative` rather than per-task
+params. Acting on the load policy today needs two backends.
+
+## The per-row cost, localised but not yet explained
+
+Marginal cost of an extra drafted row is ~3.5 ms. What it is not:
+
+- not attention or KV traffic: ms/step is identical at 5-token and 1625-token
+  context (49.89 vs 50.16, 58.38 vs 58.31, 62.48 vs 62.33)
+- not the drafter running per row: doubling drafter size 603 MB -> 1.10 GB
+  (1.75x) moved the slope only 3.51 -> 3.70 ms/row (1.05x). The drafter is
+  swept once per step, as designed - its size shows up in the base instead
+  (48.70 -> 51.27 ms, and the 0.5 GB delta is 2.7 ms at 184.6 GB/s)
+- not the verify matmul: mul_mat_vec_q grows only 10% from 2 to 5 columns
+
+3.5 ms at 184.6 GB/s is 0.646 GB. The output head is 0.592 GB. The head remains
+the best fit for the residual, in a path that is not getting mmvq's column
+amortisation. Open.
+
+This matters because it is the whole single-stream ceiling: with the per-row
+cost removed, the v1 drafter's already-measured 90.18% acceptance would give
+(1 + 4*0.9) / 0.0363 = ~100 tok/s single-stream with no new model trained.

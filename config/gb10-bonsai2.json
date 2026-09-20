@@ -1,0 +1,132 @@
+{
+  "$comment": "Measured tuning profile. Every value below was measured on an idle NVIDIA GB10 and carries its provenance. Nothing here is extrapolated or guessed. Re-generate with: pulse tune",
+  "hardware": {
+    "name": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "sms": 48,
+    "unified_memory_gb": 121.7,
+    "peak_bandwidth_gbs": 273.0,
+    "measured_sustained_bandwidth_gbs": 184.6,
+    "provenance": "bench_gb10_streaming on an idle GPU; peak is the vendor figure"
+  },
+  "model": {
+    "target": "Ternary-Bonsai-2-27B-PQ2_0.gguf",
+    "format": "PQ2_0",
+    "bytes": 6700000000,
+    "irreducible_sweep_ms_at_batch1": 36.3,
+    "provenance": "6.70 GB / 184.6 GB/s. Confirmed: no-drafter batch-1 decode measures 27.54 tok/s = 36.3 ms/token"
+  },
+  "launch_flags": {
+    "flash_attn": "on",
+    "n_gpu_layers": 99,
+    "n_gpu_layers_draft": 999,
+    "batch": 4096,
+    "ubatch": 512,
+    "ubatch_provenance": "ubatch 1024 measured worse than 512 on prefill (389 vs 656 tok/s). Do not raise.",
+    "batch_provenance": "prompts above 2048 tokens fail with the default batch size"
+  },
+  "parallel_slots": {
+    "recommended": 16,
+    "default_in_llama_server": 4,
+    "provenance": "true batched decode scales 27.54 -> 133.08 tok/s from B=1 to B=16 (llama-batched-bench). llama-server defaults to n_slots=4, which saturates at 73.08 tok/s aggregate with 16 clients; 16 slots reaches 117.71."
+  },
+  "drafters": {
+    "v1": {
+      "file": "Ternary-Bonsai-2-27B-dspark-dflash-Q4_0.gguf",
+      "bytes": 631713664,
+      "block_size": 4,
+      "optimal_k": 3,
+      "measured": {
+        "toks_sec": 62.98,
+        "acceptance": 0.9018,
+        "repeats": 5,
+        "spread_toks_sec": 0.62
+      },
+      "note": "deterministic at temp 0: acceptance identical across 5 repeats"
+    },
+    "v2": {
+      "file": "Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf",
+      "bytes": 1104605632,
+      "block_size": 7,
+      "optimal_k": 7,
+      "measured": {
+        "median_toks_sec": 63.83,
+        "min": 59.72,
+        "max": 70.82,
+        "acceptance": 0.6859,
+        "repeats": 5
+      }
+    },
+    "recommended": "v1",
+    "recommended_provenance": "v1 gives up ~1.7 tok/s of median throughput and buys 21 points of acceptance and an 18x tighter spread"
+  },
+  "k_policy": {
+    "rule": "never request K above the drafter's block_size",
+    "provenance": "K=5 and K=7 are byte-identical to K=4 with the v1 drafter (4.03 tok/step, 77.52% acceptance, 62.5 ms/step). --spec-draft-n-max past block_size is a no-op."
+  },
+  "speculation_by_load": {
+    "rule": "speculate at low concurrency, disable at high concurrency",
+    "crossover_clients": 12,
+    "measured_curve": [
+      {
+        "clients": 1,
+        "with_drafter": 40.71,
+        "no_drafter": 26.46
+      },
+      {
+        "clients": 2,
+        "with_drafter": 56.48,
+        "no_drafter": 44.09
+      },
+      {
+        "clients": 4,
+        "with_drafter": 79.61,
+        "no_drafter": 72.24
+      },
+      {
+        "clients": 8,
+        "with_drafter": 98.17,
+        "no_drafter": 94.8
+      },
+      {
+        "clients": 16,
+        "with_drafter": 111.99,
+        "no_drafter": 117.71
+      }
+    ],
+    "provenance": "bench/conc.py against a 16-slot server, 128 tokens per request, temperature 0",
+    "caveat": "llama-server cannot toggle speculation per request: the schema fields speculative.n_max / n_min are compiled out behind '#if 0' in tools/server/server-schema.cpp, and the decode path reads params_base.speculative. Acting on this policy currently requires two backends."
+  },
+  "known_negative_results": {
+    "cuda_graphs": "GGML_CUDA_GRAPHS=ON measured 61.84 vs 62.40 tok/s - no effect. Graphs are disabled at runtime because Gated DeltaNet nodes fail ggml_cuda_graph_check_compability.",
+    "ptq1_0_target": "smaller target measured 22% slower (51.73 vs 65.96 tok/s)",
+    "kv_quant_q8_0": "65.53 vs 66.59 f16 - slightly worse",
+    "ngram_stacking": "counters byte-identical to the drafter alone; never engaged",
+    "batched_lm_head_kernel": "no gain available. mul_mat_vec_q already amortises the weight read across ncols_dst; measured +10% kernel time for 2.5x the columns."
+  },
+  "vs_stock_defaults": {
+    "$comment": "Measured today, idle GB10, same model, same harness (bench/conc.py), 128 tokens/request, temp 0.",
+    "stock": "llama-server -m <model> -ngl 99 -c 65536  (n_slots=4, no drafter, no -fa)",
+    "tuned": "pulse serve  (16 slots, -fa on, -ub 512, drafter by load policy)",
+    "results": [
+      {
+        "clients": 1,
+        "stock": 26.58,
+        "pulse": 40.71,
+        "speedup": 1.53
+      },
+      {
+        "clients": 4,
+        "stock": 72.93,
+        "pulse": 79.61,
+        "speedup": 1.09
+      },
+      {
+        "clients": 16,
+        "stock": 73.08,
+        "pulse": 117.71,
+        "speedup": 1.61
+      }
+    ]
+  }
+}
