@@ -2415,3 +2415,84 @@ and objective problem, not a capacity problem.**
 
 That is a firmer basis for "do not run the retrain" than Round 25 had, and it
 arrives at the same answer from the opposite direction.
+
+---
+
+# Round 33 - the engine loader corrects the output-head arithmetic
+
+Pulse now reads the model file directly (`src/engine/gguf.cpp` ->
+`src/engine/gguf.h`, `bin/pulse-gguf`, `bin/pulse-dequant`). The first thing
+ground truth did was contradict an earlier round.
+
+## What the file says
+
+| | |
+|---|---|
+| `output.weight` dims | 5120 x 248320 = **1,271,398,400** elements |
+| stored type | **142 = `GGML_TYPE_PQ2_0`** |
+| stored size | **337,715,200 bytes = 0.338 GB (0.315 GiB)** |
+| bits per weight | **2.125** (128 weights per block, one fp16 scale + 32 bytes) |
+
+## The correction
+
+Round 14 hypothesised that the output head explains the residual per-row cost of
+speculative verification:
+
+> "a 4-bit head is 0.592 GB ... 0.592 GB / 184.6 GB/s = **3.21 ms per row**,
+> which almost exactly accounts for the residual"
+
+Two problems.
+
+**Units.** 0.592 is GiB, not GB. A 4-bit head of this shape is 0.636 GB /
+0.592 GiB, and the f16 figure quoted as 2.368 GB is likewise 2.368 GiB /
+2.543 GB. The arithmetic was right; the labels were not.
+
+**Substance, and this one matters.** The calculation used a **4-bit** head. This
+model's head is **PQ2_0 at 2.125 bits**, so it is 0.338 GB, not 0.636 GB. The
+real per-row head read is:
+
+    0.338 GB / 216 GB/s = 1.56 ms      (1.83 ms at the old 184.6 figure)
+
+against a residual of roughly `4.47 - 1.1 = 3.37 ms/row`. **The head explains
+about 46% of the residual, not "almost exactly" all of it.** The remaining
+~1.8 ms/row is still unattributed.
+
+The cuBLAS comparison in the same section is unaffected in ratio - it compared
+f16 against 4-bit and both scale together - but its absolute GB figures should
+be read as GiB.
+
+## How the weights were verified
+
+`bin/pulse-dequant` implements PQ2_0 dequantisation independently, including its
+own fp16 -> fp32 conversion, then compares against ggml's own
+`dequantize_row_pq2_0` linked from `libggml-base.so`, element by element.
+
+| tensor | elements | bitwise mismatches |
+|---|---|---|
+| `blk.0.attn_qkv.weight` | 52,428,800 | **0** |
+| `output.weight` | 1,271,398,400 | **0** |
+| `token_embd.weight` | 1,271,398,400 | **0** |
+| `blk.32.ffn_down.weight` | 89,128,960 | **0** |
+
+Every dequantised value also lands in `{-d, 0, d, 2d}` as the codec requires.
+2.7 billion elements compared, zero mismatches.
+
+## Architecture, confirmed from the file
+
+The hybrid layout is as documented, though the tensor names invert the obvious
+reading:
+
+- **48 layers** carry `attn_qkv` **plus** `ssm_a`, `ssm_alpha`, `ssm_beta`,
+  `ssm_dt.bias`, `ssm_norm`, `ssm_out`. These are the **Gated DeltaNet / SSM**
+  layers; `attn_qkv` is the SSM's own projection.
+- **16 layers** - 3, 7, 11 ... 63 - carry `attn_q`, `attn_k`, `attn_v`,
+  `attn_output` and q/k norms, and no `ssm_*`. These are the **full attention**
+  layers.
+
+That matches `qwen35.full_attention_interval = 4` exactly. Also confirmed from
+metadata: `block_count = 64`, `context_length = 262144`, `embedding_length =
+5120`, `rope.dimension_sections` present (mRoPE, the documented reason
+`--cache-reuse` is unavailable), and the `prism.hadamard.*` keys behind the
+Hadamard transforms counted in the decode step.
+
+Architecture string is `qwen35`.
