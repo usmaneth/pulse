@@ -11,7 +11,14 @@ export interface ServerConfig {
 export class PulseServer {
   private readonly config: ServerConfig;
   private readonly jev: JevDecisionClient;
-  private readonly nativeEngine = new NativePulseEngine();
+  // OPT-IN via PULSE_NATIVE_ENGINE=1. This is not an inference engine:
+  // src/cuda/speculative_engine.cu runs real CUDA kernels over SYNTHETIC
+  // weights. It never opens the GGUF - there is no file I/O in it at all - so
+  // its numbers are kernel timings, not inference. Nothing in the request path
+  // calls it, yet constructing it held 1,264 MiB of unified memory on a box
+  // where memory bandwidth is the binding constraint. Left off by default.
+  private readonly nativeEngine =
+    process.env.PULSE_NATIVE_ENGINE === '1' ? new NativePulseEngine() : null;
   private server: http.Server | null = null;
 
   private totalRequests = 0;
@@ -144,7 +151,7 @@ export class PulseServer {
   }
 
   stop(): Promise<void> {
-    this.nativeEngine.destroy();
+    this.nativeEngine?.destroy();
     return new Promise((resolve) => {
       if (this.server) {
         this.server.close(() => resolve());
