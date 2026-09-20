@@ -3065,3 +3065,86 @@ above it dispatch falls to MMQ with a ~65 ms base against `mul_mat_vec_q`'s
 project**, and it is confined to the batched regime - speculative decoding at
 K >= 8, multi-client serving, and wide verification. Single-stream decode
 remains parity at best, tested five ways.
+
+---
+
+# Round 42 - CORRECTION: the batch-8 cliff is not llama.cpp's weakness
+
+Round 41 concluded that Pulse's lack of a batch-8 threshold was "the one
+measured, defensible advantage over llama.cpp in this project". That conclusion
+was wrong, and this round withdraws it.
+
+## What Round 41 measured, and why it misled
+
+Round 41b timed **one layer plus the output head** and found 4.01x amortisation
+over 16 columns. The output head is 337 MB and dominated that total at 4.51x.
+The per-layer tensors managed only 2.0-2.7x.
+
+Measured across the **full 6.80 GB decode weight set** - every PQ2_0 tensor in
+the model, which is what a real step touches:
+
+| | NC=1 | NC=16 | amortisation |
+|---|---|---|---|
+| full weight set (6.80 GB) | 23.99 ms | 161.59 ms | **2.38x** |
+
+Not 4.01x. Round 41b generalised from a sample the head dominated.
+
+## And llama.cpp scales better
+
+| | Pulse (matvec only) | llama.cpp (full step) |
+|---|---|---|
+| batch 1 | 23.99 ms -> 41.69 tok/s | 27.54 tok/s |
+| batch 16 | 161.59 ms -> **99.02 tok/s** | **133.08 tok/s** |
+| scaling 1 -> 16 | **2.38x** | **4.83x** |
+
+**llama.cpp's entire step at batch 16 is faster than Pulse's matvecs alone.**
+Its scaling is 2x better.
+
+## Why - and it reframes the cliff entirely
+
+MMQ is not a penalty llama.cpp suffers above 8 columns. **It is a different and
+better algorithm for that regime**, and the dispatch at
+`MMVQ_MAX_BATCH_SIZE = 8` is llama.cpp choosing correctly.
+
+`mul_mat_vec_q` is a mat-VEC kernel: one warp per output row, accumulators in
+registers, activation re-read per row. That is right at batch 1 and degrades as
+columns grow, because NC accumulators per warp cut occupancy and nothing reuses
+the activation across rows.
+
+MMQ is a tiled GEMM: it stages tiles in shared memory and reuses both operands
+across a tile. That is the right shape once there is a batch dimension to
+exploit, and it is why its higher base (65 ms vs 36.6) is repaid immediately.
+
+Pulse's `pq2_matvec_batched<NC>` is the first kind. It has no cliff because it
+never switches algorithms - which is a **limitation, not a feature**. Round 41
+read the absence of a discontinuity as an advantage when it is the signature of
+using one mediocre kernel everywhere instead of two good ones.
+
+## Where this leaves the comparison
+
+There is now no measured regime in which Pulse beats llama.cpp on throughput:
+
+| regime | result |
+|---|---|
+| single-stream decode | parity at best, tested five ways |
+| batched decode | **llama.cpp wins, 2x better scaling** |
+
+The remaining advantages are genuinely capability rather than speed, and they
+survive this correction because they are not throughput claims:
+
+1. **CUDA graphs** work here; llama.cpp's GDN nodes fail its graph compatibility
+   check, so `GGML_CUDA_GRAPHS=ON` measured as a no-op in Round 5.
+2. **Text-path position shifting** via owned RoPE - the `--cache-reuse`
+   llama.cpp refuses for any `n_pos_per_embd() > 1` model, which costs a full
+   re-prefill on every mid-context edit.
+
+## The lesson, since it is the same one as Round 33
+
+Round 41's sample was one layer and the head. The head is 337 MB of a 6.80 GB
+model - 5% of the weights - and it carried the result. Measuring the full set
+took one extra command and reversed the conclusion.
+
+Round 33 made the identical error in the other direction, attributing a residual
+to the head based on a head size that was wrong. **Anything involving
+`output.weight` needs the whole model measured, because that one tensor is large
+enough and unusual enough to dominate any sample it appears in.**
