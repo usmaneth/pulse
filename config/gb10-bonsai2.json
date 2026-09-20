@@ -458,5 +458,47 @@
     },
     "cache_ram_default_mib": 8192,
     "cache_ram_warning": "KV at 256k is 17 GB, more than double the default prompt-cache budget. Raise --cache-ram for long-context deployments."
+  },
+  "slot_checkpointing": {
+    "$comment": "Mitigation for the mid-context-edit cliff, since --cache-reuse cannot be enabled on this model (mRoPE).",
+    "mechanism": "POST /slots/:id?action=save|restore, enabled with --slot-save-path",
+    "works_on_this_model": true,
+    "why_it_works_when_cache_reuse_does_not": "save/restore dumps state verbatim and never shifts positions, so the mRoPE K-shift restriction does not apply",
+    "measured": [
+      {
+        "ctx": 512,
+        "save_ms": 94.3,
+        "restore_ms": 28.5,
+        "size_mb": 190.7
+      },
+      {
+        "ctx": 2048,
+        "save_ms": 142.9,
+        "restore_ms": 48.4,
+        "size_mb": 291.4
+      },
+      {
+        "ctx": 8192,
+        "save_ms": 288.9,
+        "restore_ms": 90.8,
+        "size_mb": 694.2
+      }
+    ],
+    "size_model": "157 MB fixed (Gated DeltaNet recurrent state) + 64 KB/token",
+    "restore_bandwidth_gbs": 7.6,
+    "vs_mid_edit_reprefill": {
+      "at_8k": {
+        "reprefill_ms": 8702,
+        "restore_ms": 90.8,
+        "speedup": 96
+      },
+      "at_256k_projected": {
+        "reprefill_s": 420,
+        "restore_s": 2.3,
+        "speedup": 180
+      }
+    },
+    "bound": "converts a mid-edit into restore + prefill-from-divergence, so the win depends on where the edit lands. Near the tail it is nearly free; at the very start it saves nothing.",
+    "retention_cost": "157 MB + 64 KB/token per checkpoint; at 256k that is 17.2 GB each"
   }
 }

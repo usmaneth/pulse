@@ -1647,3 +1647,57 @@ tuning win: it is a 36x difference on a common operation that llama.cpp cannot
 currently address for this architecture. Handling it needs either per-boundary
 state snapshots that can be rolled back to (Inco's `StateCache` approach) or
 mRoPE-aware K-shifting, neither of which exists upstream today.
+
+---
+
+# Round 21 - slot checkpointing solves the mid-edit cliff
+
+Round 20b established that any edit before the tail costs a full re-prefill
+(~8700 ms at 8k) and that `--cache-reuse` cannot be enabled on this model
+because mRoPE refuses K-shift.
+
+llama.cpp has a second mechanism that does **not** depend on shifting:
+`POST /slots/:id?action=save|restore`, gated on `--slot-save-path`. Saving and
+restoring dumps state verbatim, so the mRoPE limitation does not apply.
+
+**It works on this model.** Measured:
+
+| ctx tokens | save ms | restore ms | checkpoint size |
+|---|---|---|---|
+| 512 | 94.3 | 28.5 | 190.7 MB |
+| 2048 | 142.9 | 48.4 | 291.4 MB |
+| 8192 | 288.9 | **90.8** | 694.2 MB |
+
+Size fits `157 MB fixed + 64 KB/token` - the fixed part is the Gated DeltaNet
+recurrent state, which is why a 12-token checkpoint is already 157 MB. Restore
+runs at roughly 7.6 GB/s.
+
+## The comparison that matters
+
+| operation at 8k | cost |
+|---|---|
+| append-only (existing prompt cache) | 242 ms |
+| mid-context edit, today | **8702 ms** |
+| **restore a checkpoint** | **90.8 ms** |
+
+**96x** on the mid-edit case. Projected to 256k, a 17.2 GB checkpoint restores in
+~2.3 s against roughly 7 minutes of re-prefill - about **180x**.
+
+`--cache-ram -1` alone does **not** help: the Round 20b run already used it and
+the mid-edit case still cost 8702 ms.
+
+## The bound, stated honestly
+
+Checkpointing converts a mid-edit into `restore + prefill-from-divergence`. The
+saving therefore depends on **where** the edit lands:
+
+- edit near the tail -> nearly free
+- edit at the very start -> saves nothing
+
+For the common agent pattern (append, with occasional edits to *recent*
+context), a checkpoint per turn makes most edits cheap. Retention costs
+`157 MB + 64 KB/token` per checkpoint, so keeping many of them at long context
+is not free - at 256k each is 17.2 GB.
+
+This is the mechanism Inco's `StateCache` implements natively. llama.cpp already
+exposes the primitive; nothing in this repo was using it.
