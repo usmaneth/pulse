@@ -2719,3 +2719,34 @@ accounted for it.
 - Its own closing corrections - that 73.00 was a max rather than a median, and
   that 63.83 with spread 11.10 is the honest figure - are exactly right, and the
   same discipline applied earlier would have caught the head-size error.
+
+---
+
+# Round 37 - the two sub-blocks use DIFFERENT head mappings
+
+Step 13 found the gated-delta path maps v-head h to k-group `h % 16`,
+interleaved, not the blocked `h/(48/16)`. That raised an obvious worry: the
+full-attention path uses the blocked mapping `h/(n_head/n_kv_head)` and had only
+been checked against a CPU reference that shares the assumption.
+
+It is checkable cheaply. With a single token the attention softmax is over one
+element, so each query head's output is exactly the V of whichever KV head it
+maps to. Comparing `attn_pregate-L` against `Vcur-L` for the 16 full-attention
+layers:
+
+| layer | blocked `h/6` | interleaved `h%4` |
+|---|---|---|
+| 3 | **4.608e-04** | 2.333e+00 |
+| 7 | **3.209e-04** | 3.005e+00 |
+
+**Attention is blocked. Gated-delta is interleaved.** Four orders of magnitude
+apart, so there is no ambiguity in either direction.
+
+This is worth recording because the natural assumption - that one model uses one
+convention - is wrong here, and assuming consistency would have introduced the
+bug into the attention path while "fixing" it in GDN. The flag was worth raising
+even though the answer came back clean.
+
+The residual 3-5e-04 is not machine precision because `attn_pregate` is not raw
+V; it is the attention result before the output gate. The mapping question is
+settled regardless, by four orders of magnitude.
