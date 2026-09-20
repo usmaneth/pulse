@@ -81,9 +81,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "=======================================================\n";
-    std::cout << " Dynamic Multi-Format Dispatch verified on NVIDIA GB10!\n";
-    std::cout << " • Dense 27B Ternary Decode: ~141 tok/s\n";
-    std::cout << " • Sparse MoE 35B NVFP4 Decode: ~525 tok/s\n";
+    std::cout << " Kernel dispatch microbenchmark complete on NVIDIA GB10.\n";
+    std::cout << " NOTE: the step times above are real cudaEvent measurements of the\n";
+    std::cout << " dispatch graph only (one GEMV + scan kernel). They are NOT end-to-end\n";
+    std::cout << " model inference. For real decode throughput run: bench/sweep.py\n";
     std::cout << "=======================================================\n";
 
     return 0;

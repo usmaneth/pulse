@@ -1,6 +1,5 @@
 #include "speculative_engine.hpp"
 #include <iostream>
-#include <chrono>
 
 namespace pulse {
 
@@ -122,6 +121,8 @@ SpeculativeEngine::~SpeculativeEngine() {
 
     if (draft_ready_event_) cudaEventDestroy(draft_ready_event_);
     if (verify_ready_event_) cudaEventDestroy(verify_ready_event_);
+    if (step_start_) cudaEventDestroy(step_start_);
+    if (step_stop_) cudaEventDestroy(step_stop_);
     if (compute_stream_) cudaStreamDestroy(compute_stream_);
     if (draft_stream_) cudaStreamDestroy(draft_stream_);
 }
@@ -134,6 +135,8 @@ bool SpeculativeEngine::initialize() {
 
     cudaEventCreateWithFlags(&draft_ready_event_, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&verify_ready_event_, cudaEventDisableTiming);
+    cudaEventCreate(&step_start_);
+    cudaEventCreate(&step_stop_);
 
     cudaMalloc(&d_hidden_states_, QWEN_HIDDEN_DIM * (MAX_SPECULATION_K + 1) * sizeof(float));
     cudaMalloc(&d_draft_hidden_states_, QWEN_HIDDEN_DIM * sizeof(float));
@@ -227,7 +230,7 @@ bool SpeculativeEngine::capture_cuda_graph(uint32_t k) {
 SpeculativeStepResult SpeculativeEngine::step(uint32_t k, ExecutionPhase phase) {
     if (!initialized_) initialize();
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(step_start_, compute_stream_);
 
     for (uint32_t i = 0; i < k; ++i) {
         h_draft_tokens_[i] = 1000 + i;
@@ -273,17 +276,10 @@ SpeculativeStepResult SpeculativeEngine::step(uint32_t k, ExecutionPhase phase) 
     cudaMemcpyAsync(emitted.data(), d_committed_tokens_, (k + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, compute_stream_);
     cudaStreamSynchronize(compute_stream_);
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double step_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    double target_forward_ms = 35.35;
-    if (arch_ == ModelArchitecture::SPARSE_MOE_35B) {
-        target_forward_ms = 9.5; // 1.68 GB active weight sweep
-    } else if (format_ == ModelFormat::NVFP4) {
-        target_forward_ms = 86.3; // 15.2 GB dense NVFP4 sweep
-    }
-
-    double total_step_ms = step_ms + target_forward_ms;
+    cudaEventRecord(step_stop_, compute_stream_);
+    cudaEventSynchronize(step_stop_);
+    float gpu_ms = 0.0f;
+    cudaEventElapsedTime(&gpu_ms, step_start_, step_stop_);
 
     int32_t accepted_count = *h_accepted_count_;
     emitted.resize(accepted_count);
@@ -292,15 +288,19 @@ SpeculativeStepResult SpeculativeEngine::step(uint32_t k, ExecutionPhase phase) 
     total_drafted_tokens_ += k;
     total_accepted_tokens_ += (accepted_count > 0) ? (accepted_count - 1) : 0;
 
-    last_step_toks_per_sec_ = (accepted_count / (total_step_ms / 1000.0));
+    if (gpu_ms > 0.0f) {
+        last_step_toks_per_sec_ = accepted_count / (gpu_ms / 1000.0);
+    } else {
+        last_step_toks_per_sec_ = 0.0;
+    }
 
     SpeculativeStepResult result;
     result.draft_tokens_count = k;
     result.accepted_tokens_count = accepted_count;
     result.emitted_token_ids = emitted;
-    result.step_wall_ms = total_step_ms;
-    result.verify_kernel_ms = target_forward_ms;
-    result.draft_kernel_ms = step_ms;
+    result.step_wall_ms = gpu_ms;
+    result.verify_kernel_ms = gpu_ms;
+    result.draft_kernel_ms = 0.0;
     result.active_kernel_path = get_active_kernel_name();
     return result;
 }
@@ -308,7 +308,7 @@ SpeculativeStepResult SpeculativeEngine::step(uint32_t k, ExecutionPhase phase) 
 SpeculativeStepResult SpeculativeEngine::step_pipelined(uint32_t k, ExecutionPhase phase) {
     if (!initialized_) initialize();
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(step_start_, compute_stream_);
 
     int32_t* current_draft = ping_pong_state_ ? d_draft_tokens_pong_ : d_draft_tokens_ping_;
     int32_t* current_target = ping_pong_state_ ? d_target_argmax_pong_ : d_target_argmax_ping_;
@@ -358,17 +358,10 @@ SpeculativeStepResult SpeculativeEngine::step_pipelined(uint32_t k, ExecutionPha
     cudaMemcpyAsync(emitted.data(), d_committed_tokens_, (k + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, compute_stream_);
     cudaStreamSynchronize(compute_stream_);
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double step_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    double target_forward_ms = 35.35;
-    if (arch_ == ModelArchitecture::SPARSE_MOE_35B) {
-        target_forward_ms = 9.5; // 1.68 GB active weight sweep -> 470+ tok/s
-    } else if (format_ == ModelFormat::NVFP4) {
-        target_forward_ms = 86.3; // 15.2 GB dense NVFP4 sweep
-    }
-
-    double total_step_ms = target_forward_ms + (step_ms * 0.05);
+    cudaEventRecord(step_stop_, compute_stream_);
+    cudaEventSynchronize(step_stop_);
+    float gpu_ms = 0.0f;
+    cudaEventElapsedTime(&gpu_ms, step_start_, step_stop_);
 
     int32_t accepted_count = *h_accepted_count_;
     emitted.resize(accepted_count);
@@ -377,15 +370,20 @@ SpeculativeStepResult SpeculativeEngine::step_pipelined(uint32_t k, ExecutionPha
     total_drafted_tokens_ += k;
     total_accepted_tokens_ += (accepted_count > 0) ? (accepted_count - 1) : 0;
 
-    last_step_toks_per_sec_ = (accepted_count / (total_step_ms / 1000.0));
+    if (gpu_ms > 0.0f) {
+        last_step_toks_per_sec_ = accepted_count / (gpu_ms / 1000.0);
+    } else {
+        last_step_toks_per_sec_ = 0.0;
+    }
+
     ping_pong_state_ = !ping_pong_state_;
 
     SpeculativeStepResult result;
     result.draft_tokens_count = k;
     result.accepted_tokens_count = accepted_count;
     result.emitted_token_ids = emitted;
-    result.step_wall_ms = total_step_ms;
-    result.verify_kernel_ms = target_forward_ms;
+    result.step_wall_ms = gpu_ms;
+    result.verify_kernel_ms = gpu_ms;
     result.draft_kernel_ms = 0.0;
     result.active_kernel_path = get_active_kernel_name();
     return result;
@@ -417,3 +415,45 @@ double SpeculativeEngine::get_cumulative_acceptance_rate() const {
 }
 
 } // namespace pulse
+
+extern "C" {
+
+void* pulse_engine_create(int format, int arch, int k) {
+    pulse::ModelFormat fmt = static_cast<pulse::ModelFormat>(format);
+    pulse::ModelArchitecture ar = static_cast<pulse::ModelArchitecture>(arch);
+    pulse::SpeculativeEngine* engine = new pulse::SpeculativeEngine(fmt, ar, static_cast<uint32_t>(k));
+    if (!engine->initialize()) {
+        delete engine;
+        return nullptr;
+    }
+    return static_cast<void*>(engine);
+}
+
+void pulse_engine_destroy(void* h) {
+    if (h) {
+        delete static_cast<pulse::SpeculativeEngine*>(h);
+    }
+}
+
+int pulse_engine_step(void* h, int k, int* out_tokens, int max_out, double* out_step_ms) {
+    if (!h) return 0;
+    pulse::SpeculativeEngine* engine = static_cast<pulse::SpeculativeEngine*>(h);
+    pulse::SpeculativeStepResult result = engine->step_pipelined(static_cast<uint32_t>(k));
+    int count = static_cast<int>(result.emitted_token_ids.size());
+    int copy_count = (count < max_out) ? count : max_out;
+    for (int i = 0; i < copy_count; ++i) {
+        out_tokens[i] = result.emitted_token_ids[i];
+    }
+    if (out_step_ms) {
+        *out_step_ms = result.step_wall_ms;
+    }
+    return copy_count;
+}
+
+double pulse_engine_last_rate(void* h) {
+    if (!h) return 0.0;
+    pulse::SpeculativeEngine* engine = static_cast<pulse::SpeculativeEngine*>(h);
+    return engine->get_last_step_toks_per_sec();
+}
+
+} // extern "C"

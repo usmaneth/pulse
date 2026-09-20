@@ -57,11 +57,13 @@ private:
     std::unique_ptr<MemoryGovernor> governor_;
     TensorParallelConfig tp_config_{};
 
-    cudaStream_t compute_stream_{nullptr};
+cudaStream_t compute_stream_{nullptr};
     cudaStream_t draft_stream_{nullptr};
 
     cudaEvent_t draft_ready_event_{nullptr};
     cudaEvent_t verify_ready_event_{nullptr};
+    cudaEvent_t step_start_{nullptr};
+    cudaEvent_t step_stop_{nullptr};
 
     cudaGraph_t speculative_graph_{nullptr};
     cudaGraphExec_t graph_exec_{nullptr};
