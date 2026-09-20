@@ -1353,3 +1353,84 @@ at 1854) on a different prompt. Both are real; acceptance is content-dependent
 across a measured 21%-96% range. It is a property of the workload, not of the
 drafter, and any single acceptance figure quoted without its prompt is close to
 meaningless.
+
+---
+
+# Round 17 - the context/KV model, validated, and the 256k roadmap
+
+## Corrected KV geometry
+
+Read from the model's own tensors rather than assumed:
+
+    16 attention layers (every 4th of 64 - it is a hybrid)
+    x 4 kv heads x (key_length 256 + value_length 256) x 2 bytes
+    = 64 KB per token
+
+Earlier rounds used 262 KB/token, which was ~4x too high and made the KV story
+look more urgent at short context than it is.
+
+| context | KV | vs the 6.70 GB model |
+|---|---|---|
+| 16k | 1.07 GB | 16% |
+| 64k | 4.29 GB | 64% |
+| 128k | 8.59 GB | 128% |
+| 256k | **17.18 GB** | **256%** |
+
+The model's trained `context_length` is **262144**, so 256k is in range. 1M is
+not - and would need 65 GB of KV regardless.
+
+## A validated bandwidth model
+
+    step_GB = 6.70 + ctx x 64KB
+    step_ms = step_GB / 216 GB/s
+    tok/s   = (1000 / step_ms) x 0.87        <- the measured software-gap factor
+
+Measured with `llama-batched-bench` in a **single process** (model resident, so
+no cold-start confound), `-c 200000 -b 131072` fixed across all points:
+
+| context | predicted x0.87 | measured | ratio |
+|---|---|---|---|
+| 16384 | 24.2 | **24.26** | 1.00 |
+| 65536 | 17.1 | **16.50** | 0.97 |
+
+Two independent points within 3%. The model is trustworthy for projection.
+
+## Below ~16k, context does not resolve
+
+| ctx | 128 | 256 | 512 | 1024 | 4096 | 16384 |
+|---|---|---|---|---|---|---|
+| tok/s | 26.37 | 19.08 | 17.40 | 12.40 | 14.04 | 24.26 |
+
+Non-monotonic, swinging 2.1x with no relation to context. Below 16k the KV term
+is under 16% of the step and the measurement noise exceeds the effect. **Do not
+read a context trend into these rows.** Only the 16k and 64k points are
+resolvable, and both match prediction.
+
+Related: a warm `ab.py` run at ~4k context produced a **92.2% spread**
+(14.93-41.15 tok/s over four runs on an idle GPU) against 1.6% at ~1.5k. Long
+context on this box is not merely slower, it is erratic.
+
+## The 256k roadmap
+
+At 256k a step must read 6.70 GB of weights **plus 17.18 GB of KV** = 23.88 GB,
+which is 110.6 ms at 216 GB/s, i.e. **7.9 tok/s** after the software factor.
+Speculation amortises the whole read - weights and KV alike:
+
+| configuration | tok/s at 256k |
+|---|---|
+| no drafter | 7.9 |
+| 5.74 tok/step (block 7 @ 69% acceptance) | 45 |
+| 6.95 tok/step (block 7 @ 85%) | 55 |
+| **5.74 tok/step + 6x KV compression** | **113** |
+
+**Path A** (drafter only) lands at 45-55 tok/s and requires holding >=70%
+acceptance at 256k. Acceptance currently *falls* with context (74.59% at 1.5k,
+50.00% at 4k), so this is a drafter-training problem.
+
+**Path B** (KV compression) clears 50-70 comfortably and is independent of
+drafter quality. At 256k the KV is 2.6x the model, so compressing it is the
+dominant term - the opposite of the situation below 8k, where an earlier round
+correctly found KV compression worth approximately nothing.
+
+This supersedes the earlier dismissal of TurboQuant-class KV compression. That
+dismissal was right for <=8k and wrong for long context.
