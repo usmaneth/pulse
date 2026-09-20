@@ -124,8 +124,12 @@ function buildServerArgs(profile, opts) {
     a.push('--spec-type', profile.spec_type?.recommended ?? 'draft-dspark');
     a.push('--spec-ngram-simple-size-m', '4');
     a.push('--spec-ngram-simple-size-n', '3');
-    // never request more than the drafter's block size: past it, K is a no-op
-    a.push('--spec-draft-n-max', String(Math.min(opts.k ?? d.optimal_k, d.block_size)));
+    // Run the server at the drafter's block size, which is also the measured
+    // single-stream optimum. Past the block size K is a no-op. A request can
+    // only LOWER K below this ceiling, so setting the ceiling here is what
+    // gives per-request K any room at all (see src/jev/client.ts for the
+    // measured per-workload policy, and bench/kcurve.py for the curve).
+    a.push('--spec-draft-n-max', String(opts.k ? Math.min(opts.k, d.block_size) : d.block_size));
     a.push('-ngld', String(f.n_gpu_layers_draft));
   }
   return { argv: a, drafter: drafterKey, d, kvType };

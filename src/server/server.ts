@@ -70,12 +70,16 @@ export class PulseServer {
               engine: 'pulse',
               version: '1.0.0',
               target_device: 'NVIDIA GB10 (48 SMs, sm_121, 128 GB unified LPDDR5X)',
-              role: 'HTTP proxy with Jev speculation-window routing in front of llama.cpp; not a standalone engine',
+              role: 'HTTP proxy in front of llama.cpp; not a standalone engine. It loads no weights and runs no forward pass.',
               active_streams: this.activeStreams,
               total_requests: this.totalRequests,
               total_tokens_generated: this.totalTokensGenerated,
               peak_decode_toks_per_sec: this.peakTokensPerSec,
-              jev_system_one_decisions_enabled: true,
+              // Accurate rather than flattering: the hot-path K decision is a local
+              // regex, not a Jev call, and llama.cpp ignores per-request K anyway
+              // (`#if 0` in tools/server/server-schema.cpp). See src/jev/client.ts.
+              speculation_k_decision: 'local heuristic, advisory only (backend ignores per-request K)',
+              jev_gateway_used_for: ['memory_admission'],
               checkpoints: this.checkpoints.getStats(),
               last_checkpoint_restore: this.lastCheckpointRestore,
               last_jev_decision: this.lastJevDecision,
@@ -197,18 +201,20 @@ export class PulseServer {
         // prefill measured 211.7 s on this hardware, so this is the single
         // highest-value flag for long-context agentic use. Callers may override.
         cache_prompt: parsed.cache_prompt ?? true,
-        // NOTE: the backend currently IGNORES this. Per-request speculative
-        // parameters are compiled out of llama.cpp's server behind `#if 0`
-        // (tools/server/server-schema.cpp), and the decode path reads
-        // params_base.speculative rather than per-task params. The Jev decision
-        // below is therefore advisory only - it is reported on /status but does
-        // not change backend behaviour until that block is enabled upstream.
+        // LIVE as of patches/llama-per-request-spec-n-max.patch. Stock llama.cpp
+        // compiles per-request speculative params out of its server behind
+        // `#if 0`, so this field used to be discarded. The patch exposes
+        // `speculative.n_max`, aliases it to this name, and applies it in
+        // server_slot::get_n_draft_max(). Measured: n_max=1 -> 37.10 tok/s,
+        // n_max=3 -> 53.09 tok/s, unset -> server default. Against an unpatched
+        // backend the field is simply ignored, so sending it stays safe.
         spec_draft_n_max: kDecision.k,
       };
 
-      // Restore the longest matching checkpoint before forwarding. llama.cpp's own
-      // prompt cache then sees the slot already holds that prefix and prefills
-      // only the divergent tail, instead of re-prefilling from zero.
+      // Restore the longest matching checkpoint before forwarding.
+      // OFF BY DEFAULT: measured 4.2x SLOWER than llama.cpp's own RAM cache
+      // (--cache-ram -1), which already restores evicted slot state natively.
+      // This call is a no-op unless PULSE_CKPT=1. See bench/RESULTS.md Round 23.
       const ckptKey = messages.map((m: { role?: string; content?: string }) =>
         `${m.role ?? ''}:${m.content ?? ''}`).join('\n');
       const restored = await this.checkpoints.restoreBest(ckptKey).catch(() => null);

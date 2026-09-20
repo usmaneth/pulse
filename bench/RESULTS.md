@@ -1841,3 +1841,93 @@ without a measurement on that deployment.
 
 **Use `--cache-ram -1` instead.** It is one flag, it is already in the launcher,
 and it beats the layer built to replace it.
+
+---
+
+# Round 24 - per-request draft depth, and the heuristic that had it backwards
+
+## The blocker
+
+`src/server/server.ts` sent `spec_draft_n_max` on every request and the backend
+threw it away. llama.cpp compiles per-request speculative parameters out of its
+server behind `#if 0` (`tools/server/server-schema.cpp:198`). The dead block also
+does not compile: its `speculative.n_min` entry is missing a closing paren.
+
+A second gap sat below it. `server_slot::get_n_draft_max()` computed only a
+context-fit bound. It never read the task's requested depth, so even an enabled
+schema field would not have reached the decode path.
+
+## The patch
+
+`patches/llama-per-request-spec-n-max.patch`, two changes, 24 lines:
+
+1. `server-schema.cpp` exposes `speculative.n_max` as a live request field,
+   aliased to `spec_draft_n_max`. The `#if 0` block stays disabled, because it
+   also exposes fields that reconfigure the shared speculator. `n_max` is safe
+   alone: the draft params struct already carries it per slot.
+2. `server-context.cpp` applies it in `get_n_draft_max()`.
+
+Verified on the deployed binary:
+
+| request | tok/s |
+|---|---|
+| `speculative.n_max = 4` | 54.11 |
+| `spec_draft_n_max = 4` (alias) | 54.34 |
+| field unset (server ceiling 4) | 54.03 |
+| `speculative.n_max = 2` | 47.53 |
+| `spec_draft_n_max = 2` (alias) | 47.42 |
+
+Canonical and alias agree. Unset matches the ceiling exactly, so the change is
+backward compatible: an omitted field keeps `params_base.speculative`. A request
+can only lower `n_max`, never raise it, so `--spec-draft-n-max` stays the
+operator's ceiling.
+
+**A measurement error, recorded.** The first verification run on the deployed
+binary reported 22.87, 28.53 and 27.55 tok/s and appeared to show the alias
+breaking speculation. That run had no warmup discard and started immediately
+after a CUDA build. It measured a cold machine, which is the exact trap
+documented under *Measurement hygiene*. With 2 warmup requests and 3 repeats the
+effect vanished.
+
+## The K curve, per workload
+
+Now measurable for the first time. `bench/kcurve.py`, v1 drafter (block 4),
+128 tokens, greedy, 3 interleaved repeats, server ceiling raised to 8.
+
+| | K=1 | K=2 | K=3 | K=4 | K=6 | spread |
+|---|---|---|---|---|---|---|
+| code | 36.57 | 46.95 | 52.19 | 56.07 | **56.43** | 0.6-1.7% |
+| schema | 36.74 | 45.51 | **51.14** | 49.22 | 49.22 | 0.1-0.7% |
+| chat | 33.93 | 39.05 | 40.92 | 41.38 | **41.62** | 0.1-1.4% |
+
+Two results:
+
+1. **Everything saturates at K=4**, the drafter's block size. K=5 and above are
+   flat. This independently re-confirms the block-size cap from an unrelated
+   direction.
+2. **Schema peaks at K=3 and loses 3.9% at K=4.** Its spread is 0.1-0.7%, so the
+   drop is real. Code and chat both want the K=4 knee.
+
+## The heuristic was backwards
+
+`src/jev/client.ts` sent structured and schema-like prompts to **K=7**, citing
+"80-87% acceptance, 140-157 tok/s". Those figures were never measured and are
+removed. The measurement wants schema at the *shallowest* of the three depths,
+not the deepest. K=7 also clamped to 4 on the default drafter, so the rule had
+no effect either way.
+
+The policy is now the measured one: schema to K=3, everything else to K=4.
+
+## Honest size of this lever
+
+Against a single global K=4, per-request K is worth **3.9%, and only on
+schema-like traffic**. It is a small win. It is recorded because the mechanism
+was advertised and did not work, not because the number is large.
+
+## Also corrected this round
+
+`decideSpeculationK` never called Jev. It returned strings reading "Jev local
+fast-path" while running a local regex. `/status` advertised
+`jev_system_one_decisions_enabled: true`. Both now state what actually happens:
+the hot-path K decision is a local heuristic, and the gateway is used for memory
+admission.

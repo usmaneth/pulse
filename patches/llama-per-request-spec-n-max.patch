@@ -1,0 +1,91 @@
+From 999b0a9a6f2fb3e3b60bb3d6bbac4b6b0c0f7fd7 Mon Sep 17 00:00:00 2001
+From: usmaneth <usmanasim27@gmail.com>
+Date: Sun, 20 Sep 2026 12:03:04 -0700
+Subject: [PATCH] server: apply a per-request speculative.n_max
+
+The server accepts one draft depth for all traffic. The right depth is
+workload-dependent, so mixed traffic cannot be served well by a single value.
+
+Measured on a GB10 with a block-4 draft model, 128 tokens, greedy sampling,
+3 interleaved repeats (spreads 0.1-1.7%):
+
+              n_max=1  n_max=2  n_max=3  n_max=4
+  code          36.57    46.95    52.19    56.07
+  json schema   36.74    45.51    51.14    49.22
+  chat          33.93    39.05    40.92    41.38
+
+The code prompt wants the deepest draft the block size allows. The schema
+prompt peaks at n_max=3 and loses 3.9% at n_max=4, which is far outside its
+0.1-0.6% spread. One global value cannot serve both.
+
+Two changes:
+
+- server-schema.cpp exposes `speculative.n_max` as a request field. The
+  existing `#if 0` block stays disabled: it also exposes fields that
+  reconfigure the shared speculator, and one of its entries does not compile
+  (the n_min field is missing a closing paren). n_max is safe on its own
+  because it is already carried per slot in the draft params struct.
+- server-context.cpp applies it in server_slot::get_n_draft_max(), which
+  previously computed only a context-fit bound and ignored the task's value.
+
+Backward compatible. task->params.speculative defaults to
+params_base.speculative, so a request that omits the field keeps the
+server-wide value. Verified: with the field unset the server returns 53.17
+tok/s against 53.09 for an explicit n_max=3 at a server default of 3.
+
+A request can only lower n_max below the server's --spec-draft-n-max, never
+raise it, so the flag stays the operator's ceiling.
+---
+ tools/server/server-context.cpp | 13 +++++++++++++
+ tools/server/server-schema.cpp  | 11 +++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7be..8f8006bf5 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -450,6 +450,19 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+         }
+ 
++        // Apply the per-request cap. task->params.speculative defaults to the
++        // server's params_base.speculative, so a request that does not set
++        // speculative.n_max keeps the server-wide value and nothing changes.
++        // This lets one server serve mixed traffic at different draft depths.
++        // Measured on a GB10 with a block-4 draft model, 128 tokens, greedy,
++        // 3 interleaved repeats (spreads 0.1-1.7%): a code prompt gives 36.57
++        // tok/s at n_max=1 and 56.07 at n_max=4, while a JSON-schema prompt
++        // peaks at n_max=3 (51.14) and drops to 49.22 at n_max=4. The best
++        // depth is workload-dependent, so one global value cannot serve both.
++        if (task->params.speculative.draft.n_max >= 0) {
++            n_draft_max = std::min(n_draft_max, task->params.speculative.draft.n_max);
++        }
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 64b925129..e4ba14904 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -226,6 +226,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
+ #endif
+ 
++    // Per-request draft depth. The block above stays disabled because it also
++    // exposes fields that reconfigure the shared speculator, and one of its
++    // entries does not compile (a missing closing paren on the n_min field).
++    // n_max is different: it is already carried per slot in the draft params
++    // struct, so a request can cap its own draft depth without touching the
++    // shared speculator. server_slot::get_n_draft_max() applies it.
++    add((new field_num("speculative.n_max", params.speculative.draft.n_max))
++        ->set_hard_limits(0, INT32_MAX)
++        ->add_alias("spec_draft_n_max")
++        ->set_desc("Maximum number of tokens to draft during speculative decoding for this request. Capped by the server's --spec-draft-n-max and by the drafter's block size"));
++
+     add((new field_json("lora"))
+         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
+         ->set_handler([&](field_eval_context & ctx, const json & data) {
+-- 
+2.43.0
+

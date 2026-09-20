@@ -167,6 +167,40 @@ not "what throughput will my workload get".
 are byte-identical to `4`. Requesting more is a no-op, and earlier rounds of this
 repo reported "K=7" numbers that were really K=4.
 
+## Per-request draft depth (patch to llama.cpp)
+
+Pulse sent `spec_draft_n_max` on every request and llama.cpp threw it away.
+Per-request speculative parameters are compiled out of its server behind `#if 0`
+(`tools/server/server-schema.cpp`), and `server_slot::get_n_draft_max()` computed
+only a context-fit bound, never reading the task's value.
+
+`patches/llama-per-request-spec-n-max.patch` fixes both in 24 lines. It exposes
+`speculative.n_max` (aliased to `spec_draft_n_max`) and applies it per slot.
+Backward compatible: an omitted field keeps the server-wide value, and a request
+can only *lower* K, never raise it, so `--spec-draft-n-max` stays the ceiling.
+
+That made the K curve measurable per workload for the first time
+(`bench/kcurve.py`, v1 drafter, block 4, 3 interleaved repeats):
+
+| | K=1 | K=2 | K=3 | K=4 | K=6 |
+|---|---|---|---|---|---|
+| code | 36.57 | 46.95 | 52.19 | 56.07 | **56.43** |
+| schema | 36.74 | 45.51 | **51.14** | 49.22 | 49.22 |
+| chat | 33.93 | 39.05 | 40.92 | 41.38 | **41.62** |
+
+Everything saturates at K=4, the drafter's block size — an independent
+re-confirmation of the cap. But **schema peaks at K=3 and loses 3.9% at K=4**,
+against a 0.1-0.7% spread.
+
+The heuristic that shipped before this sent schema-like prompts to **K=7**, citing
+"80-87% acceptance, 140-157 tok/s". Those numbers were never measured and are
+gone. The measurement wants schema at the shallowest depth of the three, not the
+deepest. The policy is now the measured one.
+
+**Honest size:** against a single global K=4 this is worth **3.9%, on schema
+traffic only**. It is in here because the feature was advertised and did not
+work, not because the number is large.
+
 ## Measured negative results
 
 | lever | result |
