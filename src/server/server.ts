@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { CheckpointManager } from './checkpoint.js';
 import { JevDecisionClient, SpeculationDecision, MemoryAdmissionDecision } from '../jev/client.js';
 import { NativePulseEngine } from './native_ffi.js';
 export interface ServerConfig {
@@ -18,6 +19,8 @@ export class PulseServer {
   private activeStreams = 0;
   private peakTokensPerSec = 0; // measured at runtime; no seeded value
   private lastJevDecision: SpeculationDecision | null = null;
+  private checkpoints: CheckpointManager;
+  private lastCheckpointRestore: { chars: number; bytes: number } | null = null;
 
   constructor(config: Partial<ServerConfig> = {}) {
     this.config = {
@@ -26,6 +29,15 @@ export class PulseServer {
       backendUrl: config.backendUrl ?? 'http://127.0.0.1:8085',
     };
     this.jev = new JevDecisionClient(2000);
+    // Mid-context edits cost a full re-prefill (8702 ms at 8k) because mRoPE
+    // blocks --cache-reuse. Slot checkpoints restore in 90.8 ms instead: 96x.
+    this.checkpoints = new CheckpointManager(
+      this.config.backendUrl,
+      process.env.PULSE_CKPT_PATH ?? '/tmp/slotsave/',
+      // PULSE_CKPT_MIN_CHARS=999999999 effectively disables checkpointing,
+      // which is how the A/B in bench/RESULTS.md was run.
+      Number(process.env.PULSE_CKPT_MIN_CHARS ?? 4000),
+    );
   }
 
   start(): Promise<void> {
@@ -58,6 +70,8 @@ export class PulseServer {
               total_tokens_generated: this.totalTokensGenerated,
               peak_decode_toks_per_sec: this.peakTokensPerSec,
               jev_system_one_decisions_enabled: true,
+              checkpoints: this.checkpoints.getStats(),
+              last_checkpoint_restore: this.lastCheckpointRestore,
               last_jev_decision: this.lastJevDecision,
             }, null, 2)
           );
@@ -186,6 +200,16 @@ export class PulseServer {
         spec_draft_n_max: kDecision.k,
       };
 
+      // Restore the longest matching checkpoint before forwarding. llama.cpp's own
+      // prompt cache then sees the slot already holds that prefix and prefills
+      // only the divergent tail, instead of re-prefilling from zero.
+      const ckptKey = messages.map((m: { role?: string; content?: string }) =>
+        `${m.role ?? ''}:${m.content ?? ''}`).join('\n');
+      const restored = await this.checkpoints.restoreBest(ckptKey).catch(() => null);
+      if (restored) {
+        this.lastCheckpointRestore = { chars: restored.text.length, bytes: restored.bytes };
+      }
+
       const backendResponse = await fetch(`${this.config.backendUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -225,6 +249,9 @@ export class PulseServer {
           res.write(chunkStr);
         }
         res.end();
+        // Checkpoint the slot now that it holds this full context, so a later
+        // turn that edits earlier text can restore instead of re-prefilling.
+        void this.checkpoints.save(ckptKey).catch(() => null);
       } else {
         const json = await backendResponse.json() as Record<string, unknown>;
         const timings = (json.timings ?? {}) as Record<string, number>;
@@ -244,6 +271,7 @@ export class PulseServer {
           device: 'NVIDIA GB10 (sm_121, 128GB LPDDR5X)',
           tensor_parallel_world_size: 2,
         };
+        void this.checkpoints.save(ckptKey).catch(() => null);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(json, null, 2));
