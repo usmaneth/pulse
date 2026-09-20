@@ -2301,3 +2301,59 @@ It also showed **inter-instance variance of ~1.9%** - two runs of the identical
 binary in different server processes gave 27.34 and 27.86 tok/s - against
 within-run spreads of 0.2-0.8%. Any kernel comparison must therefore restart and
 interleave, not measure once per build.
+
+---
+
+# Round 31 - Jev belongs off the request hot path, measured
+
+Every previous round described the Jev integration as "partial" without
+measuring whether the alternative is viable. This settles it.
+
+## The gateway works
+
+`JevDecisionClient.decideMemoryAdmission` calls `experimental_evaluate` against
+the Vercel AI Gateway. 5 of 5 calls succeeded.
+
+| | ms |
+|---|---|
+| median latency | **334.7** |
+| min / max | 248.5 / 594.0 |
+
+## And it cannot pay for itself on the hot path
+
+| | value |
+|---|---|
+| typical short request, wall clock | 1486.5 ms |
+| local heuristic decision cost | **0.012 ms** |
+| Jev gateway decision cost | **334.7 ms** (27,707x the local path) |
+| gateway as a share of a short request | **22.5%** |
+| best case the K decision is worth | **3.9%** (schema K=3 vs K=4, Round 24) |
+
+**Calling Jev per request costs 22.5% to win at most 3.9%.** It is a net loss by
+roughly 6x, and the gap widens as requests get shorter.
+
+Long requests invert the ratio - 334.7 ms against a ~40 s request is under 1% -
+but at long context the context taper sets K=0 regardless (Rounds 27-29), so
+there is no decision left to make. The band where a model-driven K decision
+could help is exactly the band where the round trip is most expensive.
+
+## What Jev is actually good for here
+
+The decisions worth making per request are cheap to compute locally. Prompt
+length and `activeStreams` are already in hand, and the policy they feed is a
+measured table, not a judgement call.
+
+Jev's value is **off** the hot path:
+
+1. **Memory admission**, where it already runs. The decision is infrequent and
+   the input (pressure on a 121 GB pool) is genuinely a judgement.
+2. **Offline policy tuning.** Every table in `config/gb10-bonsai2.json` came
+   from a sweep. Jev could propose which sweeps to run next from observed
+   acceptance and throughput, which costs nothing per request.
+
+## Correction to the naming, already applied
+
+Round 24 renamed `decideSpeculationK`'s return strings, which read "Jev local
+fast-path" while running a regex, and corrected `/status`, which advertised
+`jev_system_one_decisions_enabled: true`. This round supplies the number that
+justifies that design rather than merely describing it.
