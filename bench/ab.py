@@ -22,9 +22,10 @@ DRAFT = os.environ.get("SPEC_DRAFT", "models/bonsai2-gguf/27B/Ternary-Bonsai-2-2
 # Cold (no warmup, after CPU activity): measured 10.2% - pages migrate back lazily.
 NOISE_FLOOR_PCT = float(os.environ.get("PULSE_NOISE_FLOOR", "3.4"))
 
-BASE = ["-m", MODEL, "-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "7",
-        "-ngl", "99", "-ngld", "999", "-fa", "on", "-c", "8192", "-b", "4096", "-ub", "512",
+BASE = ["-m", MODEL, "-ngl", "99", "-fa", "on", "-c", "8192", "-b", "4096", "-ub", "512",
         "--temp", "0", "--ignore-eos"]
+if os.environ.get("PULSE_AB_NO_DEFAULT_DRAFT") != "1":
+    BASE += ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "7", "-ngld", "999"]
 
 def gpu_clean():
     r = subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
