@@ -1491,6 +1491,164 @@ int main(int argc, char** argv) {
             cudaFree(dag);cudaFree(dout3);cudaFree(dg3);cudaFree(du3);cudaFree(df3);
             if(s5120)cudaFree(s5120); if(s6144)cudaFree(s6144); if(s17408)cudaFree(s17408);
         }
+        // ================= FULL 64-LAYER SWEEP =================
+        // Run every layer from the embedding, checking drift against l_out-N at
+        // each one, then the final norm and head against result_output.
+        {
+            const int HB = 1024; const float hs = 1.0f/std::sqrt((float)HB);
+            std::vector<int32_t> sv, sw;
+            m.reader().array_i32("prism.hadamard.sign_values", sv);
+            m.reader().array_i32("prism.hadamard.sign_widths",  sw);
+            auto mk_sign = [&](int width)->float* {
+                size_t off = 0;
+                for (size_t i = 0; i < sw.size(); ++i) {
+                    if (sw[i] == width) {
+                        std::vector<float> f(width);
+                        for (int j = 0; j < width; ++j) f[j] = (float)sv[off+j];
+                        float* d; CU(cudaMalloc(&d,(size_t)width*4));
+                        CU(cudaMemcpy(d,f.data(),(size_t)width*4,cudaMemcpyHostToDevice));
+                        return d; }
+                    off += (size_t)sw[i]; }
+                return nullptr; };
+            float* S5120 = mk_sign(5120); float* S6144 = mk_sign(6144);
+            float* S17408 = mk_sign(17408);
+            const int nff = (int)m.layer(0,"ffn_gate.weight")->ne[1];
+
+            float *dx,*dh,*dt,*dbig,*dsmall,*dg,*du,*dfw,*dgate;
+            CU(cudaMalloc(&dx,(size_t)n*4));      CU(cudaMalloc(&dh,(size_t)n*4));
+            CU(cudaMalloc(&dt,(size_t)n*4));      CU(cudaMalloc(&dbig,(size_t)16384*4));
+            CU(cudaMalloc(&dsmall,(size_t)n*4));  CU(cudaMalloc(&dg,(size_t)nff*4));
+            CU(cudaMalloc(&du,(size_t)nff*4));    CU(cudaMalloc(&dfw,(size_t)nff*4));
+            CU(cudaMalloc(&dgate,(size_t)6144*4));
+
+            std::vector<float> emb;
+            if (!load_ref("model.input_embed", emb)) emb.assign(n,0.f);
+            std::vector<float> x(emb);
+            auto softplus=[](double v){ return v>20.0? v : std::log1p(std::exp(v)); };
+            const int dk=128,dv=128,nvh=48,nkh=16;
+            double worst_layer_cos = 1.0; int worst_layer = -1;
+            int layers_checked = 0;
+
+            for (int il = 0; il < hp.n_layer; ++il) {
+                std::vector<float> res(x);
+                CU(cudaMemcpy(dx,x.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+                k_rmsnorm<<<1,256>>>(dx,(const float*)m.layer(il,"attn_norm.weight")->ptr,dh,n,hp.rms_eps);
+                CU(cudaDeviceSynchronize());
+                std::vector<float> hh(n);
+                CU(cudaMemcpy(hh.data(),dh,(size_t)n*4,cudaMemcpyDeviceToHost));
+                CU(cudaMemcpy(dt,dh,(size_t)n*4,cudaMemcpyDeviceToDevice));
+                k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dt,S5120,n,HB,hs);
+                CU(cudaDeviceSynchronize());
+
+                std::vector<float> sub(n);
+                if (m.is_full_attn(il)) {
+                    const int nqf=(int)m.layer(il,"attn_q.weight")->ne[1];
+                    const int nkv=(int)m.layer(il,"attn_v.weight")->ne[1];
+                    const int hd=256, nqh=24, nkvh=4;
+                    k_matvec_pq2<<<(nqf+7)/8,256>>>((const blk*)m.layer(il,"attn_q.weight")->ptr,dt,dbig,n,nqf);
+                    k_matvec_pq2<<<(nkv+7)/8,256>>>((const blk*)m.layer(il,"attn_v.weight")->ptr,dt,dsmall,n,nkv);
+                    CU(cudaDeviceSynchronize());
+                    std::vector<float> qf(nqf), vv(nkv), gated(6144);
+                    CU(cudaMemcpy(qf.data(),dbig,(size_t)nqf*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(vv.data(),dsmall,(size_t)nkv*4,cudaMemcpyDeviceToHost));
+                    for (int h=0;h<nqh;++h){ const int kv=h/(nqh/nkvh);
+                        for (int i=0;i<hd;++i){
+                            const double g=(double)qf[(size_t)h*2*hd+hd+i];
+                            gated[(size_t)h*hd+i]=(float)((1.0/(1.0+std::exp(-g)))*(double)vv[(size_t)kv*hd+i]); } }
+                    CU(cudaMemcpy(dgate,gated.data(),(size_t)6144*4,cudaMemcpyHostToDevice));
+                    k_hadamard<<<(6144+HB-1)/HB,512,HB*4>>>(dgate,S6144,6144,HB,hs);
+                    CU(cudaDeviceSynchronize());
+                    k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)m.layer(il,"attn_output.weight")->ptr,dgate,dsmall,6144,n);
+                } else {
+                    k_matvec_pq2<<<(10240+7)/8,256>>>((const blk*)m.layer(il,"attn_qkv.weight")->ptr,dt,dbig,n,10240);
+                    k_matvec_pq2<<<(6144+7)/8,256>>>((const blk*)m.layer(il,"attn_gate.weight")->ptr,dt,dgate,n,6144);
+                    float *dga,*dgb; CU(cudaMalloc(&dga,48*4)); CU(cudaMalloc(&dgb,48*4));
+                    k_matvec_bf16<<<48,256>>>((const uint16_t*)m.layer(il,"ssm_alpha.weight")->ptr,dh,dga,n,48);
+                    k_matvec_bf16<<<48,256>>>((const uint16_t*)m.layer(il,"ssm_beta.weight")->ptr,dh,dgb,n,48);
+                    CU(cudaDeviceSynchronize());
+                    std::vector<float> qkv(10240), zz(6144), alp(48), bt(48), ssa(48), sdt(48), snw(128), cw((size_t)4*10240);
+                    CU(cudaMemcpy(qkv.data(),dbig,(size_t)10240*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(zz.data(),dgate,(size_t)6144*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(alp.data(),dga,48*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(bt.data(),dgb,48*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(ssa.data(),m.layer(il,"ssm_a")->ptr,48*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(sdt.data(),m.layer(il,"ssm_dt.bias")->ptr,48*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(snw.data(),m.layer(il,"ssm_norm.weight")->ptr,128*4,cudaMemcpyDeviceToHost));
+                    CU(cudaMemcpy(cw.data(),m.layer(il,"ssm_conv1d.weight")->ptr,(size_t)4*10240*4,cudaMemcpyDeviceToHost));
+                    cudaFree(dga); cudaFree(dgb);
+                    std::vector<float> conv(10240);
+                    for (int c=0;c<10240;++c){ const double a=(double)qkv[c]*cw[(size_t)c*4+3];
+                        conv[c]=(float)(a/(1.0+std::exp(-a))); }
+                    std::vector<float> qh(2048), kh2(2048), vh(6144), fin(6144);
+                    for (int i=0;i<2048;++i){ qh[i]=conv[i]; kh2[i]=conv[2048+i]; }
+                    for (int i=0;i<6144;++i) vh[i]=conv[4096+i];
+                    auto l2=[&](std::vector<float>& t){ for (int h=0;h<nkh;++h){ double s2=0;
+                        for (int j=0;j<dk;++j) s2+=(double)t[h*dk+j]*t[h*dk+j];
+                        const double inv=1.0/std::sqrt(std::max(s2,1e-30));
+                        for (int j=0;j<dk;++j) t[h*dk+j]=(float)(t[h*dk+j]*inv);} };
+                    l2(qh); l2(kh2);
+                    for (int h=0;h<nvh;++h){ const int g=h%nkh;
+                        const double bv=1.0/(1.0+std::exp(-(double)bt[h]));
+                        (void)std::exp((double)ssa[h]*softplus((double)alp[h]+sdt[h]));
+                        std::vector<double> o(dv); double ss=0;
+                        double kq=0; for (int j=0;j<dk;++j) kq += (double)kh2[g*dk+j]*qh[g*dk+j];
+                        for (int i=0;i<dv;++i){ o[i]=bv*(double)vh[h*dv+i]*kq; ss+=o[i]*o[i]; }
+                        const double sc=1.0/std::sqrt(ss/dv + (double)dv*hp.rms_eps);
+                        for (int i=0;i<dv;++i){ const double z2=(double)zz[h*dv+i];
+                            fin[h*dv+i]=(float)((z2/(1.0+std::exp(-z2)))*(o[i]*sc*(double)snw[i])); } }
+                    float* dperm; CU(cudaMalloc(&dperm,(size_t)6144*4));
+                    CU(cudaMemcpy(dgate,fin.data(),(size_t)6144*4,cudaMemcpyHostToDevice));
+                    k_perm_tiled_to_grouped<<<(6144+255)/256,256>>>(dgate,dperm,128,16,3);
+                    CU(cudaDeviceSynchronize());
+                    k_hadamard<<<(6144+HB-1)/HB,512,HB*4>>>(dperm,S6144,6144,HB,hs);
+                    CU(cudaDeviceSynchronize());
+                    k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)m.layer(il,"ssm_out.weight")->ptr,dperm,dsmall,6144,n);
+                    CU(cudaDeviceSynchronize());
+                    cudaFree(dperm);
+                }
+                CU(cudaDeviceSynchronize());
+                CU(cudaMemcpy(sub.data(),dsmall,(size_t)n*4,cudaMemcpyDeviceToHost));
+                for (int i=0;i<n;++i) x[i]=res[i]+sub[i];
+
+                std::vector<float> res2(x);
+                CU(cudaMemcpy(dx,x.data(),(size_t)n*4,cudaMemcpyHostToDevice));
+                k_rmsnorm<<<1,256>>>(dx,(const float*)m.layer(il,"post_attention_norm.weight")->ptr,dh,n,hp.rms_eps);
+                CU(cudaDeviceSynchronize());
+                CU(cudaMemcpy(dt,dh,(size_t)n*4,cudaMemcpyDeviceToDevice));
+                k_hadamard<<<(n+HB-1)/HB,512,HB*4>>>(dt,S5120,n,HB,hs);
+                CU(cudaDeviceSynchronize());
+                k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)m.layer(il,"ffn_gate.weight")->ptr,dt,dg,n,nff);
+                k_matvec_pq2<<<(nff+7)/8,256>>>((const blk*)m.layer(il,"ffn_up.weight")->ptr,dt,du,n,nff);
+                CU(cudaDeviceSynchronize());
+                k_swiglu<<<(nff+255)/256,256>>>(dg,du,dfw,nff);
+                CU(cudaDeviceSynchronize());
+                k_hadamard<<<(nff+HB-1)/HB,512,HB*4>>>(dfw,S17408,nff,HB,hs);
+                CU(cudaDeviceSynchronize());
+                k_matvec_pq2<<<(n+7)/8,256>>>((const blk*)m.layer(il,"ffn_down.weight")->ptr,dfw,dsmall,nff,n);
+                CU(cudaDeviceSynchronize());
+                CU(cudaMemcpy(sub.data(),dsmall,(size_t)n*4,cudaMemcpyDeviceToHost));
+                for (int i=0;i<n;++i) x[i]=res2[i]+sub[i];
+
+                char nm[64]; snprintf(nm,sizeof nm,"l_out-%d",il);
+                std::vector<float> ref;
+                if (load_ref(nm, ref) && (int)ref.size()==n) {
+                    double cn=0,ga2=0,ra2=0;
+                    for (int i=0;i<n;++i){ cn+=(double)x[i]*ref[i]; ga2+=(double)x[i]*x[i]; ra2+=(double)ref[i]*ref[i]; }
+                    const double cs = cn/std::sqrt(std::max(ga2*ra2,1e-30));
+                    ++layers_checked;
+                    if (cs < worst_layer_cos) { worst_layer_cos = cs; worst_layer = il; }
+                    if (il < 4 || il % 16 == 0 || il == hp.n_layer-1)
+                        printf("    layer %2d (%s) cos %.8f\n", il,
+                               m.is_full_attn(il)?"attn":"gdn ", cs);
+                }
+            }
+            printf("    --- %d layers checked, worst cosine %.8f at layer %d ---\n",
+                   layers_checked, worst_layer_cos, worst_layer);
+            report("FULL 64-LAYER SWEEP (worst layer cos)", 1.0-worst_layer_cos, 1e-2);
+            cudaFree(dx);cudaFree(dh);cudaFree(dt);cudaFree(dbig);cudaFree(dsmall);
+            cudaFree(dg);cudaFree(du);cudaFree(dfw);cudaFree(dgate);
+            if(S5120)cudaFree(S5120); if(S6144)cudaFree(S6144); if(S17408)cudaFree(S17408);
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
