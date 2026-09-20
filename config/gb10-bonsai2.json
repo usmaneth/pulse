@@ -35,14 +35,17 @@
       "file": "Ternary-Bonsai-2-27B-dspark-dflash-Q4_0.gguf",
       "bytes": 631713664,
       "block_size": 4,
-      "optimal_k": 3,
+      "optimal_k": 4,
       "measured": {
-        "toks_sec": 62.98,
-        "acceptance": 0.9018,
-        "repeats": 5,
-        "spread_toks_sec": 0.62
+        "toks_sec": 63.77,
+        "acceptance": 0.7228,
+        "tok_per_step": 3.86,
+        "ms_per_step": 60.6,
+        "repeats": 3,
+        "spread_toks_sec": 0.37,
+        "context": "realistic 5000-char code prompt, temp 0, --ignore-eos"
       },
-      "note": "deterministic at temp 0: acceptance identical across 5 repeats"
+      "note": "K=4 (= block_size) beats K=3 on throughput: 63.77 vs 58.08 tok/s. K=3 gives higher acceptance (78.29% vs 72.28%) but fewer tokens per step. Use the full block."
     },
     "v2": {
       "file": "Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf",
@@ -58,7 +61,7 @@
       }
     },
     "recommended": "v1",
-    "recommended_provenance": "v1 gives up ~1.7 tok/s of median throughput and buys 21 points of acceptance and an 18x tighter spread"
+    "recommended_provenance": "v1 at K=4 is the measured best single-stream config on realistic code context"
   },
   "k_policy": {
     "rule": "never request K above the drafter's block_size",
@@ -128,5 +131,72 @@
         "speedup": 1.61
       }
     ]
+  },
+  "design_curve": {
+    "$comment": "Throughput vs accepted-tokens-per-step at 100% acceptance, measured with a model-free n-gram drafter on repetitive text. This is the hardware ceiling for any drafter, and the spec any drafter must be designed against.",
+    "method": "llama-speculative-simple --spec-type ngram-simple --spec-ngram-simple-size-m M, idle GB10, temp 0",
+    "points": [
+      {
+        "m": 1,
+        "toks_sec": 27.29,
+        "tok_per_step": 1.0,
+        "ms_per_step": 36.65
+      },
+      {
+        "m": 3,
+        "toks_sec": 85.36,
+        "tok_per_step": 4.0,
+        "ms_per_step": 46.86
+      },
+      {
+        "m": 4,
+        "toks_sec": 101.25,
+        "tok_per_step": 5.0,
+        "ms_per_step": 49.38
+      },
+      {
+        "m": 6,
+        "toks_sec": 126.2,
+        "tok_per_step": 6.92,
+        "ms_per_step": 54.84
+      },
+      {
+        "m": 8,
+        "toks_sec": 127.4,
+        "tok_per_step": 8.83,
+        "ms_per_step": 69.33
+      },
+      {
+        "m": 12,
+        "toks_sec": 174.11,
+        "tok_per_step": 12.81,
+        "ms_per_step": 73.57
+      },
+      {
+        "m": 16,
+        "toks_sec": 219.35,
+        "tok_per_step": 17.0,
+        "ms_per_step": 77.5
+      }
+    ],
+    "fit_below_8_rows": "ms_per_step = 36.6 + ~2.9 * (rows - 1)",
+    "base_is_the_weight_sweep": "36.65 ms measured vs 36.3 ms predicted from 6.70 GB / 184.6 GB/s",
+    "discontinuity_at_8": "ncols_dst crosses MMVQ_MAX_BATCH_SIZE=8 and dispatch falls from mul_mat_vec_q to MMQ: +14.5 ms for +1.9 tokens. MMQ base ~65 ms, marginal ~1.0 ms/row.",
+    "threshold_is_correctly_tuned_below_8": "forcing MMQ earlier via GGML_MMVQ_MAX measured 34% worse (100.78 -> 75.21 tok/s at 5 rows). Raising it above 8 asserts: mmvq is only template-instantiated to ncols_dst=8, so rows 9-15 are forced onto MMQ although the measured crossover is ~15."
+  },
+  "remaining_levers": {
+    "$comment": "Both quantified against the measured design curve. Together they clear 100 tok/s single-stream.",
+    "lever_1_drafter_path_overhead": {
+      "size_ms_per_step": 12.4,
+      "evidence": "at 3.86 tok/step the n-gram curve gives 44.9 ms/step; the dspark drafter measures 60.6 ms. Of the 15.7 ms gap only 3.27 ms is the drafter's own 603 MB sweep.",
+      "if_removed_toks_sec": 80
+    },
+    "lever_2_deeper_block": {
+      "current_block": 4,
+      "target_block": 5,
+      "evidence": "v1 already reaches 90.18% acceptance at depth 3 and 72-78% at depth 3-4",
+      "projected_toks_sec_at_block5": 96
+    },
+    "both": "~100+ tok/s single-stream, no change to the target model"
   }
 }

@@ -1,0 +1,29 @@
+--- /tmp/mmvq.cu.orig	2026-09-20 09:13:51.908749747 -0700
++++ ggml/src/ggml-cuda/mmvq.cu	2026-09-20 09:13:51.969509673 -0700
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include <cstdlib>
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -291,6 +292,20 @@
+ }
+ 
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
++    // EXPERIMENT (Pulse): let the mmvq/MMQ dispatch threshold be swept without a rebuild.
++    // Measured on GB10: mmvq marginal cost is 2.5-3.4 ms per extra verify row, while MMQ
++    // past the ncols>8 switch costs ~1.0 ms/row. If that holds at low ncols, the default
++    // threshold of MMVQ_MAX_BATCH_SIZE=8 is too high for PQ2_0 on this chip.
++    {
++        static const int mmvq_max_override = [] {
++            const char * s = getenv("GGML_MMVQ_MAX");
++            return s ? atoi(s) : -1;
++        }();
++        if (mmvq_max_override >= 0) {
++            if (!ggml_is_quantized(type)) return false;
++            return ne11 <= mmvq_max_override;
++        }
++    }
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }

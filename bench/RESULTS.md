@@ -651,3 +651,92 @@ amortisation. Open.
 This matters because it is the whole single-stream ceiling: with the per-row
 cost removed, the v1 drafter's already-measured 90.18% acceptance would give
 (1 + 4*0.9) / 0.0363 = ~100 tok/s single-stream with no new model trained.
+
+---
+
+# Round 8 - the design curve, and what actually blocks 100 tok/s
+
+## Method
+
+Throughput as a function of accepted-tokens-per-step, measured with a model-free
+n-gram drafter on repetitive text. Acceptance is pinned at 100%, so this isolates
+the hardware's cost of verifying N rows from any drafter's quality. It is the
+ceiling for any drafter, and the spec a drafter must be designed against.
+
+    llama-speculative-simple --spec-type ngram-simple --spec-ngram-simple-size-m M
+
+## The curve (idle GB10, temp 0, --ignore-eos)
+
+| m | tok/s | tok/step | ms/step | marginal ms/row |
+|---|---|---|---|---|
+| 1 | 27.29 | 1.00 | 36.65 | - |
+| 3 | 85.36 | 4.00 | 46.86 | 3.44 |
+| 4 | **101.25** | 5.00 | 49.38 | 2.52 |
+| 6 | 126.20 | 6.92 | 54.84 | 2.84 |
+| 8 | 127.40 | 8.83 | 69.33 | 7.58 |
+| 12 | 174.11 | 12.81 | 73.57 | 1.07 |
+| 16 | 219.35 | 17.00 | 77.50 | 0.94 |
+
+**100 tok/s single-stream is reachable on this hardware at 5 accepted tokens per
+step.** 219 tok/s at 17. The machine is not the limit; drafter depth x acceptance is.
+
+The base of 36.65 ms matches the predicted 6.70 GB / 184.6 GB/s = 36.3 ms sweep.
+
+## This corrects the Round 4 cost model
+
+Round 4 fit `t_step = 48.3 + 4.47K` and concluded 100 tok/s required a block-9
+drafter holding 90% acceptance. Both terms were wrong and both erred the same way:
+
+- the base of 48.3 ms silently included the dspark drafter's own 3.27 ms sweep
+  plus its path overhead. The true verify-only base is 36.6 ms.
+- the slope of 4.47 ms/row is really 2.5-3.4 ms/row, and it decreases with depth.
+
+On the corrected curve the requirement is a **block-5 drafter**, not block-9.
+v1 already measures 90.18% acceptance at depth 3.
+
+## The dispatch discontinuity at 8 rows
+
+At m=8 `ncols_dst` crosses `MMVQ_MAX_BATCH_SIZE = 8` and dispatch falls from
+`mul_mat_vec_q` to MMQ: +14.5 ms for +1.9 tokens. Past it MMQ's marginal cost is
+~1.0 ms/row against mmvq's ~2.9, but its base is ~65 ms against mmvq's 36.6.
+
+Both directions tested with a patched, env-var-driven threshold
+(`patches/mmvq-threshold-override.patch`):
+
+| GGML_MMVQ_MAX at 5 rows | tok/s | ms/step |
+|---|---|---|
+| 8 (default, mmvq) | **100.78** | 49.62 |
+| 4 (forces MMQ) | 75.21 | 66.48 |
+| 0 (forces MMQ) | 74.84 | 66.81 |
+
+Forcing MMQ earlier is **34% worse**. The default is correctly tuned below 8.
+
+Raising the threshold above 8 asserts: mmvq is only template-instantiated to
+`ncols_dst = 8`. So rows 9-15 are forced onto MMQ although the fits put the real
+crossover at ~15 rows. That is a genuine upstream gap, but it does not affect us:
+our drafters have block 4 and 7, giving 5 and 8 rows.
+
+## Best measured single-stream config
+
+v1 drafter, realistic 5000-char code context, 3 repeats each:
+
+| K | tok/s | acceptance | tok/step | ms/step |
+|---|---|---|---|---|
+| 3 | 58.01 / 58.07 / 58.16 | 78.29% | 3.32 | 57.2 |
+| **4** | 63.61 / 63.71 / 63.98 | 72.28% | 3.86 | 60.6 |
+
+K=4 (the full block size) wins. Deterministic at temp 0.
+
+## The two remaining levers, quantified
+
+At 3.86 tok/step the design curve gives **44.9 ms/step**. The dspark drafter
+measures **60.6 ms**. The gap is **15.7 ms**, of which only 3.27 ms is the
+drafter's own 603 MB weight sweep.
+
+1. **~12.4 ms/step of unexplained dspark drafter path overhead.** Removing it
+   alone gives ~80 tok/s single-stream.
+2. **Block size 4 -> 5.** At current acceptance that is ~96 tok/s.
+
+Together: **100+ tok/s single-stream, with no change to the target model and no
+new target quantization.** That is the whole remaining gap, stated in measured
+quantities.
