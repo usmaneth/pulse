@@ -64,8 +64,8 @@
       },
       "correction": "an earlier measurement of this exact config reported 73.3 tok/s with a 1.09 spread. That was taken in an unusually favourable machine state. A properly quiesced 6-repeat run gives a 66.31 median with 10.2% spread."
     },
-    "recommended": "v2",
-    "recommended_provenance": "v2 at K=7 is the measured best single-stream config on realistic code context: 73.2-73.4 tok/s over 3 repeats, vs 63.8-64.3 for v1 at K=4. Earlier rounds preferred v1 because they measured v2 on a shorter, less representative context."
+    "recommended": "v1",
+    "recommended_provenance": "v1 (block 4) at K=4 is the best default: it wins the serving grid at 1, 4 and 8 clients and loses to no-drafter only at 16. v2 (block 7) wins single-stream on code context (71.45 vs ~64) but loses under batching at every level except 2 clients, because batch rows = clients x (K+1) and deeper speculation pushes past mmvq's ncols<=8 into MMQ."
   },
   "k_policy": {
     "rule": "never request K above the drafter's block_size",
@@ -273,5 +273,48 @@
         "note": "warm steady state; the sustained-serving number"
       }
     }
+  },
+  "serving_policy": {
+    "$comment": "Measured 2D grid: drafter x concurrent clients, bench/grid.sh, 16 slots, 128 tok/request. Batch rows = clients x (K+1), so deeper speculation multiplies under batching and crosses mmvq's ncols<=8 limit into MMQ's high-fixed-cost regime (see Round 8 discontinuity).",
+    "grid": {
+      "no_drafter": {
+        "1": 23.54,
+        "2": 40.24,
+        "4": 68.02,
+        "8": 87.77,
+        "16": 111.44
+      },
+      "v1_block4_K4": {
+        "1": 37.78,
+        "2": 53.24,
+        "4": 74.66,
+        "8": 92.37,
+        "16": 102.86
+      },
+      "v2_block7_K7": {
+        "1": 36.35,
+        "2": 58.83,
+        "4": 62.8,
+        "8": 77.06,
+        "16": 84.39
+      }
+    },
+    "rule": [
+      {
+        "clients": "1-8",
+        "use": "v1 drafter (block 4) at K=4",
+        "why": "+61% at 1 client, +5% at 8"
+      },
+      {
+        "clients": ">=12",
+        "use": "no drafter",
+        "why": "no-drafter wins at 16 (111.44 vs 102.86)"
+      },
+      {
+        "note": "v2 (block 7) is only worth it for SINGLE-STREAM on high-acceptance workloads such as code, where it measured 71.45 vs v1's ~64. Under batching it loses at every level except 2 clients."
+      }
+    ],
+    "caveat": "the grid used short chat-style prompts and saw 29-43% acceptance; the single-stream code-context tests saw 69-72%. Acceptance is workload-dependent (measured range 21%-96%), so the optimal drafter depends on prompt type as well as concurrency.",
+    "crossover_clients": 12
   }
 }

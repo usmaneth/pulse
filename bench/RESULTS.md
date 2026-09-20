@@ -1112,3 +1112,54 @@ Overhead scales ~1.81x for a 1.75x larger drafter on the same prompt, so the cos
 is the drafter's own forward pass and is roughly proportional to its weight
 volume. That much is solid. The absolute effective-bandwidth figure is not, and
 the kernel-level mechanism remains open.
+
+---
+
+# Round 13 - the serving policy grid
+
+The full 2D grid: drafter x concurrent clients. `bench/grid.sh`, 16 slots,
+128 tokens per request, temperature 0, short chat-style prompts.
+
+| clients | no drafter | v1 (block 4) K=4 | v2 (block 7) K=7 |
+|---|---|---|---|
+| 1 | 23.54 | **37.78** | 36.35 |
+| 2 | 40.24 | 53.24 | **58.83** |
+| 4 | 68.02 | **74.66** | 62.80 |
+| 8 | 87.77 | **92.37** | 77.06 |
+| 16 | **111.44** | 102.86 | 84.39 |
+
+## Deeper speculation is actively harmful under batching
+
+v2 - the block-7 drafter that wins **single-stream** on code context (71.45 vs
+v1's ~64) - loses to v1 at every concurrency level here except 2, and loses
+badly at 16 (84.39 vs 102.86).
+
+The mechanism is the Round 8 dispatch discontinuity. Batch rows are
+`clients x (K+1)`. At 16 clients v2's K=7 means 128 rows per batch, far past
+`MMVQ_MAX_BATCH_SIZE = 8`, so every matmul runs on MMQ - which has a ~65 ms base
+against mmvq's 36.6 ms. Depth that pays for itself at batch 1 is pure cost once
+batching has already filled the weight sweep.
+
+This reverses the Round 10 recommendation of v2 as the default. **v1 is the
+default**; v2 is for single-stream, high-acceptance workloads only.
+
+## The policy
+
+| clients | use |
+|---|---|
+| 1 | v1 at K=4, or v2 at K=7 for code-like prompts specifically |
+| 2-8 | v1 at K=4 |
+| >=12 | no drafter |
+
+## Caveat, stated plainly
+
+The grid used short chat-style prompts and saw **29-43% acceptance**. The
+single-stream code-context runs saw **69-72%**. Acceptance is strongly
+workload-dependent - the full measured range across this project is 21% to 96% -
+so the optimal drafter depends on prompt type as well as concurrency. The grid
+answers "which drafter under load", not "what throughput will my workload get".
+
+Each grid cell is a single run, so cells carry roughly the cold noise band. The
+*pattern* is trustworthy because it is monotonic across five points and the
+crossover reproduces an independent earlier measurement taken with a different
+server invocation.
