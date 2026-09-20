@@ -938,6 +938,81 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // ---- GDN output path: o = S_new q ; final = silu(z) * rmsnorm_head(o, ssm_norm)
+        // qwen35.cpp build_norm_gated: normalized = rms_norm(input, weights);
+        //                              return swiglu_split(gate, normalized);
+        std::vector<float> nsv, qv, zv, fov2, snw;
+        if (load_ref("new_state-0", nsv) && load_ref("q_conv_predelta-0", qv)
+            && load_ref("z-0", zv) && load_ref("final_output-0", fov2)) {
+            const DevTensor* wn = m.layer(0,"ssm_norm.weight");
+            if (wn && wn->type == T_F32) {
+                const int dk=128, dv=128, nvh=48, nkh=16;
+                snw.resize(dv);
+                CU(cudaMemcpy(snw.data(), wn->ptr, (size_t)dv*4, cudaMemcpyDeviceToHost));
+                // Several plausible conventions; run them all and let the data pick.
+                //  A: silu(z) * rmsnorm_head(o)                 (swiglu_split(z, norm))
+                //  B: silu(rmsnorm_head(o)) * z                 (operands swapped)
+                //  C: A, but z read in tiled head order [hd,nk,rep] -> grouped
+                //  D: A, but o indexed with the BLOCKED q mapping h/3
+                double bestv = 1e30; int bestk = -1; double bestcos = 0;
+                for (int variant = 0; variant < 5; ++variant) {
+                    double e=0, mag=0, cn=0, ga=0, ra=0;
+                    std::vector<double> o(dv);
+                    // variant 4: RMSNorm over the whole 6144, not per 128-head
+                    double global_ss = 0;
+                    if (variant == 4) {
+                        for (int h = 0; h < nvh; ++h) {
+                            const int g = h % nkh;
+                            const float* qq = qv.data()  + (size_t)g*dk;
+                            const float* Sn = nsv.data() + (size_t)h*dv*dk;
+                            for (int i = 0; i < dv; ++i) {
+                                double acc = 0;
+                                for (int j = 0; j < dk; ++j) acc += (double)Sn[(size_t)i*dk+j]*qq[j];
+                                global_ss += acc*acc;
+                            }
+                        }
+                    }
+                    for (int h = 0; h < nvh; ++h) {
+                        const int g = (variant==3) ? h/(nvh/nkh) : (h % nkh);
+                        const float* qq = qv.data()  + (size_t)g*dk;
+                        const float* Sn = nsv.data() + (size_t)h*dv*dk;
+                        double ss = 0;
+                        for (int i = 0; i < dv; ++i) {
+                            double acc = 0;
+                            for (int j = 0; j < dk; ++j) acc += (double)Sn[(size_t)i*dk+j]*qq[j];
+                            o[i] = acc; ss += acc*acc;
+                        }
+                        const double sc = (variant==4)
+                            ? 1.0/std::sqrt(global_ss/(double)(dv*nvh) + hp.rms_eps)
+                            : 1.0/std::sqrt(ss/dv + hp.rms_eps);
+                        for (int i = 0; i < dv; ++i) {
+                            const double nm = o[i]*sc*(double)snw[i];
+                            size_t zi = (size_t)h*dv + i;
+                            if (variant == 2) {   // z in tiled [128,16,3] -> grouped index
+                                const int d = i, t = h % nkh, r = h / nkh;
+                                zi = (size_t)(d + t*dv + r*dv*nkh);
+                            }
+                            const double zz = (double)zv[zi];
+                            double want;
+                            if (variant == 1) want = (nm/(1.0+std::exp(-nm))) * zz;
+                            else              want = (zz/(1.0+std::exp(-zz))) * nm;
+                            const double got = (double)fov2[(size_t)h*dv+i];
+                            e = std::max(e, std::fabs(want-got)); mag = std::max(mag, std::fabs(got));
+                            cn += want*got; ga += want*want; ra += got*got;
+                        }
+                    }
+                    const double rel = e/std::max(mag,1e-9);
+                    const double cs  = cn/std::sqrt(std::max(ga*ra,1e-30));
+                    static const char* vn[5] = {"silu(z)*norm","silu(norm)*z","z tiled->grouped","blocked q map","global rmsnorm"};
+                    printf("    gate %-20s rel %.3e  cos %.8f\n", vn[variant], rel, cs);
+                    if (rel < bestv) { bestv = rel; bestk = variant; bestcos = cs; }
+                }
+                const double e = bestv, mag = 1.0; (void)bestk;
+                const double cn = bestcos, ga = 1.0, ra = 1.0;
+                report("GDN norm+gate vs llama.cpp final_output", e/std::max(mag,1e-9), 1e-2);
+                printf("    best variant cosine %.8f\n", cn/std::sqrt(std::max(ga*ra,1e-30)));
+            }
+        }
     }
 
     printf("\n%d/%d ops validated\n", pass, total);
