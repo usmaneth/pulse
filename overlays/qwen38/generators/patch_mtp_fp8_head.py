@@ -15,6 +15,13 @@ TARGET is the mtp_patched.py that patch_mtp_draft_vocab.py wrote. The file is
 patched in place. Without TARGET the script patches mtp_patched.py next to
 itself, which is the recipe layout, so this file can replace the recipe copy
 of the generator with no other change.
+
+This generator gives the same output bytes as the recipe copy
+files/patch_mtp_fp8_head.py. It differs from that copy in three ways: the
+TARGET argument, short anchors, and a check that each anchor occurs exactly
+once. The first two anchors are short fragments of the code that the MiaAI Lab
+script patch_mtp_draft_vocab.py (AGPL-3.0) writes. This repository does not
+hold that script. The third anchor is from the vLLM file mtp.py.
 """
 import os, sys
 
@@ -41,19 +48,18 @@ def _attach_fp8_draft_head(model: nn.Module) -> None:
     model.register_buffer("_draft_head_fp8_scale", scale.t().contiguous(), persistent=False)
     model._draft_head_rows = rows
     logger.info("MTP draft head: FP8 rowwise copy engaged (%d rows, %d pad).", rows, pad)
+'''
 
-
-def _remap_ignored_layers('''
-
-OLD_ATTACH = '''    full_gib = weight.numel() * weight.element_size() / 2**30
-    cut_gib = model._draft_lm_head_weight.numel() * weight.element_size() / 2**30'''
-NEW_ATTACH = '''    if os.environ.get("VLLM_MTP_DRAFT_HEAD_FP8", "0") == "1":
+# The attach call goes at the start of the line that computes the full head
+# size, after the reduced head exists.
+ATTACH_AT = "\n    full_gib = "
+ATTACH = '''    if os.environ.get("VLLM_MTP_DRAFT_HEAD_FP8", "0") == "1":
         _attach_fp8_draft_head(model)
-''' + OLD_ATTACH
+'''
 
-OLD_TOP = '''        logits = torch.nn.functional.linear(hidden_states.to(weight.dtype), weight)
-        return self._draft_id_to_target_id[logits.argmax(dim=-1)].to(torch.long)'''
-NEW_TOP = '''        w8 = getattr(self, "_draft_head_fp8", None)
+# The FP8 branch goes at the start of the BF16 linear in get_top_tokens.
+TOP_AT = "\n        logits = torch.nn.functional.linear("
+TOP = '''        w8 = getattr(self, "_draft_head_fp8", None)
         if w8 is not None:
             x = hidden_states.float()
             xs = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 448.0
@@ -63,16 +69,23 @@ NEW_TOP = '''        w8 = getattr(self, "_draft_head_fp8", None)
                 out_dtype=torch.bfloat16,
             )[:, : self._draft_head_rows]
             return self._draft_id_to_target_id[logits.argmax(dim=-1)].to(torch.long)
-''' + OLD_TOP
+'''
 
-s = open(PATH).read()
+# The helper goes before this vLLM function.
+HELPER_AT = "\n\ndef _remap_ignored_layers("
+
+with open(PATH, encoding="utf-8") as f:
+    s = f.read()
 if MARK in s:
     print("patch_mtp_fp8_head: already applied")
     sys.exit(0)
-for old in (OLD_ATTACH, OLD_TOP, "\n\ndef _remap_ignored_layers("):
-    if old not in s:
-        sys.exit(f"patch_mtp_fp8_head: anchor not found: {old[:60]!r}")
-s = s.replace(OLD_ATTACH, NEW_ATTACH, 1).replace(OLD_TOP, NEW_TOP, 1)
-s = s.replace("\n\ndef _remap_ignored_layers(", HELPER, 1)
-open(PATH, "w").write(s)
+for anchor in (ATTACH_AT, TOP_AT, HELPER_AT):
+    n = s.count(anchor)
+    if n != 1:
+        sys.exit(f"patch_mtp_fp8_head: anchor count {n}, expected 1: {anchor!r}")
+s = s.replace(ATTACH_AT, "\n" + ATTACH + ATTACH_AT[1:], 1)
+s = s.replace(TOP_AT, "\n" + TOP + TOP_AT[1:], 1)
+s = s.replace(HELPER_AT, HELPER + HELPER_AT, 1)
+with open(PATH, "w", encoding="utf-8") as f:
+    f.write(s)
 print("patch_mtp_fp8_head: applied")

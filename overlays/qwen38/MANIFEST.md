@@ -14,7 +14,7 @@ same image.
 
 ```bash
 overlays/qwen38/build.sh --out <dir> --set <comma list of overlay names>
-overlays/qwen38/build.sh --out out --set best     # block-drop,mtp-fp8-head
+overlays/qwen38/build.sh --out overlays/qwen38/out --set best   # block-drop,mtp-fp8-head
 ```
 
 Names: `block-drop`, `capture`, `mtp-fp8-head`, `lm-head-fp8`. Aliases: `best`
@@ -24,8 +24,10 @@ The builder does these steps:
 
 1. It extracts the pristine vLLM files from the image with `docker create` and
    `docker cp`. It does not use the GPU.
-2. It runs each generator in `generators/` on the pristine files. Every anchor
-   must occur exactly once.
+2. It runs each generator in `generators/` on the pristine files. For
+   `mtp-fp8-head`, the input is the output of the recipe
+   `patch_mtp_draft_vocab.py` (see below). Every generator checks that each of
+   its anchors occurs exactly once, and stops if not.
 3. It parses every output with `ast.parse`.
 4. It writes `<dir>/<overlay>/*.py`, `<dir>/docker-args.txt` and
    `<dir>/manifest.json`.
@@ -41,9 +43,17 @@ mount target that repeats or that the recipe `start.sh` mounts itself.
 
 `manifest.json` has the keys `image`, `image_digest`, `vllm_pkg`, `sources`
 (sha256 of each pristine file) and `overlays`. Each overlay entry has `name`,
-`status`, `files` (`src`, `mount_target`, `mode`), `env`, `generator` and
-`requires_profile`. The `mtp-fp8-head` entry also has `applied_by` and
-`reference`. The file has no timestamps, so a rebuild gives the same bytes.
+`status`, `files`, `dirs`, `env`, `generator` and `requires_profile`. The
+`mtp-fp8-head` entry also has `applied_by` and `reference`. The file has no
+timestamps, so a rebuild gives the same bytes.
+
+- `files`: a list of `{src, mount_target, mode}`. Each `src` is a generated
+  regular file in `<dir>`, and `mode` is `ro`.
+- `dirs`: a list of `{src, mount_target, mode}` for host directories that the
+  overlay mounts. Only `capture` has one (`--capture-dir` on `/cap`, `rw`).
+  The builder does not make or check these directories.
+
+`docker-args.txt` holds the mounts of both lists.
 
 Options:
 
@@ -56,7 +66,8 @@ Options:
 | `--no-recipe-check` | off | Do not compare with the recipe copy of `patch_mtp_fp8_head.py`. |
 
 `out/` in this directory is ignored by git. Do not commit generated vLLM
-files, extracted sources or the reference `mtp_patched.py`.
+files, extracted sources or the reference `mtp_patched.py`. The builder
+refuses an `--out` in this repository that git does not ignore.
 
 ## Overlays
 
@@ -122,10 +133,13 @@ result `files/mtp_patched.py` on `nvidia/mtp.py`. An overlay cannot mount the
 same target a second time: docker refuses to start with `Duplicate mount
 point`. So:
 
-- `generators/patch_mtp_fp8_head.py` is the canonical generator. It is a
-  drop-in copy of the recipe file. The only change is an optional `TARGET`
-  argument. Without it, the script patches `mtp_patched.py` next to itself,
-  as before.
+- `generators/patch_mtp_fp8_head.py` is the canonical generator. It gives
+  the same output bytes as the recipe file, and it can replace the recipe
+  file with no other change. It differs from the recipe file in three ways.
+  It takes an optional `TARGET` argument (without it, it patches
+  `mtp_patched.py` next to itself, as before). Its anchors are short
+  fragments, not full lines of the MiaAI Lab code. It stops when an anchor
+  does not occur exactly once.
 - The builder runs the full launch chain on the pristine `mtp.py`: the
   recipe's `patch_mtp_draft_vocab.py` (from the recipe checkout, never copied
   into Pulse), then the Pulse generator. It writes the result to
@@ -221,14 +235,20 @@ python3 -m unittest discover -s overlays/qwen38/tests -v
 The tests use docker without the GPU. They skip when docker or the pinned
 image is not present. They check that:
 
-- every generator applies to the pristine image files, and fails on a
-  missing, repeated or already-applied anchor;
+- every generator applies to the pristine image files (`mtp-fp8-head`: to
+  the output of the recipe `patch_mtp_draft_vocab.py`);
+- every generator fails on a missing anchor and on a repeated anchor, for
+  each of its anchors;
+- the SRC/OUT generators refuse a source that they already patched, and the
+  FP8 generator makes no change on a second run;
 - every output parses with `ast`;
-- a rebuild writes nothing, and the FP8 generator is idempotent;
+- a rebuild writes nothing, and a changed output is replaced with a new inode;
+- the builder refuses an `--out` in this repository that git does not ignore;
 - the output sha256 values equal the pinned values and the files that the
   recipe serves today;
 - the `best` arguments equal the overlay mounts in the spark1 best profile,
   with no host paths;
 - no mount target repeats or collides with a recipe mount;
 - `docker-args.txt` is one shell-safe line, and `manifest.json` matches the
-  schema above.
+  schema above (each `files[].src` is a regular file, and only `capture` has
+  `dirs`).

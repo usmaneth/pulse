@@ -80,6 +80,39 @@ SRC_TO_OUT = {
         ("models/qwen3_8_flash_next/nvidia/model.py", "nvidia_model_fp8head.py")]),
 }
 ALL_SOURCES = sorted({rel for o in build.OVERLAYS for rel in o["sources"]})
+# Every anchor of the SRC/OUT generators, by source file. Each occurs once in
+# the pristine image file.
+SRC_OUT_ANCHORS = {
+    "patch_block_drop.py": [
+        ("config/speculative.py", "    use_local_argmax_reduction: bool = False\n"),
+        ("config/speculative.py",
+         '        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")\n'),
+        ("v1/core/kv_cache_utils.py",
+         "    if spec_config is None or not spec_config.use_eagle():\n"),
+        ("v1/core/sched/scheduler.py", "        self.use_eagle = False\n"),
+        ("v1/core/sched/scheduler.py",
+         "            self.use_eagle = speculative_config.use_eagle()\n"),
+        ("v1/core/sched/scheduler.py", "            use_eagle=self.use_eagle,\n"),
+        ("v1/core/sched/scheduler.py",
+         "        if self.use_eagle:\n"
+         "            last_cache_position = max(last_cache_position - block_size, 0)\n"),
+    ],
+    "patch_capture.py": [
+        ("v1/worker/gpu/spec_decode/autoregressive/speculator.py",
+         "        self.hidden_states[:num_tokens_padded].copy_(hidden_states)\n"),
+    ],
+    "patch_lm_head_fp8.py": [
+        ("models/qwen3_8_flash_next/nvidia/model.py",
+         "    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:\n"
+         "        return self.logits_processor(self.lm_head, hidden_states)\n"),
+    ],
+}
+# Anchors of patch_mtp_fp8_head.py in the output of patch_mtp_draft_vocab.py.
+FP8_ANCHORS = [
+    "\n    full_gib = ",
+    "\n        logits = torch.nn.functional.linear(",
+    "\n\ndef _remap_ignored_layers(",
+]
 
 
 def read(path, mode="r"):
@@ -165,6 +198,29 @@ class RegistryTest(unittest.TestCase):
         with self.assertRaises(build.BuildError):
             build.docker_args_tokens([("K", "v\n")], [])
 
+    def test_out_dir_in_repository_must_be_ignored(self):
+        p = subprocess.run(["git", "-C", PKG, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            self.skipTest("the package is not in a git work tree")
+        top = p.stdout.strip()
+        with self.assertRaises(build.BuildError):
+            build.check_out_dir(os.path.join(top, "out"))
+        with self.assertRaises(build.BuildError):
+            build.check_out_dir(top)
+        build.check_out_dir(os.path.join(PKG, "out"))
+        build.check_out_dir(os.path.join(PKG, "out", "best"))
+        with tempfile.TemporaryDirectory() as t:
+            build.check_out_dir(t)
+        # The CLI refuses before it extracts or writes anything.
+        bad = os.path.join(top, f"qwen38-overlays-guard-test-{os.getpid()}")
+        self.assertFalse(os.path.exists(bad))
+        self.addCleanup(shutil.rmtree, bad, True)
+        p = run_build("--out", bad, "--set", "best")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("git does not ignore it", p.stderr)
+        self.assertFalse(os.path.exists(bad))
+
 
 @unittest.skipUnless(image_present(), f"docker or image {IMAGE} not present")
 class BuildTest(unittest.TestCase):
@@ -204,16 +260,20 @@ class BuildTest(unittest.TestCase):
                 for _rel, name in pairs:
                     self.assertTrue(os.path.isfile(os.path.join(t, name)))
 
-    def test_fp8_head_generator_applies_then_is_idempotent(self):
+    def mtp_chain(self, t):
+        """Run the recipe patch_mtp_draft_vocab.py in t. Return its output path."""
         if not self.has_recipe:
             self.skipTest("recipe patch_mtp_draft_vocab.py not present")
+        shutil.copy(os.path.join(RECIPE, "files", "patch_mtp_draft_vocab.py"), t)
+        shutil.copy(os.path.join(self.src, build.MTP_REL),
+                    os.path.join(t, "mtp_patched.py.orig"))
+        subprocess.run([sys.executable, os.path.join(t, "patch_mtp_draft_vocab.py")],
+                       cwd=t, check=True, capture_output=True)
+        return os.path.join(t, "mtp_patched.py")
+
+    def test_fp8_head_generator_applies_then_is_idempotent(self):
         with tempfile.TemporaryDirectory() as t:
-            shutil.copy(os.path.join(RECIPE, "files", "patch_mtp_draft_vocab.py"), t)
-            shutil.copy(os.path.join(self.src, build.MTP_REL),
-                        os.path.join(t, "mtp_patched.py.orig"))
-            subprocess.run([sys.executable, os.path.join(t, "patch_mtp_draft_vocab.py")],
-                           check=True, capture_output=True)
-            target = os.path.join(t, "mtp_patched.py")
+            target = self.mtp_chain(t)
             p = gen("patch_mtp_fp8_head.py", target)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("patch_mtp_fp8_head: applied", p.stdout)
@@ -225,16 +285,36 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(sha256(target), first)
 
     def test_anchor_count_must_be_one(self):
+        # A missing anchor (count 0) and a repeated anchor (count 2) both fail.
+        for script, anchors in SRC_OUT_ANCHORS.items():
+            for rel, anchor in anchors:
+                text = read(os.path.join(self.src, rel))
+                self.assertEqual(text.count(anchor), 1, f"{script}: {anchor!r}")
+                for count, changed in ((0, text.replace(anchor, "", 1)),
+                                       (2, text.replace(anchor, anchor + anchor, 1))):
+                    with self.subTest(script=script, anchor=anchor[:50], count=count), \
+                            tempfile.TemporaryDirectory() as t:
+                        tree = os.path.join(t, "src")
+                        shutil.copytree(self.src, tree)
+                        write(os.path.join(tree, rel), changed)
+                        p = gen(script, tree, os.path.join(t, "out"))
+                        self.assertNotEqual(p.returncode, 0)
+                        self.assertIn(f"anchor count {count}", p.stderr)
+
+    def test_fp8_head_anchor_count_must_be_one(self):
         with tempfile.TemporaryDirectory() as t:
-            rel = "v1/worker/gpu/spec_decode/autoregressive/speculator.py"
-            dup = os.path.join(t, "src", rel)
-            os.makedirs(os.path.dirname(dup))
-            text = read(os.path.join(self.src, rel))
-            anchor = "        self.hidden_states[:num_tokens_padded].copy_(hidden_states)\n"
-            write(dup, text.replace(anchor, anchor + anchor, 1))
-            p = gen("patch_capture.py", os.path.join(t, "src"), os.path.join(t, "out"))
-            self.assertNotEqual(p.returncode, 0)
-            self.assertIn("anchor count 2", p.stderr)
+            target = self.mtp_chain(t)
+            text = read(target)
+            for anchor in FP8_ANCHORS:
+                self.assertEqual(text.count(anchor), 1, repr(anchor))
+                for count, changed in ((0, text.replace(anchor, "\n#" + anchor[1:], 1)),
+                                       (2, text.replace(anchor, anchor + anchor, 1))):
+                    with self.subTest(anchor=anchor, count=count):
+                        write(target, changed)
+                        p = gen("patch_mtp_fp8_head.py", target)
+                        self.assertNotEqual(p.returncode, 0)
+                        self.assertIn(f"anchor count {count}", p.stderr)
+                        self.assertEqual(read(target), changed, "the file was changed")
 
     # (b) every output parses
     def test_outputs_parse(self):
@@ -369,10 +449,14 @@ class BuildTest(unittest.TestCase):
             self.assertIsInstance(o["env"], dict)
             self.assertIsInstance(o["files"], list)
             for f in o["files"]:
-                self.assertTrue(os.path.isabs(f["src"]))
                 self.assertTrue(os.path.isabs(f["mount_target"]))
-                if f["mode"] == "ro":
-                    self.assertTrue(os.path.isfile(f["src"]), f["src"])
+                self.assertTrue(os.path.isfile(f["src"]), f["src"])
+                self.assertEqual(f["mode"], "ro")
+            want_dirs = []
+            if o["name"] == "capture":
+                want_dirs = [{"src": build.CAPTURE_DIR_DEFAULT, "mount_target": "/cap",
+                              "mode": "rw"}]
+            self.assertEqual(o["dirs"], want_dirs)
         fp8 = m["overlays"][2]
         self.assertEqual(fp8["files"], [])
         self.assertEqual(fp8["env"], {"VLLM_MTP_DRAFT_HEAD_FP8": "1"})

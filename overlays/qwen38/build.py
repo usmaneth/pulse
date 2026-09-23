@@ -10,6 +10,9 @@ and writes the results to OUT:
     OUT/docker-args.txt       one shell-safe line for EXTRA_DOCKER_ARGS
     OUT/manifest.json         what was built, from which sources
 
+OUT must not be a directory in this repository that git does not ignore.
+Use overlays/qwen38/out/ or a directory outside the repository.
+
     build.sh --out OUT --set block-drop,mtp-fp8-head
     build.sh --out OUT --set best
 
@@ -250,6 +253,35 @@ def generate_mtp_reference(src, recipe, work, stage_dir, recipe_check):
     return ref
 
 
+def check_out_dir(out):
+    """Refuse an output directory in this repository that git does not ignore.
+
+    The output holds generated vLLM files and, for mtp-fp8-head, a reference
+    file that the recipe script patch_mtp_draft_vocab.py (AGPL-3.0) helps to
+    make. Do not commit them to this repository. When the builder is not in a
+    git work tree (for example a git archive), there is nothing to check.
+    """
+    try:
+        p = subprocess.run(["git", "-C", HERE, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True)
+    except FileNotFoundError:
+        return
+    if p.returncode != 0 or not p.stdout.strip():
+        return
+    top = os.path.realpath(p.stdout.strip())
+    real = os.path.realpath(out)
+    if os.path.commonpath([top, real]) != top:
+        return
+    probe = os.path.join(real, "manifest.json")
+    q = subprocess.run(["git", "-C", top, "check-ignore", "-q", probe],
+                       capture_output=True)
+    if q.returncode != 0:
+        raise BuildError(
+            f"--out {out} is in the repository {top} and git does not ignore "
+            f"it. Use {os.path.join(HERE, 'out')} or a directory outside the "
+            "repository.")
+
+
 def check_mounts(mounts):
     seen = set()
     for _src, target, _mode in mounts:
@@ -289,6 +321,7 @@ def install(data, dest):
 def build(args):
     names = resolve_set(args.set)
     out = os.path.abspath(args.out)
+    check_out_dir(out)
     capture_dir = os.path.abspath(args.capture_dir)
     recipe = os.path.abspath(args.recipe)
     selected = [BY_NAME[n] for n in names]
@@ -324,7 +357,8 @@ def build(args):
         for o in selected:
             stage_dir = os.path.join(stage, o["name"])
             entry = {"name": o["name"], "status": o["status"], "env": dict(o["env"]),
-                     "files": [], "generator": "generators/" + o["generator"],
+                     "files": [], "dirs": [],
+                     "generator": "generators/" + o["generator"],
                      "requires_profile": dict(o["requires_profile"])}
             if o["name"] == "mtp-fp8-head":
                 entry["applied_by"] = o["applied_by"]
@@ -345,8 +379,10 @@ def build(args):
                                            "mode": "ro"})
                     mounts.append((host, target, "ro"))
             if o["name"] == "capture":
-                entry["files"].append({"src": capture_dir, "mount_target": "/cap",
-                                       "mode": "rw"})
+                # A host directory, not a generated file: it goes in "dirs",
+                # so that every files[].src is a regular file.
+                entry["dirs"].append({"src": capture_dir, "mount_target": "/cap",
+                                      "mode": "rw"})
                 mounts.append((capture_dir, "/cap", "rw"))
             env_items += sorted(o["env"].items())
             manifest_overlays.append(entry)
