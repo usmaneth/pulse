@@ -28,12 +28,22 @@ The builder does these steps:
    `mtp-fp8-head`, the input is the output of the recipe
    `patch_mtp_draft_vocab.py` (see below). Every generator checks that each of
    its anchors occurs exactly once, and stops if not.
-3. It parses every output with `ast.parse`.
+3. It compiles every output with `compile()`. `ast.parse` is not
+   enough: it accepts a `from __future__` import after another statement,
+   and the import of that module then fails in the container.
 4. It writes `<dir>/<overlay>/*.py`, `<dir>/docker-args.txt` and
    `<dir>/manifest.json`.
 
 A rebuild with the same inputs writes no file. A changed file is replaced with
 `os.replace`, so a container that runs keeps the inode that it mounted.
+
+A rebuild into the same `<dir>` with a smaller set (for example `all`, then
+`best`) does not remove the directories of the overlays that are not in the
+set. A container that started with an earlier `docker-args.txt` names those
+files, and a restart of that container needs them. The builder gives a
+warning for each such directory. `docker-args.txt` and `manifest.json` name
+only the overlays of the current set. Remove an old directory when no
+container uses it.
 
 `docker-args.txt` is one line: the `-e` and `-v` arguments that a recipe
 profile adds to `EXTRA_DOCKER_ARGS`. The recipe pastes `EXTRA_DOCKER_ARGS`
@@ -54,7 +64,10 @@ timestamps, so a rebuild gives the same bytes.
   overlay mounts. Only `capture` has one (`--capture-dir` on `/cap`, `rw`).
   The builder does not make or check these directories.
 
-`docker-args.txt` holds the mounts of both lists.
+`docker-args.txt` holds the mounts of both lists. It is the source of truth
+for a profile. A tool that makes docker arguments from `manifest.json` must
+read `files` and `dirs`. If it reads only `files`, it loses the `/cap` mount
+of `capture`. The `best` set has no `dirs` entry.
 
 Options:
 
@@ -285,7 +298,8 @@ python3 -m unittest discover -s overlays/qwen38/tests -v   # the same tests
 ```
 
 The tests use docker without the GPU. They skip when docker or the pinned
-image is not present. They check that:
+image is not present. The `--out` guard test skips when git is not present.
+They check that:
 
 - every generator applies to the pristine image files (`mtp-fp8-head`: to
   the output of the recipe `patch_mtp_draft_vocab.py`);
@@ -293,8 +307,13 @@ image is not present. They check that:
   each of its anchors;
 - the SRC/OUT generators refuse a source that they already patched, and the
   FP8 generator makes no change on a second run;
-- every output parses with `ast`;
+- every output compiles with `compile()`, and the build refuses an output
+  that `ast.parse` accepts but `compile()` refuses;
+- `capture` and `lm-head-fp8` put `import os` after a docstring and a
+  `from __future__` import, if the source has them;
 - a rebuild writes nothing, and a changed output is replaced with a new inode;
+- a rebuild with a smaller set keeps the old overlay directories, warns for
+  each one, and writes only the current set to `docker-args.txt`;
 - the builder refuses an `--out` in this repository that git does not ignore;
 - the output sha256 values equal the pinned values and the files that the
   recipe serves today;

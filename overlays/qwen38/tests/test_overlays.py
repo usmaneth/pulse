@@ -215,8 +215,11 @@ class RegistryTest(unittest.TestCase):
             build.docker_args_tokens([("K", "v\n")], [])
 
     def test_out_dir_in_repository_must_be_ignored(self):
-        p = subprocess.run(["git", "-C", PKG, "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True)
+        try:
+            p = subprocess.run(["git", "-C", PKG, "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            self.skipTest("git not present")
         if p.returncode != 0:
             self.skipTest("the package is not in a git work tree")
         top = p.stdout.strip()
@@ -237,6 +240,24 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("git does not ignore it", p.stderr)
         self.assertFalse(os.path.exists(bad))
 
+    def test_python_check_uses_compile(self):
+        # ast.parse accepts a "from __future__" import after another
+        # statement. compile() refuses it, and so must the build.
+        late_future = b"import os\nfrom __future__ import annotations\n"
+        ast.parse(late_future)
+        with self.assertRaises(build.BuildError):
+            build.check_python(late_future, "late_future.py")
+        with self.assertRaises(build.BuildError):
+            build.check_python(b"x = 1\0\n", "null_byte.py")
+        build.check_python(b"from __future__ import annotations\nimport os\n", "ok.py")
+
+    def test_leftover_dirs(self):
+        with tempfile.TemporaryDirectory() as t:
+            for name in ("block-drop", "capture", "lm-head-fp8"):
+                os.makedirs(os.path.join(t, name))
+            self.assertEqual(build.leftover_dirs(t, ["block-drop", "mtp-fp8-head"]),
+                             ["capture", "lm-head-fp8"])
+            self.assertEqual(build.leftover_dirs(t, build.resolve_set("all")), [])
 
     def test_profile_owned_items_match_profile(self):
         # Each KEY=VALUE item that MANIFEST.md lists as owned by the profile
@@ -375,14 +396,56 @@ class BuildTest(unittest.TestCase):
                         self.assertIn(f"anchor count {count}", p.stderr)
                         self.assertEqual(read(target), changed, "the file was changed")
 
-    # (b) every output parses
-    def test_outputs_parse(self):
+    # (b) every output compiles
+    def test_outputs_compile(self):
         n = 0
         for rel, path in self.files(self.out_all).items():
             if rel.endswith(".py"):
-                ast.parse(read(path, "rb"), filename=path)
+                compile(read(path, "rb"), path, "exec", dont_inherit=True)
                 n += 1
         self.assertEqual(n, 6 if self.has_recipe else 5)
+
+    def test_import_os_goes_after_future_imports(self):
+        # A future image can start with a docstring and a __future__ import,
+        # and have no "import os". The output must still compile.
+        head = ('"""Module docstring."""\n'
+                "from __future__ import (\n    annotations,\n)\n")
+        for script, (_mark, pairs) in SRC_TO_OUT.items():
+            if script == "patch_block_drop.py":
+                continue  # it adds no import
+            (rel, name), = pairs
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as t:
+                tree = os.path.join(t, "src")
+                shutil.copytree(self.src, tree)
+                text = read(os.path.join(tree, rel))
+                self.assertNotIn("\nimport os\n", text)
+                write(os.path.join(tree, rel), head + text)
+                p = gen(script, tree, os.path.join(t, "out"))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                path = os.path.join(t, "out", name)
+                data = read(path, "rb")
+                compile(data, path, "exec", dont_inherit=True)
+                body = ast.parse(data).body
+                self.assertIsInstance(body[0], ast.Expr)
+                self.assertEqual(body[1].module, "__future__")
+                self.assertIsInstance(body[2], ast.Import)
+                self.assertEqual([a.name for a in body[2].names], ["os"])
+
+    def test_smaller_set_keeps_and_reports_leftover_dirs(self):
+        with tempfile.TemporaryDirectory() as t:
+            out = os.path.join(t, "out")
+            p = run_build("--out", out, "--set", "all", "--src", self.src)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            p = run_build("--out", out, "--set", "best", "--src", self.src)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            for name in ("capture", "lm-head-fp8"):
+                self.assertIn(f"{os.path.join(out, name)} is from an earlier build", p.stderr)
+                self.assertTrue(os.path.isdir(os.path.join(out, name)))
+            self.assertNotIn(os.path.join(out, "block-drop") + " is from", p.stderr)
+            line = read(os.path.join(out, "docker-args.txt"))
+            self.assertEqual(sorted(parse_args_line(line)), BEST_EXPECTED)
+            m = json.loads(read(os.path.join(out, "manifest.json")))
+            self.assertEqual([o["name"] for o in m["overlays"]], ["block-drop", "mtp-fp8-head"])
 
     # (c) idempotency
     def test_rebuild_writes_nothing(self):

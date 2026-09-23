@@ -18,7 +18,25 @@ SRC is an extracted vLLM package. The anchor must occur exactly once. A source
 that already holds the hook is refused, so the generator never patches its own
 output a second time.
 """
-import os, sys
+import ast, os, sys
+
+
+def add_import_os(s):
+    """Add "import os" at the start, but after each "from __future__" import.
+
+    A "from __future__" import must come before all other statements.
+    """
+    if "\nimport os\n" in s:
+        return s
+    end = 0
+    for node in ast.parse(s).body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            end = node.end_lineno
+    pos = 0
+    for _ in range(end):
+        pos = s.index("\n", pos) + 1
+    return s[:pos] + "import os\n" + s[pos:]
+
 
 if len(sys.argv) != 3:
     sys.exit("usage: patch_capture.py SRC OUT")
@@ -61,8 +79,7 @@ if n != 1:
 s = s.replace(ANCHOR, HOOK, 1)
 first_def = s.index("\nclass ")
 s = s[:first_def] + HELPER + s[first_def:]
-if "\nimport os\n" not in s:
-    s = "import os\n" + s
+s = add_import_os(s)
 os.makedirs(OUT, exist_ok=True)
 open(os.path.join(OUT, "ar_speculator_capture.py"), "w", encoding="utf-8").write(s)
 print("wrote ar_speculator_capture.py")

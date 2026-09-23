@@ -3,8 +3,8 @@
 
 An overlay is a change to the vLLM package in the serving image. The builder
 extracts the pristine vLLM files from the image (docker create + docker cp, no
-GPU), runs the generators in generators/, checks every output with ast.parse
-and writes the results to OUT:
+GPU), runs the generators in generators/, compiles every output and writes the
+results to OUT:
 
     OUT/<overlay>/<file>.py   generated files that a profile mounts
     OUT/docker-args.txt       one shell-safe line for EXTRA_DOCKER_ARGS
@@ -18,10 +18,13 @@ Use overlays/qwen38/out/ or a directory outside the repository.
 
 A rebuild with the same inputs writes no file. A changed file is replaced
 with os.replace, so a container that runs keeps the inode that it mounted.
+The builder does not remove the directory of an overlay that is not in the
+set, because a container that started with an earlier docker-args.txt can
+name its files. It gives a warning. docker-args.txt and manifest.json name
+only the overlays of the set.
 See MANIFEST.md for each overlay, its status and its evidence.
 """
 import argparse
-import ast
 import hashlib
 import json
 import os
@@ -304,6 +307,24 @@ def docker_args_tokens(env_items, mounts):
     return tokens
 
 
+def check_python(data, path):
+    """Stop the build when data is not a valid Python module.
+
+    compile() finds more errors than ast.parse. For example, ast.parse accepts
+    a "from __future__" import after another statement, and compile() does not.
+    """
+    try:
+        compile(data, path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError) as e:
+        raise BuildError(f"generated file does not compile: {path}: {e}")
+
+
+def leftover_dirs(out, names):
+    """Return the overlay directories in out that are not in names."""
+    return [o["name"] for o in OVERLAYS
+            if o["name"] not in names and os.path.isdir(os.path.join(out, o["name"]))]
+
+
 def install(data, dest):
     """Write bytes to dest only when they differ. Returns True on a write."""
     if os.path.isfile(dest):
@@ -387,17 +408,14 @@ def build(args):
             env_items += sorted(o["env"].items())
             manifest_overlays.append(entry)
 
-        # Every generated file must be valid Python.
+        # Every generated file must compile.
         staged = []
         for root, _dirs, files in os.walk(stage):
             for fname in files:
                 path = os.path.join(root, fname)
                 with open(path, "rb") as f:
                     data = f.read()
-                try:
-                    ast.parse(data, filename=path)
-                except SyntaxError as e:
-                    raise BuildError(f"generated file does not parse: {path}: {e}")
+                check_python(data, path)
                 staged.append((os.path.relpath(path, stage), data))
 
         check_mounts(mounts)
@@ -428,6 +446,12 @@ def build(args):
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    for name in leftover_dirs(out, names):
+        warn(f"{os.path.join(out, name)} is from an earlier build and is not in "
+             "this set. docker-args.txt and manifest.json do not name it. The "
+             "builder does not remove it: a container that started with an "
+             "earlier docker-args.txt names its files, and a restart of that "
+             "container needs them. Remove it when no container uses it.")
     print(f"overlays: {', '.join(names)}")
     print(f"out: {out}")
     print(f"written: {', '.join(written) if written else 'nothing (no change)'}")

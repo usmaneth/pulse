@@ -21,7 +21,25 @@ driftgate.py (top-1 agreement, KL) and the HumanEval gate before you ship it.
 SRC is an extracted vLLM package. The anchor must occur exactly once. A source
 that already holds the wrapper is refused.
 """
-import os, sys
+import ast, os, sys
+
+
+def add_import_os(s):
+    """Add "import os" at the start, but after each "from __future__" import.
+
+    A "from __future__" import must come before all other statements.
+    """
+    if "\nimport os\n" in s:
+        return s
+    end = 0
+    for node in ast.parse(s).body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            end = node.end_lineno
+    pos = 0
+    for _ in range(end):
+        pos = s.index("\n", pos) + 1
+    return s[:pos] + "import os\n" + s[pos:]
+
 
 if len(sys.argv) != 3:
     sys.exit("usage: patch_lm_head_fp8.py SRC OUT")
@@ -85,8 +103,7 @@ if n != 1:
 s = s.replace(OLD, NEW, 1)
 first_class = s.index("\nclass ")
 s = s[:first_class] + HELPER + s[first_class:]
-if "\nimport os\n" not in s:
-    s = "import os\n" + s
+s = add_import_os(s)
 os.makedirs(OUT, exist_ok=True)
 open(os.path.join(OUT, "nvidia_model_fp8head.py"), "w", encoding="utf-8").write(s)
 print("wrote nvidia_model_fp8head.py")
