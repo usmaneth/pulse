@@ -146,7 +146,8 @@ export function fragmentHelp(file: string): string[] {
     `gateway fragment: ${file}`,
     'The gateway reads this file only when it starts. To use it:',
     `  1. Set PULSE_GATEWAY_CONFIG=${file} (or start the gateway with --config ${file}).`,
-    '  2. Remove PULSE_QWEN_BACKENDS from ~/.config/pulse/qwen38.env. It replaces the endpoints of the file.',
-    '  3. Restart the gateway: systemctl --user restart pulse-qwen38. Pulse does not do this for you.',
+    '  2. Make sure that PULSE_QWEN_BACKENDS is not set. It replaces the endpoints of the file.',
+    '     If you run the pulse-qwen38 user service from deploy/systemd, remove it from ~/.config/pulse/qwen38.env.',
+    '  3. Restart the gateway. For the user service: systemctl --user restart pulse-qwen38. Pulse does not do this for you.',
   ];
 }

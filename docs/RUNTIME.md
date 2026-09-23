@@ -31,7 +31,7 @@ Do not use `npm run build` for this. That script also runs `make` for the CUDA c
 | `pulse model up ... --dry-run --preflight` | Also runs the read-only checks on the node. |
 | `pulse model down --node <node>` | Stops the server on the node. |
 | `pulse model status [--node <node>]` | Shows the container, the profile, drift, health, the KV cache size and memory. |
-| `pulse model smoke --node <node>` | Sends one short chat completion on the node. |
+| `pulse model smoke --node <node>` | Sends one short chat completion on the node. A protected node needs `--yes`. |
 | `pulse model fragment` | Writes the gateway backend file again from the saved state. |
 
 Options for `up`:
@@ -49,6 +49,14 @@ Options for `status`: `--json`, `--no-http` (no request to the server), and
 `--gpu-probe`. The GPU probe starts a GPU container on the node, so it runs
 only when you ask for it.
 
+A protected node gets these limits, also when `status` has no `--node`:
+
+- `status` sends no HTTP request to the server without `--yes`. It still
+  shows the container, the `.env`, the KV cache line and memory.
+- `status --gpu-probe` refuses without `--yes`. Name the node with `--node`
+  to probe only another node.
+- `smoke` refuses without `--yes`.
+
 ## Files
 
 ### runtime/nodes.json
@@ -59,7 +67,7 @@ One entry for each node:
 |---|---|
 | `host` | `local` (this host) or `ssh`. |
 | `ssh` | The ssh target, for example `spark2`. |
-| `protected` | `true` makes `up` and `down` refuse without `--yes`. |
+| `protected` | `true` makes `up`, `down`, `smoke` and `status --gpu-probe` refuse without `--yes`, and `status` sends no HTTP request without `--yes`. |
 | `env` | The node keys of the `.env`: `HF_HOME`, `BIND`, `PORT`, `REQUIRE_IDLE_GPU`. A profile cannot set them. |
 | `vars` | Values for `{{name}}` in profiles, for example `tritonCache` and `mtpShardR2`. |
 | `gatewayUrl` | The URL that the gateway uses for this node. |
@@ -100,6 +108,7 @@ Rules:
 - `EXTRA_DOCKER_ARGS` can contain only `-e NAME=VALUE` and `-v SRC:DST[:ro|rw]` pairs.
   The reason: `start.sh` puts this value without quotes into a generated bash script.
 - A key can occur only one time. `HF_TOKEN`, `API_KEY` and `TP1_CONTAINER_NAME` are not allowed.
+- `--api-key` is not allowed in `EXTRA_VLLM_ARGS`. Put the key in the node `.env` as `API_KEY`.
 
 Directives:
 
@@ -135,9 +144,20 @@ Each value is written as `KEY="value"`. A header comes first:
 ```
 
 The sha256 covers only the assignment lines. `status` uses it to find a file
-that somebody edited after the render. If the old `.env` has `HF_TOKEN=` or
-`API_KEY=` lines, the node script copies them to the end of the new file. Pulse
-never prints these values.
+that somebody edited after the render. With an overlay, the `pulse-overlay`
+line holds the overlay directory and `overlay-sha256`, the sha256 of
+`docker-args.txt` and `manifest.json`.
+
+The identity of a `.env` is the body sha256, the profile and the
+`pulse-overlay` line. `up` writes no new file when all three are the same.
+
+If the old `.env` has `HF_TOKEN=` or `API_KEY=` lines, the node script copies
+them to the end of the new file. Pulse never prints these values.
+
+`start.sh` gives `API_KEY` to vLLM as `--api-key`. Then vLLM refuses requests
+to `/v1` without the key. So each `curl` of `up`, `status` and `smoke` reads
+`API_KEY` from the node `.env` and sends it as a bearer token. The key goes to
+`curl` on stdin, so it is not on a command line.
 
 ## What `up` does
 
@@ -148,12 +168,13 @@ never prints these values.
    between the current key map and the render. It also counts the open client
    connections. A failure stops `up` before any change.
 2. It creates the `pulse-mkdir` directories.
-3. It writes the `.env`. First it copies the old file to
-   `.env.pulse-bak-<UTC time>`. It does not write the file when the sha256 and
-   the profile are the same.
-4. It runs `stop.sh` and makes sure that the container is gone.
-5. It waits until `MemAvailable` is at the gate (100 GiB). `stop.sh` returns
+3. It runs `stop.sh` and makes sure that the container is gone. `stop.sh`
+   reads the `.env`, so the old `.env` stays in place until this step is done.
+4. It waits until `MemAvailable` is at the gate (100 GiB). `stop.sh` returns
    before the memory is free.
+5. It writes the `.env`. First it copies the old file to
+   `.env.pulse-bak-<UTC time>`. It does not write the file when the identity
+   (the sha256, the profile and the overlay) is the same.
 6. It starts `start.sh` in a new session with `setsid`, so a lost ssh
    connection cannot stop it. `env -i` removes the caller environment, so the
    `.env` alone sets the recipe keys. The log goes to `logs/pulse-up-<UTC time>.log`.
@@ -162,11 +183,17 @@ never prints these values.
    `pulse-proof` texts.
 9. It writes the node state and the gateway backend file.
 
-If a node already runs the same `.env`, `up` does only steps 1, 7, 8 and 9.
-Use `--restart` to restart it.
+If a node already runs a `.env` with the same identity, `up` does only steps
+1, 7, 8 and 9. This is true only when the container started after the last
+change of the `.env` and after the last change (ctime) of each file that it
+mounts. A bind mount of a file keeps the old inode, so a rebuilt overlay file
+or a new MTP shard needs a restart, and `up` does it. Use `--restart` to
+restart the server in all cases.
 
-If a step fails after the `.env` write, `up` prints the backup path and the
-command that goes back to the previous profile.
+If a step fails after the stop step started, `up` marks the node `failed` in
+its state, and the gateway backend file disables its endpoint. `up` prints the
+backup path if it wrote one, and the command that goes back to the previous
+profile. If `down` fails in its stop step, it also marks the node `failed`.
 
 ## Safety
 
@@ -175,7 +202,8 @@ command that goes back to the previous profile.
 - `--dry-run --preflight` runs only step 1, which only reads.
 - Every node script goes to `bash -s` on stdin. The login shell of the node
   does not parse it. On spark2 the login shell is zsh.
-- `up` and `down` refuse a protected node without `--yes`.
+- `up` and `down` refuse a protected node without `--yes`. `smoke` and
+  `status --gpu-probe` also refuse it, and `status` sends it no HTTP request.
 - `up` refuses a render-only profile, and an experimental profile without `--experimental`.
 - Pulse never calls `start.sh --no-launch`. That mode starts helper containers
   and writes `.last_launch.sh`.
@@ -197,8 +225,10 @@ enabled endpoint, so the first node stays enabled in that case, with a warning.
 The gateway reads its config only when it starts. To use the file:
 
 1. Set `PULSE_GATEWAY_CONFIG` to the file, or start the gateway with `--config <file>`.
-2. Remove `PULSE_QWEN_BACKENDS` from `~/.config/pulse/qwen38.env`. That variable replaces the endpoints of the file.
-3. Restart the gateway: `systemctl --user restart pulse-qwen38`.
+2. Make sure that `PULSE_QWEN_BACKENDS` is not set. That variable replaces the
+   endpoints of the file. If you run the `pulse-qwen38` user service from
+   `deploy/systemd`, remove the variable from `~/.config/pulse/qwen38.env`.
+3. Restart the gateway. For the user service: `systemctl --user restart pulse-qwen38`.
 
 Pulse does not do these steps. The file holds only `models`, so the other
 gateway settings get their default values.
@@ -220,10 +250,17 @@ it checks `$BIND`, or `0.0.0.0` with a firewall.
 ## Overlays
 
 `overlays/qwen38/build.sh --out DIR --set NAMES` writes `DIR/docker-args.txt`
-and `DIR/manifest.json`. `docker-args.txt` holds `-e` and `-v` pairs, one pair
-on each line. Lines that start with `#` are comments. The paths must be
-absolute paths on the node. Pulse writes `manifest.json` into the node state
-without a change.
+and `DIR/manifest.json`. `docker-args.txt` holds `-e` and `-v` pairs with white
+space between the words. The builder writes all pairs on one line. Pulse also
+reads pairs on more than one line, and lines that start with `#` are comments.
+The paths must be absolute paths on the node. Pulse writes `manifest.json`
+into the node state without a change.
+
+A new build with a different `docker-args.txt` or `manifest.json` changes the
+`overlay-sha256` of the `.env`, so `up` writes a new `.env` and restarts the
+server. The builder replaces a changed file with a new inode. A running
+container does not see the new file, and the mount check of `up` restarts the
+server for this case too.
 
 An overlay mount on the same path as a profile mount is an error. Use
 `--overlay-wins` to replace the profile mount; the plan then shows each
@@ -242,9 +279,9 @@ spark1 is its head node, and its `stop.sh` stops the servers on both nodes. So
 - The memory gate is 100 GiB, and it depends on `vm.watermark_scale_factor`.
   A higher factor makes `MemAvailable` smaller for the same free memory. With
   factor 300 (a test on 2026-09-23), `MemAvailable` with no server was 96.6 GiB
-  on spark1 and 99.4 GiB on spark2, so step 5 timed out. The same change
-  also stopped the spark2 server: `MemAvailable` fell below the 6 GiB floor of
-  the recipe watchdog. `status` shows the factor. If you keep a high factor,
+  on spark1 and 99.4 GiB on spark2, so the memory wait (step 4) would time
+  out. The same change also stopped the spark2 server: `MemAvailable` fell
+  below the 6 GiB floor of the recipe watchdog. `status` shows the factor. If you keep a high factor,
   set a new gate with `minMemAvailableGiB` in `runtime/nodes.json` or with `--min-mem-gib`.
 - `nvidia-smi` on spark2 did not always list the vLLM container. `status` shows
   the list for information only. The container state and memory are the real signals.
