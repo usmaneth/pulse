@@ -116,7 +116,7 @@ RECIPE_TARGETS = {VLLM_PKG + "/" + rel for rel in (
 
 # docker-args.txt is pasted unquoted into the recipe launch script, so every
 # token must be free of shell metacharacters and whitespace.
-SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_./:@+=,-]+$")
+SAFE_TOKEN = re.compile(r"[A-Za-z0-9_./:@+=,-]+")
 
 
 class BuildError(Exception):
@@ -267,7 +267,7 @@ def docker_args_tokens(env_items, mounts):
     for src, target, mode in mounts:
         tokens += ["-v", f"{src}:{target}" + (":ro" if mode == "ro" else "")]
     for tok in tokens:
-        if not SAFE_TOKEN.match(tok):
+        if not SAFE_TOKEN.fullmatch(tok):
             raise BuildError(f"docker argument {tok!r} is not shell-safe")
     return tokens
 

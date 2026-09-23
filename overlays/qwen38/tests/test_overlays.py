@@ -162,6 +162,8 @@ class RegistryTest(unittest.TestCase):
             build.docker_args_tokens([], [("/a b", t, "ro")])
         with self.assertRaises(build.BuildError):
             build.docker_args_tokens([("K", "$(x)")], [])
+        with self.assertRaises(build.BuildError):
+            build.docker_args_tokens([("K", "v\n")], [])
 
 
 @unittest.skipUnless(image_present(), f"docker or image {IMAGE} not present")
