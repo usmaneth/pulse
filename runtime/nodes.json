@@ -1,0 +1,75 @@
+{
+  "minMemAvailableGiB": 100,
+  "memTimeoutS": 600,
+  "readyGraceS": 300,
+  "nodes": {
+    "spark1": {
+      "description": "DGX Spark 1 (10.99.0.1). Serves live Codex traffic.",
+      "host": "local",
+      "protected": true,
+      "env": {
+        "HF_HOME": "/models/usman/hf",
+        "BIND": "127.0.0.1",
+        "PORT": "8888"
+      },
+      "vars": {
+        "tritonCache": "/models/usman/triton-cache",
+        "mtpShardR2": "/models/usman/distill/shard34_r2.safetensors",
+        "captureDir": "/models/usman/distill/cap",
+        "hfSnapshot": "925d7be6c14c6c9442ef83e8f05b5a3c39304f69"
+      },
+      "gatewayUrl": "http://127.0.0.1:8888/v1",
+      "gpuProbe": "bash /models/usman/qwen38-tune/probe.sh",
+      "recipes": {
+        "qwen38-flash": {
+          "dir": "/models/usman/qwen38-flash",
+          "start": "./start.sh",
+          "stop": "./stop.sh",
+          "container": "vllm-fn-tp1",
+          "dockerArgs": ["-v", "/models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache"]
+        },
+        "qwen38-dual": {
+          "dir": "/models/usman/qwen38-dual",
+          "start": "./start.sh --launch",
+          "stop": "./stop.sh",
+          "container": "vllm-fn",
+          "vars": {
+            "headIp": "10.99.0.1",
+            "workerIp": "10.99.0.2",
+            "iface": "enp1s0f1np1",
+            "ibHca": "=rocep1s0f1",
+            "workerHfHome": "/home/usman/.cache/huggingface"
+          }
+        }
+      }
+    },
+    "spark2": {
+      "description": "DGX Spark 2 (10.99.0.2), reached over ssh.",
+      "host": "ssh",
+      "ssh": "spark2",
+      "env": {
+        "HF_HOME": "/home/usman/.cache/huggingface",
+        "BIND": "127.0.0.1",
+        "PORT": "8888",
+        "REQUIRE_IDLE_GPU": "false"
+      },
+      "vars": {
+        "tritonCache": "/models/usman/triton-cache",
+        "mtpShardR2": "/models/usman/distill/shard34_r2.safetensors",
+        "captureDir": "/models/usman/distill/cap",
+        "hfSnapshot": "925d7be6c14c6c9442ef83e8f05b5a3c39304f69"
+      },
+      "gatewayUrl": "http://10.99.0.2:8888/v1",
+      "gpuProbe": "bash /models/usman/distill/probe.sh",
+      "recipes": {
+        "qwen38-flash": {
+          "dir": "/models/usman/qwen38-flash",
+          "start": "./start.sh",
+          "stop": "./stop.sh",
+          "container": "vllm-fn-tp1",
+          "dockerArgs": ["-v", "/models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache"]
+        }
+      }
+    }
+  }
+}
