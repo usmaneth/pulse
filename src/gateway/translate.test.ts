@@ -4,7 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, flattenTools, normalizeToolOutput, responsesToChat,
+  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, arrangeSystem, flattenTools, grammarHint, mapToolChoice,
+  mergeAssistantTurns, normalizeToolOutput, responsesToChat,
 } from './translate.js';
 import type { Obj, ResponseEvent } from './translate.js';
 
@@ -68,7 +69,8 @@ test('tools: function kept, custom wrapped, namespace flattened, tool_search and
   const { tools, map } = flattenTools(CODEX_TOOLS);
   assert.deepEqual(tools.map((t) => t.function.name), ['shell_command', 'apply_patch', 'mcp__github__get_issue']);
   const patch = tools[1].function;
-  assert.equal(patch.description, 'Use the apply_patch tool to edit files.' + CUSTOM_TOOL_HINT);
+  assert.equal(patch.description, 'Use the apply_patch tool to edit files.' + CUSTOM_TOOL_HINT +
+    '\nThe input string must follow this lark grammar:\nstart: begin_patch');
   assert.deepEqual(patch.parameters, { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] });
   assert(map.custom.has('apply_patch'));
   assert.deepEqual(map.namespaced.get('mcp__github__get_issue'), ['mcp__github', 'get_issue']);
@@ -98,7 +100,7 @@ test('history: system merge, tool calls, custom calls, namespaces, parallel call
   assert.deepEqual(payload.messages, [
     { role: 'system', content: 'base instructions\n\ndev note' },
     { role: 'user', content: 'fix the bug' },
-    { role: 'assistant', content: null, tool_calls: [
+    { role: 'assistant', content: null, reasoning_content: 'thinking', tool_calls: [
       { id: 'c1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
       { id: 'c2', type: 'function', function: { name: 'mcp__github__get_issue', arguments: '{"number":1}' } },
     ] },
@@ -125,6 +127,130 @@ test('invalid requests raise RequestError', () => {
   assert.throws(() => responsesToChat([], qwen), RequestError);
   assert.throws(() => responsesToChat({ input: 3 }, qwen), RequestError);
   assert.throws(() => responsesToChat({ input: 'x', previous_response_id: 'r' }, qwen), RequestError);
+});
+
+test('unsupported input gets a clear RequestError instead of a silent drop', () => {
+  const bad: Array<[Obj, RegExp]> = [
+    [{ input: 'x', conversation: 'c' }, /conversation is not supported/],
+    [{ input: 'x', background: true }, /background is not supported/],
+    [{ input: 'x', store: true }, /store=true is not supported/],
+    [{ input: 'x', text: { format: { type: 'json_schema', schema: {} } } }, /text.format json_schema/],
+    [{ input: [{ type: 'web_search_call', id: 'w' }] }, /unsupported input item type: web_search_call/],
+    [{ input: [{ type: 'message', role: 'tool', content: 'x' }] }, /unsupported message role: tool/],
+  ];
+  for (const [request, message] of bad) assert.throws(() => responsesToChat(request, qwen), message);
+  // Codex sends these. They must pass.
+  responsesToChat({ input: 'x', store: false, text: { format: { type: 'text' }, verbosity: 'low' } }, qwen);
+});
+
+test('grammar hint: only custom tools with a grammar format get one', () => {
+  assert.equal(grammarHint(undefined), '');
+  assert.equal(grammarHint({ type: 'text' }), '');
+  assert.equal(grammarHint({ type: 'grammar', syntax: 'lark', definition: '  ' }), '');
+  assert.equal(grammarHint({ type: 'grammar', syntax: 'regex', definition: 'a+\n' }), '\nThe input string must follow this regex grammar:\na+');
+  const { tools } = flattenTools([{ type: 'custom', name: 'free', description: 'd' }]);
+  assert.equal(tools[0].function.description, 'd' + CUSTOM_TOOL_HINT);
+});
+
+test('reasoning replay: reasoning, text and calls of one turn become one assistant message', () => {
+  const input = [
+    { type: 'message', role: 'user', content: 'go' },
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'plan' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Running ls.' }] },
+    { type: 'function_call', call_id: 'c1', name: 'shell_command', arguments: '{"command":"ls"}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'a.ts' },
+    { type: 'reasoning', summary: [], encrypted_content: 'opaque' },
+    { type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: 'from content' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] },
+  ];
+  const { payload } = responsesToChat({ model: 'm', input }, qwen);
+  assert.deepEqual(payload.messages, [
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: 'Running ls.', reasoning_content: 'plan', tool_calls: [
+      { id: 'c1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: 'a.ts' },
+    { role: 'assistant', content: 'Done.', reasoning_content: 'from content' },
+  ]);
+  const off = responsesToChat({ model: 'm', input }, { ...qwen, replayReasoning: false }).payload;
+  assert.equal(off.messages[1].reasoning_content, undefined);
+  assert.equal(off.messages[1].content, 'Running ls.');
+});
+
+test('merge: a new model turn starts at reasoning or text that follows calls', () => {
+  const call = (id: string) => ({ id, type: 'function', function: { name: 'f', arguments: '{}' } });
+  assert.deepEqual(mergeAssistantTurns([
+    { role: 'assistant', content: null, tool_calls: [call('a')] },
+    { role: 'assistant', content: null, tool_calls: [call('b')] },
+    { role: 'assistant', content: null, reasoning_content: 'r2' },
+    { role: 'assistant', content: 'x' },
+    { role: 'assistant', content: null, tool_calls: [call('c')] },
+    { role: 'assistant', content: 'after calls' },
+  ]), [
+    { role: 'assistant', content: null, tool_calls: [call('a'), call('b')] },
+    { role: 'assistant', content: 'x', reasoning_content: 'r2', tool_calls: [call('c')] },
+    { role: 'assistant', content: 'after calls' },
+  ]);
+});
+
+test('system: qwen38 keeps a late developer message in place; llamacpp moves it to the start', () => {
+  const messages = [
+    { role: 'system', content: 'a' },
+    { role: 'system', content: 'b' },
+    { role: 'user', content: 'u1' },
+    { role: 'system', content: 'late' },
+    { role: 'system', content: '' },
+    { role: 'user', content: 'u2' },
+  ];
+  assert.deepEqual(arrangeSystem(messages.map((m) => ({ ...m })), 'qwen38'), [
+    { role: 'system', content: 'a\n\nb' },
+    { role: 'user', content: 'u1' },
+    { role: 'system', content: 'late' },
+    { role: 'user', content: 'u2' },
+  ]);
+  assert.deepEqual(arrangeSystem(messages.map((m) => ({ ...m })), 'llamacpp'), [
+    { role: 'system', content: 'a\n\nb\n\nlate' },
+    { role: 'user', content: 'u1' },
+    { role: 'user', content: 'u2' },
+  ]);
+});
+
+test('prefix stability: the next turn starts with the same messages', () => {
+  const turn1 = [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rules' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'task' }] },
+  ];
+  const turn2 = [
+    ...turn1,
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'plan' }] },
+    { type: 'function_call', call_id: 'c1', name: 'shell_command', arguments: '{"command":"ls"}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'a.ts' },
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'approval mode changed' }] },
+  ];
+  const body = { model: 'm', instructions: 'base', tools: CODEX_TOOLS, reasoning: { effort: 'high' } };
+  const a = responsesToChat({ ...body, input: turn1 }, qwen).payload;
+  const b = responsesToChat({ ...body, input: turn2 }, qwen).payload;
+  assert.equal(JSON.stringify(b.tools), JSON.stringify(a.tools));
+  assert.equal(JSON.stringify(b.messages.slice(0, a.messages.length)), JSON.stringify(a.messages));
+});
+
+test('tool_choice: names map to the flat function name; parallel_tool_calls passes', () => {
+  const names = new Set(['shell_command', 'apply_patch', 'mcp__github__get_issue']);
+  assert.equal(mapToolChoice('auto', names), 'auto');
+  assert.equal(mapToolChoice('required', names), 'required');
+  assert.deepEqual(mapToolChoice({ type: 'custom', name: 'apply_patch' }, names), { type: 'function', function: { name: 'apply_patch' } });
+  assert.deepEqual(mapToolChoice({ type: 'function', name: 'get_issue', namespace: 'mcp__github' }, names),
+    { type: 'function', function: { name: 'mcp__github__get_issue' } });
+  assert.throws(() => mapToolChoice({ type: 'function', name: 'nope' }, names), /not in tools/);
+  assert.throws(() => mapToolChoice({ type: 'allowed_tools', tools: [] }, names), /unsupported tool_choice type/);
+  assert.throws(() => mapToolChoice('sometimes', names), /unsupported tool_choice/);
+  const { payload } = responsesToChat({ model: 'm', input: 'x', tools: CODEX_TOOLS, tool_choice: 'auto', parallel_tool_calls: true }, qwen);
+  assert.equal(payload.tool_choice, 'auto');
+  assert.equal(payload.parallel_tool_calls, true);
+  // vLLM rejects tool_choice without tools, so it is not sent.
+  const bare = responsesToChat({ model: 'm', input: 'x', tool_choice: 'auto', parallel_tool_calls: false }, qwen).payload;
+  assert.equal(bare.tool_choice, undefined);
+  assert.equal(bare.parallel_tool_calls, undefined);
 });
 
 // ----------------------------------------------------------------- stream
@@ -204,14 +330,17 @@ test('stream: qwen3_xml tool call deltas become a function_call', () => {
     { type: call.type, call_id: call.call_id, name: call.name, arguments: call.arguments, status: call.status },
     { type: 'function_call', call_id: 'chatcmpl-tool-1', name: 'shell_command', arguments: '{"command": "ls -la"}', status: 'completed' },
   );
-  assert.deepEqual(types(events).slice(-6), [
+  assert.deepEqual(types(events).slice(-7), [
     'response.output_item.done', // reasoning closes when the tool call starts
     'response.output_item.added',
+    'response.function_call_arguments.delta',
     'response.function_call_arguments.delta',
     'response.function_call_arguments.done',
     'response.output_item.done',
     'response.completed',
   ]);
+  const deltas = events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta);
+  assert.deepEqual(deltas, ['{"command": ', '"ls -la"}']);
   const added = events.find((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call') as Obj;
   assert.equal(added.output_index, 1);
   assert.equal(added.item.status, 'in_progress');
@@ -272,9 +401,83 @@ test('stream: finish_reason length is incomplete and drops partial tool calls', 
   ]);
   assert.equal(t.response.status, 'incomplete');
   assert.deepEqual(t.response.incomplete_details, { reason: 'max_output_tokens' });
+  // The text before the call is complete. The call is not, and it leaves the output.
   assert.equal(t.response.output.length, 1);
-  assert.equal(t.response.output[0].status, 'incomplete');
+  assert.equal(t.response.output[0].type, 'message');
+  assert.equal(t.response.output[0].status, 'completed');
   assert.equal(events.at(-1)!.type, 'response.incomplete');
+  assert(!events.some((e) => e.type === 'response.function_call_arguments.done'));
+  assert(!events.some((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'function_call'));
+});
+
+test('stream: finish_reason length marks a text-only message incomplete', () => {
+  const { t } = run([chunk({ content: 'partial' }), chunk({}, 'length')]);
+  assert.equal(t.response.output[0].status, 'incomplete');
+});
+
+test('stream: finish_reason length drops every call of the turn, also the complete ones', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":"ls"}' } }] }),
+    chunk({ tool_calls: [{ index: 1, id: 'b', function: { name: 'shell_command', arguments: '{"comm' } }] }),
+    chunk({}, 'length'),
+  ]);
+  assert.deepEqual(t.response.output, []);
+  assert(!events.some((e) => e.type === 'response.output_item.done'));
+});
+
+test('stream: function call arguments go out before the finish reason', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  const first = t.push(chunk({ tool_calls: [{ index: 0, id: 'c', function: { name: 'shell_command', arguments: '{"comm' } }] }));
+  assert.deepEqual(types(first), ['response.output_item.added', 'response.function_call_arguments.delta']);
+  assert.equal((first[0] as Obj).item.status, 'in_progress');
+  assert.equal((first[0] as Obj).item.arguments, '');
+  const second = t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: 'and":"ls"}' } }] }));
+  assert.deepEqual(types(second), ['response.function_call_arguments.delta']);
+  assert.equal((second[0] as Obj).delta, 'and":"ls"}');
+  t.push(chunk({}, 'tool_calls'));
+  const end = t.finishStream();
+  assert.deepEqual(types(end), ['response.function_call_arguments.done', 'response.output_item.done', 'response.completed']);
+  assert.equal((end[0] as Obj).arguments, '{"command":"ls"}');
+  assert.equal((end[1] as Obj).item.status, 'completed');
+});
+
+test('stream: text closes before the first call; white space between calls is dropped', () => {
+  const { events, t } = run([
+    chunk({ content: 'I will list.' }),
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":"ls"}' } }] }),
+    chunk({ content: '\n' }),
+    chunk({ tool_calls: [{ index: 1, id: 'b', function: { name: 'shell_command', arguments: '{"command":"pwd"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.deepEqual(t.response.output.map((i: Obj) => i.type), ['message', 'function_call', 'function_call']);
+  assert.equal(t.response.output[0].content[0].text, 'I will list.');
+  const doneMsg = events.findIndex((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'message');
+  const addedCall = events.findIndex((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call');
+  assert(doneMsg < addedCall);
+  const doneIds = events.filter((e) => e.type === 'response.output_item.done').map((e) => (e as Obj).item.call_id);
+  assert.deepEqual(doneIds, [undefined, 'a', 'b']);
+});
+
+test('stream: arguments that arrive before the name go out when the name arrives', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { arguments: '{"command":' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { name: 'shell_command', arguments: '"ls"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  const deltas = events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta);
+  assert.equal(deltas.join(''), '{"command":"ls"}');
+  assert.equal(t.response.output[0].arguments, '{"command":"ls"}');
+});
+
+test('stream: a call without arguments gets {}', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.equal(t.response.output[0].arguments, '{}');
+  assert.equal(events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta).join(''), '{}');
 });
 
 test('stream: a stream without a finish reason fails', () => {

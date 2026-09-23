@@ -24,6 +24,8 @@ export interface TranslateOptions {
   upstreamModel: string;
   /** Cap for one tool output in characters. 0 disables the cap. */
   maxToolOutputChars: number;
+  /** Send the text of earlier reasoning items back to the model. Default true. */
+  replayReasoning?: boolean;
 }
 
 /**
@@ -137,12 +139,44 @@ export function flattenTools(tools: unknown): { tools: Obj[]; map: ToolMap } {
       }
     } else if (tool.type === 'custom' && typeof tool.name === 'string') {
       map.custom.add(tool.name);
-      fn(tool.name, (tool.description ?? '') + CUSTOM_TOOL_HINT, {
+      fn(tool.name, (tool.description ?? '') + CUSTOM_TOOL_HINT + grammarHint(tool.format), {
         type: 'object', properties: { input: { type: 'string' } }, required: ['input'],
       });
     }
   }
   return { tools: out, map };
+}
+
+/**
+ * Text that gives the model the grammar of a freeform tool. Codex sends the
+ * Lark grammar of apply_patch in `format`. A function tool cannot carry a
+ * grammar, so the grammar goes into the description instead.
+ */
+export function grammarHint(format: unknown): string {
+  if (!format || typeof format !== 'object') return '';
+  const f = format as Obj;
+  if (f.type !== 'grammar' || typeof f.definition !== 'string' || !f.definition.trim()) return '';
+  const syntax = typeof f.syntax === 'string' && f.syntax ? `${f.syntax} ` : '';
+  return `\nThe input string must follow this ${syntax}grammar:\n${f.definition.trim()}`;
+}
+
+/**
+ * Map a Responses tool_choice to Chat Completions. Named function and custom
+ * tools become a named function. Namespaced tools use the flat name.
+ */
+export function mapToolChoice(choice: unknown, available: Set<string>): unknown {
+  if (typeof choice === 'string') {
+    if (['auto', 'none', 'required'].includes(choice)) return choice;
+    throw new RequestError(`unsupported tool_choice: ${choice}`);
+  }
+  if (!choice || typeof choice !== 'object') throw new RequestError('tool_choice must be a string or an object');
+  const c = choice as Obj;
+  if ((c.type !== 'function' && c.type !== 'custom') || typeof c.name !== 'string') {
+    throw new RequestError(`unsupported tool_choice type: ${String(c.type)}`);
+  }
+  const name = c.namespace ? `${c.namespace}${NAMESPACE_SEPARATOR}${c.name}` : c.name;
+  if (!available.has(name)) throw new RequestError(`tool_choice names a tool that is not in tools: ${name}`);
+  return { type: 'function', function: { name } };
 }
 
 /** Apply the reasoning-effort rules for one profile to a chat payload. */
@@ -166,15 +200,64 @@ export function applyReasoning(payload: Obj, profile: ProfileName, effort: unkno
   payload.reasoning_effort = value;
 }
 
+/** Top-level request fields that need server-side state. */
+const STATEFUL_KEYS = ['previous_response_id', 'conversation', 'background'];
+
+/** Join the summary text of a reasoning item. */
+export function reasoningText(item: Obj): string {
+  const parts = (list: unknown) => Array.isArray(list)
+    ? list.filter((p) => p && typeof p.text === 'string').map((p) => p.text as string)
+    : [];
+  const summary = parts(item.summary);
+  // The summary is what this gateway emits. `content` (reasoning_text) is the
+  // fallback for items from other servers.
+  return (summary.length ? summary : parts(item.content)).join('\n\n');
+}
+
+/**
+ * Merge consecutive assistant messages into one turn. Codex sends one model
+ * turn as separate items (reasoning, message, tool calls). The chat template
+ * expects them in one assistant message, in the order the model wrote them.
+ */
+export function mergeAssistantTurns(messages: Obj[]): Obj[] {
+  const out: Obj[] = [];
+  for (const message of messages) {
+    const last = out.at(-1);
+    if (message.role !== 'assistant' || last?.role !== 'assistant') {
+      out.push(message);
+      continue;
+    }
+    // Reasoning that follows text or tool calls starts a new model turn.
+    if (message.reasoning_content && (last.content != null || last.tool_calls)) {
+      out.push(message);
+      continue;
+    }
+    if (message.reasoning_content) last.reasoning_content = (last.reasoning_content ?? '') + message.reasoning_content;
+    if (message.content != null) {
+      // Text after tool calls also starts a new model turn.
+      if (last.tool_calls) { out.push(message); continue; }
+      last.content = (last.content ?? '') + message.content;
+    }
+    if (message.tool_calls) last.tool_calls = [...(last.tool_calls ?? []), ...message.tool_calls];
+  }
+  return out;
+}
+
 /** Translate a stateless, full-history Responses request to Chat Completions. */
 export function responsesToChat(request: unknown, options: TranslateOptions): ChatRequest {
   if (!request || typeof request !== 'object' || Array.isArray(request)) {
     throw new RequestError('request must be a JSON object');
   }
   const body = request as Obj;
-  if (body.previous_response_id) {
-    throw new RequestError('previous_response_id is not supported; send the full input history');
+  for (const key of STATEFUL_KEYS) {
+    if (body[key]) throw new RequestError(`${key} is not supported; send the full input history`);
   }
+  if (body.store === true) throw new RequestError('store=true is not supported; the gateway keeps no state, so set store=false');
+  const format = body.text?.format;
+  if (format && typeof format === 'object' && format.type !== 'text') {
+    throw new RequestError(`text.format ${String(format.type)} is not supported; only text output is available`);
+  }
+  const replayReasoning = options.replayReasoning ?? true;
   const messages: Obj[] = [];
   if (typeof body.instructions === 'string' && body.instructions) {
     messages.push({ role: 'system', content: body.instructions });
@@ -191,53 +274,57 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
       if (type === 'message' || (type === undefined && 'role' in item)) {
         let role = item.role ?? 'user';
         if (role === 'developer') role = 'system';
-        if (!['system', 'user', 'assistant'].includes(role)) continue;
+        if (!['system', 'user', 'assistant'].includes(role)) {
+          throw new RequestError(`unsupported message role: ${String(item.role)}`);
+        }
         const text = messageText(item.content);
         // Codex adds a plugin advertisement block. The router drops it; it
         // only adds prompt tokens for a model that cannot use the plugins.
         if (text.includes('<recommended_plugins>')) continue;
         messages.push({ role, content: text });
+      } else if (type === 'reasoning') {
+        // The Qwen3.8 template renders each assistant turn as
+        // `<think>reasoning</think>content`. With the reasoning replayed, the
+        // history is the same text that the model wrote, so the model sees
+        // its own plan in a tool loop. Items without text (for example
+        // encrypted reasoning from another provider) carry nothing usable.
+        const text = replayReasoning ? reasoningText(item) : '';
+        if (text) messages.push({ role: 'assistant', content: null, reasoning_content: text });
       } else if (CALL_TYPES.has(type)) {
         const args = typeof item.arguments === 'string'
           ? item.arguments
           : JSON.stringify({ input: typeof item.input === 'string' ? item.input : '' });
         const call = { id: item.call_id ?? item.id, type: 'function', function: { name: flatName(item), arguments: args } };
-        // Parallel calls from one model turn arrive as consecutive items.
-        // Merge them into one assistant message, which is the shape the
-        // model produced and the shape the chat template expects.
-        const last = messages.at(-1);
-        if (last?.role === 'assistant' && Array.isArray(last.tool_calls) && last.content == null) {
-          last.tool_calls.push(call);
-        } else {
-          messages.push({ role: 'assistant', content: null, tool_calls: [call] });
-        }
+        messages.push({ role: 'assistant', content: null, tool_calls: [call] });
       } else if (OUTPUT_TYPES.has(type)) {
         messages.push({
           role: 'tool',
           tool_call_id: item.call_id,
           content: normalizeToolOutput(item.output, options.maxToolOutputChars),
         });
+      } else {
+        throw new RequestError(`unsupported input item type: ${String(type)}`);
       }
-      // Other items (reasoning, web_search_call, compaction markers) carry
-      // nothing that a chat template can use. They are dropped, as in the router.
     }
   } else if (body.input != null) {
     throw new RequestError('input must be a string or an array');
   }
 
-  // Chat templates accept one system message at the start.
-  const system = messages.filter((m) => m.role === 'system').map((m) => m.content).filter(Boolean);
-  const rest = messages.filter((m) => m.role !== 'system');
-  if (system.length) rest.unshift({ role: 'system', content: system.join('\n\n') });
-
   const payload: Obj = {
     model: options.upstreamModel,
-    messages: rest.length ? rest : [{ role: 'user', content: ' ' }],
+    messages: arrangeSystem(mergeAssistantTurns(messages), options.profile),
     stream: true,
     stream_options: { include_usage: true },
   };
+  if (!payload.messages.length) payload.messages = [{ role: 'user', content: ' ' }];
   const { tools, map } = flattenTools(body.tools);
-  if (tools.length) payload.tools = tools;
+  if (tools.length) {
+    payload.tools = tools;
+    if (body.tool_choice != null) {
+      payload.tool_choice = mapToolChoice(body.tool_choice, new Set(tools.map((t) => t.function.name)));
+    }
+    if (typeof body.parallel_tool_calls === 'boolean') payload.parallel_tool_calls = body.parallel_tool_calls;
+  }
   if (typeof body.max_output_tokens === 'number') payload.max_tokens = body.max_output_tokens;
   for (const key of ['temperature', 'top_p']) {
     if (typeof body[key] === 'number') payload[key] = body[key];
@@ -249,6 +336,31 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
     payload.cache_prompt = true;
   }
   return { payload, tools: map };
+}
+
+/**
+ * Put the system messages where the chat template accepts them.
+ *
+ * qwen38: the leading system messages merge into one. A later system message
+ * (Codex sends a developer message when a setting changes during a session)
+ * stays where it is. The Qwen3.8 template renders it in place. If it moved to
+ * the start, the prompt prefix would change and the vLLM prefix cache would
+ * miss for the full history.
+ *
+ * llamacpp: the Bonsai template accepts one system message at the start
+ * only, so all system messages merge into it.
+ */
+export function arrangeSystem(messages: Obj[], profile: ProfileName): Obj[] {
+  const isSystem = (m: Obj) => m.role === 'system';
+  let head = 0;
+  if (profile === 'qwen38') while (head < messages.length && isSystem(messages[head])) head++;
+  const leading = profile === 'qwen38' ? messages.slice(0, head) : messages.filter(isSystem);
+  const rest = profile === 'qwen38'
+    ? messages.slice(head).filter((m) => !isSystem(m) || m.content)
+    : messages.filter((m) => !isSystem(m));
+  const system = leading.map((m) => m.content).filter(Boolean);
+  if (system.length) rest.unshift({ role: 'system', content: system.join('\n\n') });
+  return rest;
 }
 
 // ---------------------------------------------------------------- responses
@@ -301,25 +413,35 @@ interface PendingCall {
   id?: string;
   name: string;
   args: string;
+  /** The Responses item, once `output_item.added` went out. */
+  item?: Obj;
+  index?: number;
 }
 
 /**
  * Turn a stream of chat-completions chunks into Responses stream events.
  *
- * Text and reasoning go out as deltas when they arrive. Tool calls go out
- * complete after the backend finishes, because the arguments of a custom tool
- * are JSON that must be unwrapped as a whole. This matches the router and the
- * Responses event order that Codex expects:
+ * Text and reasoning go out as deltas when they arrive. Function-call
+ * arguments also go out as deltas when they arrive, but the
+ * `function_call_arguments.done` and `output_item.done` events of all calls
+ * wait for the finish reason. Codex runs a call when its `output_item.done`
+ * arrives, and a call that the token limit cut off must not run. Custom tool
+ * calls go out complete after the backend finishes, because their arguments
+ * are JSON that must be unwrapped as a whole. The event order:
  *
  *   response.created, response.in_progress,
- *   [reasoning item events], [message item events], [tool call item events],
+ *   [reasoning item events], [message item events],
+ *   [function call: output_item.added, function_call_arguments.delta...],
+ *   ...finish reason...
+ *   [function call: function_call_arguments.done, output_item.done],
+ *   [custom call: output_item.added, custom_tool_call_input.delta/.done, output_item.done],
  *   response.completed | response.incomplete | response.failed
  */
 export class ChatStreamTranslator {
   readonly response: Obj;
   private sequence = 0;
   private reasoning: { item: Obj; index: number; open: boolean } | null = null;
-  private message: { item: Obj; index: number } | null = null;
+  private message: { item: Obj; index: number; open: boolean } | null = null;
   private readonly calls = new Map<number, PendingCall>();
   private finish: string | null = null;
   private sawVisibleOutput = false;
@@ -375,12 +497,17 @@ export class ChatStreamTranslator {
       if (this.emitReasoning) events.push(...this.reasoningDelta(thought));
     }
     if (typeof delta.content === 'string' && delta.content) {
-      this.sawVisibleOutput = true;
-      events.push(...this.closeReasoning());
-      events.push(...this.textDelta(delta.content));
+      // After the tool calls start, the tool parser can pass on white space
+      // between calls. It is not part of the answer.
+      if (!(this.calls.size && !delta.content.trim())) {
+        this.sawVisibleOutput = true;
+        events.push(...this.closeReasoning());
+        events.push(...this.textDelta(delta.content));
+      }
     }
     if (Array.isArray(delta.tool_calls)) {
       events.push(...this.closeReasoning());
+      events.push(...this.closeMessage());
       for (const tc of delta.tool_calls) {
         const slot = typeof tc.index === 'number' ? tc.index : 0;
         let call = this.calls.get(slot);
@@ -393,7 +520,9 @@ export class ChatStreamTranslator {
         // Some servers repeat the full name in every chunk, others send it
         // once. Keep the first non-empty name, as the router does.
         if (tc.function?.name && !call.name) call.name = tc.function.name;
-        if (typeof tc.function?.arguments === 'string') call.args += tc.function.arguments;
+        const piece = typeof tc.function?.arguments === 'string' ? tc.function.arguments : '';
+        call.args += piece;
+        events.push(...this.streamCall(call, piece));
       }
     }
     if (choice.finish_reason) this.finish = choice.finish_reason;
@@ -433,10 +562,10 @@ export class ChatStreamTranslator {
 
   private textDelta(text: string): ResponseEvent[] {
     const events: ResponseEvent[] = [];
-    if (!this.message) {
+    if (!this.message || !this.message.open) {
       const item = { id: newId('msg', 16), type: 'message', role: 'assistant', status: 'in_progress', content: [] as Obj[] };
       const index = this.response.output.push(item) - 1;
-      this.message = { item, index };
+      this.message = { item, index, open: true };
       events.push(this.event('response.output_item.added', { output_index: index, item: { ...item, content: [] } }));
       item.content.push({ type: 'output_text', text: '', annotations: [] });
       events.push(this.event('response.content_part.added', {
@@ -452,6 +581,50 @@ export class ChatStreamTranslator {
   }
 
   /**
+   * Close the message item. The text before a tool call is complete, so the
+   * message closes when the first tool call starts, and the Responses items
+   * stay in sequence.
+   */
+  private closeMessage(status = 'completed'): ResponseEvent[] {
+    const m = this.message;
+    if (!m || !m.open) return [];
+    m.open = false;
+    m.item.status = status;
+    const part = m.item.content[0];
+    return [
+      this.event('response.output_text.done', { item_id: m.item.id, output_index: m.index, content_index: 0, text: part.text }),
+      this.event('response.content_part.done', { item_id: m.item.id, output_index: m.index, content_index: 0, part: { ...part } }),
+      this.event('response.output_item.done', { output_index: m.index, item: m.item }),
+    ];
+  }
+
+  /**
+   * Open the function_call item when the name is known and send the new
+   * argument text as a delta. Custom tool calls wait for the finish reason.
+   */
+  private streamCall(call: PendingCall, piece: string): ResponseEvent[] {
+    if (!call.name) return [];
+    const { name, namespace, custom } = codexToolName(call.name, this.tools);
+    if (custom) return [];
+    if (!call.item) {
+      call.id ??= newId('call', 16);
+      const item: Obj = { id: newId('fc', 16), type: 'function_call', status: 'in_progress', call_id: call.id, name, arguments: '' };
+      if (namespace) item.namespace = namespace;
+      call.item = item;
+      call.index = this.response.output.push(item) - 1;
+      const events = [this.event('response.output_item.added', { output_index: call.index, item: { ...item } })];
+      // Arguments that arrived before the name go out now, in one delta.
+      if (call.args) events.push(this.argsDelta(call, call.args));
+      return events;
+    }
+    return piece ? [this.argsDelta(call, piece)] : [];
+  }
+
+  private argsDelta(call: PendingCall, delta: string): ResponseEvent {
+    return this.event('response.function_call_arguments.delta', { item_id: call.item!.id, output_index: call.index, delta });
+  }
+
+  /**
    * Close all open items and emit the terminal event. Call this after the
    * backend sends `[DONE]`. A stream that ends without a finish reason is a
    * truncated stream, and it fails.
@@ -460,21 +633,19 @@ export class ChatStreamTranslator {
     if (!this.finish) return this.fail('backend stream ended before a finish reason');
     const events: ResponseEvent[] = [...this.closeReasoning()];
     const truncated = this.finish === 'length';
-    if (this.message) {
-      const m = this.message;
-      m.item.status = truncated ? 'incomplete' : 'completed';
-      const part = m.item.content[0];
-      events.push(this.event('response.output_text.done', { item_id: m.item.id, output_index: m.index, content_index: 0, text: part.text }));
-      events.push(this.event('response.content_part.done', { item_id: m.item.id, output_index: m.index, content_index: 0, part: { ...part } }));
-      events.push(this.event('response.output_item.done', { output_index: m.index, item: m.item }));
-    }
-    // A call cut off by the token limit has partial arguments. Codex would
-    // run it, so it is dropped instead.
-    if (!truncated) {
-      for (const slot of [...this.calls.keys()].sort((a, b) => a - b)) {
-        const call = this.calls.get(slot)!;
+    events.push(...this.closeMessage(truncated ? 'incomplete' : 'completed'));
+    const slots = [...this.calls.keys()].sort((a, b) => a - b).map((slot) => this.calls.get(slot)!);
+    if (truncated) {
+      // A call cut off by the token limit has partial arguments. Codex would
+      // run it, so it gets no done event and leaves the final output. The
+      // other calls of the turn go too: Codex retries an incomplete turn, and
+      // a call that already ran would run again.
+      const open = new Set(slots.map((call) => call.item).filter(Boolean));
+      this.response.output = this.response.output.filter((item: Obj) => !open.has(item));
+    } else {
+      for (const call of slots) {
         if (!call.name) continue;
-        events.push(...this.emitCall(call));
+        events.push(...(call.item ? this.closeCall(call) : this.emitCall(call)));
       }
     }
     this.response.status = truncated ? 'incomplete' : 'completed';
@@ -483,6 +654,21 @@ export class ChatStreamTranslator {
     return events;
   }
 
+  private closeCall(call: PendingCall): ResponseEvent[] {
+    const item = call.item!;
+    const events: ResponseEvent[] = [];
+    if (!call.args) {
+      call.args = '{}';
+      events.push(this.argsDelta(call, call.args));
+    }
+    item.arguments = call.args;
+    item.status = 'completed';
+    events.push(this.event('response.function_call_arguments.done', { item_id: item.id, output_index: call.index, arguments: call.args }));
+    events.push(this.event('response.output_item.done', { output_index: call.index, item }));
+    return events;
+  }
+
+  /** Emit a custom tool call, complete, after the finish reason. */
   private emitCall(call: PendingCall): ResponseEvent[] {
     const { name, namespace, custom } = codexToolName(call.name, this.tools);
     const callId = call.id ?? newId('call', 16);
