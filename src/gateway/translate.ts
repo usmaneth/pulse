@@ -108,7 +108,10 @@ export function sanitizePairs(items: Obj[]): Obj[] {
  * - namespace: each nested function becomes `<namespace>__<name>`.
  * - custom (freeform, for example apply_patch): becomes a function with one
  *   string argument `input`. The response translator unwraps it again.
- * - tool_search: becomes a plain function, as in the router.
+ * - tool_search: dropped. Codex answers a tool_search call only in its own
+ *   Responses item shape, and rejects a plain function call with "tool_search
+ *   handler received unsupported payload". The router drops it for the same
+ *   reason on its Grok path.
  * - other types (web_search, local_shell, image_generation): dropped. The
  *   backend cannot run them.
  */
@@ -137,10 +140,6 @@ export function flattenTools(tools: unknown): { tools: Obj[]; map: ToolMap } {
       fn(tool.name, (tool.description ?? '') + CUSTOM_TOOL_HINT, {
         type: 'object', properties: { input: { type: 'string' } }, required: ['input'],
       });
-    } else if (tool.type === 'tool_search') {
-      fn('tool_search',
-        'Search over deferred tool metadata and expose matching tools for the next model call.',
-        tool.parameters ?? { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] });
     }
   }
   return { tools: out, map };

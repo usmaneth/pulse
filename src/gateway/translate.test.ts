@@ -64,9 +64,9 @@ test('payload streams from the backend, asks for usage and uses the upstream mod
   assert.deepEqual(payload.messages, [{ role: 'user', content: 'hi' }]);
 });
 
-test('tools: function kept, custom wrapped, namespace flattened, tool_search kept, others dropped', () => {
+test('tools: function kept, custom wrapped, namespace flattened, tool_search and others dropped', () => {
   const { tools, map } = flattenTools(CODEX_TOOLS);
-  assert.deepEqual(tools.map((t) => t.function.name), ['shell_command', 'apply_patch', 'mcp__github__get_issue', 'tool_search']);
+  assert.deepEqual(tools.map((t) => t.function.name), ['shell_command', 'apply_patch', 'mcp__github__get_issue']);
   const patch = tools[1].function;
   assert.equal(patch.description, 'Use the apply_patch tool to edit files.' + CUSTOM_TOOL_HINT);
   assert.deepEqual(patch.parameters, { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] });
