@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Run Codex with a local Bonsai provider for this process only."""
+import json
+import runpy
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+import urllib.request
+import tomllib
+
+base = os.environ.get('BONSAI_CODEX_URL', 'http://127.0.0.1:18086/v1')
+url = urlparse(base)
+if url.scheme != 'http' or url.hostname not in ('127.0.0.1', 'localhost', '::1') or url.username or url.password:
+    sys.exit('BONSAI_CODEX_URL must be a loopback HTTP URL. Use an SSH tunnel for a remote Spark.')
+context = int(os.environ.get('BONSAI_CODEX_CONTEXT', '65536'))
+if not any(arg in ('--help', '-h', '--version', '-V') for arg in sys.argv[1:]):
+    try:
+        with urllib.request.urlopen(base.removesuffix('/v1').rstrip('/') + '/ready', timeout=5) as response:
+            status = json.load(response)
+        backend = urlparse(status.get('backend', ''))
+        if status.get('engine') != 'pulse' or backend.scheme != 'http' or backend.hostname not in ('127.0.0.1', 'localhost', '::1'):
+            sys.exit('The local profile requires a Pulse adapter with a loopback backend.')
+        actual = status.get('context_per_slot')
+        if not isinstance(actual, int) or actual < 8192:
+            sys.exit('The adapter did not report a valid backend context size.')
+        if 'BONSAI_CODEX_CONTEXT' in os.environ and context != actual:
+            sys.exit(f'BONSAI_CODEX_CONTEXT={context} differs from the backend slot context {actual}.')
+        context = actual
+        print(f'Local Bonsai: {status.get("model")} | {actual} context | {status.get("backend_build")}', file=sys.stderr)
+    except Exception as error:
+        sys.exit(f'Local Bonsai is not ready: {error}. Start scripts/codex-bonsai-server first.')
+if context < 8192:
+    sys.exit('BONSAI_CODEX_CONTEXT must be at least 8192.')
+settings = {
+    'model_provider': 'pulse_bonsai',
+    'model': os.environ.get('BONSAI_CODEX_MODEL', 'bonsai-2-27b'),
+    'model_providers.pulse_bonsai.name': 'Local Bonsai through Pulse',
+    'model_providers.pulse_bonsai.base_url': base,
+    'model_providers.pulse_bonsai.wire_api': 'responses',
+    'model_providers.pulse_bonsai.requires_openai_auth': False,
+    'model_providers.pulse_bonsai.supports_websockets': False,
+    'model_providers.pulse_bonsai.request_max_retries': 0,
+    'model_providers.pulse_bonsai.stream_max_retries': 0,
+    'model_context_window': context,
+    'model_auto_compact_token_limit': int(context * 0.75),
+    'model_reasoning_effort': 'low',
+    'model_reasoning_summary': 'none',
+    'web_search': 'disabled',
+    'model_catalog_json': str(Path(__file__).resolve().with_name('codex-bonsai-models.json')),
+    'features.apps': False,
+    'features.multi_agent': False,
+    'features.responses_websockets': False,
+    'features.responses_websockets_v2': False,
+}
+if 'BONSAI_CODEX_MCP_STARTUP_GRACE_MS' in os.environ:
+    try:
+        grace = int(os.environ['BONSAI_CODEX_MCP_STARTUP_GRACE_MS'])
+    except ValueError:
+        sys.exit('BONSAI_CODEX_MCP_STARTUP_GRACE_MS must be a nonnegative integer.')
+    if grace < 0:
+        sys.exit('BONSAI_CODEX_MCP_STARTUP_GRACE_MS must be a nonnegative integer.')
+    settings['mcp_optional_startup_grace_ms'] = grace
+if 'BONSAI_CODEX_REASONING_BUDGET' in os.environ:
+    budget = int(os.environ['BONSAI_CODEX_REASONING_BUDGET'])
+    if budget < -1:
+        sys.exit('BONSAI_CODEX_REASONING_BUDGET must be -1 or greater.')
+    settings['model_providers.pulse_bonsai.http_headers.X-Pulse-Reasoning-Budget'] = str(budget)
+user_args = []
+user_config = []
+routing_keys = {'model', 'model_provider', 'model_providers', 'model_catalog_json',
+                'openai_base_url', 'chatgpt_base_url', 'oss_provider', 'profile', 'model_context_window'}
+routing_flags = {'--model', '-m', '--profile', '-p', '--oss', '--local-provider', '--remote', '--remote-auth-token-env'}
+source_args = iter(sys.argv[1:])
+for arg in source_args:
+    if arg == '--':
+        sys.exit('The local launcher does not accept --. Pass the prompt as one quoted argument.')
+    flag = arg.split('=', 1)[0]
+    if flag in routing_flags or (arg.startswith('-m') and not arg.startswith('--')) or (arg.startswith('-p') and not arg.startswith('--')):
+        sys.exit(f'{flag} cannot override the local Bonsai profile.')
+    config = None
+    if arg in ('-c', '--config'):
+        config = next(source_args, None)
+        if config is None:
+            sys.exit('A config override requires a value.')
+    elif arg.startswith('--config='):
+        config = arg.split('=', 1)[1]
+    elif arg.startswith('-c') and not arg.startswith('--'):
+        config = arg[2:]
+    if config is not None:
+        key = config.split('=', 1)[0].strip()
+        try:
+            root_key = next(iter(tomllib.loads(key + ' = 0')))
+        except (tomllib.TOMLDecodeError, StopIteration):
+            sys.exit('The config override key is not valid TOML.')
+        if root_key in routing_keys:
+            sys.exit(f'{key} cannot override the local Bonsai profile.')
+        user_config += ['-c', config]
+    else:
+        user_args.append(arg)
+# Keep every config override in the deepest subcommand parser scope.
+# Codex replaces global overrides when a nested subcommand receives -c.
+continuity = runpy.run_path(str(Path(__file__).resolve().with_name('codex-bonsai-continuity.py')))
+try:
+    continuity['configure'](os.environ.get('CODEX_BIN', 'codex'), settings, user_args, user_config)
+except Exception as error:
+    sys.exit(f'Local continuity could not start: {error}')
+args = [os.environ.get('CODEX_BIN', 'codex')] + user_args
+for key, value in settings.items():
+    args += ['-c', key + '=' + continuity['toml_value'](value)]
+args += user_config
+os.execvp(args[0], args)

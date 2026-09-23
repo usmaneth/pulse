@@ -3,7 +3,7 @@ import { PulseServer } from './server.js';
 const port = Number(process.env.PORT || 8000);
 const host = process.env.HOST || '0.0.0.0';
 
-const server = new PulseServer({ port, host });
+const server = new PulseServer({ port, host, backendUrl: process.env.PULSE_BACKEND_URL });
 
 async function main() {
   await server.start();

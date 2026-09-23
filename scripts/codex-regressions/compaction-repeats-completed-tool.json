@@ -1,0 +1,39 @@
+{
+  "id": "compaction-repeats-completed-tool",
+  "client": "codex-cli 0.154.0",
+  "model": "Bonsai 2 27B PQ2_0",
+  "backend_build": "b10708-999b0a9a6",
+  "settings": {
+    "auto_compact_token_limit": 1000,
+    "reasoning_budget_tokens": 512,
+    "reasoning_effort": "low"
+  },
+  "user_request": "Remember the codeword ORCHID-731. Use exec_command once to run printf COMPACT_PROBE_OK. After the tool result, reply with only the codeword and the shell output. Do not edit files or run another command.",
+  "completed_tool": {
+    "name": "exec_command",
+    "arguments": {
+      "cmd": "printf COMPACT_PROBE_OK"
+    },
+    "result": "COMPACT_PROBE_OK",
+    "exit_code": 0
+  },
+  "checkpoint": "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n**handoff: codex-budget-fixture session**\n\n**progress**\n- task complete. session is idle.\n- task: remember the codeword, run one printf, reply with codeword plus shell output only.\n- both parts done in the prior turn.\n\n**key data (carry forward)**\n- codeword: `ORCHID-731`\n- command run: `printf COMPACT_PROBE_OK`\n- command result: `COMPACT_PROBE_OK` (exit code 0)\n- reply sent: codeword + `COMPACT_PROBE_OK`\n\n**constraints from the user**\n- use `exec_command` exactly once per task. no second run.\n- no file edits during the probe task.\n- final reply to the user was codeword + shell output only. no extra prose.\n\n**next steps**\n- none for the probe task. it is closed.\n- if a follow-up references ORCHID-731 or COMPACT_PROBE_OK, the values above are the source of truth. do not re-run the probe unless the user asks.\n\n**notes**\n- no files changed. no git activity. no commits to record.\n- workspace root: `<workspace>`\n- no memory entries were read or written for this task.",
+  "expected": {
+    "additional_tool_calls": 0,
+    "final_answer_contains": [
+      "ORCHID-731",
+      "COMPACT_PROBE_OK"
+    ]
+  },
+  "observed": {
+    "additional_tool_calls": 1,
+    "repeated_command": "printf COMPACT_PROBE_OK",
+    "operator_cancelled_after_duplicate": true
+  },
+  "failure_notes": [
+    "The summary falsely stated that a final reply had been sent.",
+    "The continuation repeated the command despite a retained no-repeat instruction.",
+    "The 1000-token threshold was a forced protocol stress check, not the normal 49152-token threshold."
+  ],
+  "candidate_fix": "Use scripts/codex-bonsai-compact-prompt.txt as an explicit experimental_compact_prompt_file override. Validate this case and unrelated continuation cases before changing the default."
+}

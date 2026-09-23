@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Run a private Bonsai backend and Pulse adapter until interrupted."""
+import argparse
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--backend-bin', default=Path.home() / 'llama.cpp-upstream/build-cuda/bin/llama-server', type=Path, help='Prism-compatible llama-server executable')
+parser.add_argument('--model', default=Path.home() / 'Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf', type=Path, help='Bonsai GGUF model')
+draft_options = parser.add_mutually_exclusive_group()
+draft_options.add_argument('--draft', type=Path, help='Explicit DSpark GGUF control')
+draft_options.add_argument('--no-draft', action='store_true')
+draft_options.add_argument('--legacy-v1', action='store_true', help='Use the original v1 DSpark control')
+parser.add_argument('--cache-ram', type=int, default=8192, help='Prompt cache bound in MiB')
+parser.add_argument('--checkpoint-min-step', type=int, default=8192, help='Minimum token interval between backend recurrent-state checkpoints')
+parser.add_argument('--chat-template-file', type=Path, help='Optional private backend template')
+parser.add_argument('--context', type=int, default=65536)
+parser.add_argument('--backend-port', type=int, default=18085)
+parser.add_argument('--port', type=int, default=18086)
+parser.add_argument('--verified-spec-patch', action='store_true', help='Enable the historical v1 K policy with --legacy-v1 after backend patch verification')
+parser.add_argument('--jev', action='store_true', help='Use bounded native Jev advice once per Responses request')
+args = parser.parse_args()
+model_directory = Path.home() / 'Bonsai-demo/models/bonsai2-gguf/27B'
+if args.verified_spec_patch and not args.legacy_v1:
+    parser.error('--verified-spec-patch requires --legacy-v1; the legacy taper is not validated for corrected v2.')
+if args.no_draft:
+    args.draft = None
+elif args.legacy_v1:
+    args.draft = model_directory / 'Ternary-Bonsai-2-27B-dspark-dflash-Q4_0.gguf'
+elif args.draft is None:
+    args.draft = model_directory / 'bonsai2-v2-Q4_K_M-yarn32.gguf'
+    if not args.draft.is_file():
+        parser.error('The corrected v2 draft is missing. Run scripts/codex-bonsai-install-draft or follow docs/CODEX.md to reproduce it.')
+if args.checkpoint_min_step < 0:
+    parser.error('--checkpoint-min-step must be nonnegative')
+if args.cache_ram < 0:
+    parser.error('--cache-ram must be nonnegative')
+root = Path(__file__).resolve().parent.parent
+for path in [args.backend_bin, args.model] + ([args.draft] if args.draft else []) + ([args.chat_template_file] if args.chat_template_file else []):
+    if not path.is_file():
+        parser.error(f'File does not exist: {path}')
+if not (root / 'dist/server/index.js').is_file():
+    parser.error('Compile TypeScript first: pnpm exec tsc')
+if args.context < 8192 or args.port == args.backend_port:
+    parser.error('The context must be at least 8192. The ports must differ.')
+if args.verified_spec_patch and not args.draft:
+    parser.error('--verified-spec-patch requires --draft')
+# Refuse occupied ports before child creation. The children also check their binds.
+import socket
+for port in [args.backend_port, args.port]:
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(('127.0.0.1', port))
+children = []
+def stop(signum, frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, stop)
+
+def ready(url, child):
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            raise RuntimeError(f'Child process exited with code {child.returncode}')
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(0.25)
+    raise RuntimeError(f'The service did not become ready: {url}')
+
+command = [str(args.backend_bin.resolve()), '-m', str(args.model.resolve()), '--host', '127.0.0.1',
+           '--port', str(args.backend_port), '-ngl', '999', '-fa', 'on', '-c', str(args.context),
+           '-np', '1', '-b', '4096', '-ub', '512', '--jinja', '--cache-ram', str(args.cache_ram),
+           '-ctk', 'f16', '-ctv', 'f16', '--checkpoint-min-step', str(args.checkpoint_min_step), '--reasoning-format', 'deepseek', '--reasoning-preserve']
+if args.chat_template_file:
+    command += ['--chat-template-file', str(args.chat_template_file.resolve())]
+if args.draft:
+    command += ['-md', str(args.draft.resolve()), '--spec-type', 'draft-dspark', '--spec-draft-n-max', '4', '-ngld', '999']
+try:
+    backend = subprocess.Popen(command)
+    children.append(backend)
+    backend_url = f'http://127.0.0.1:{args.backend_port}'
+    ready(backend_url + '/health', backend)
+    env = dict(os.environ, HOST='127.0.0.1', PORT=str(args.port), PULSE_BACKEND_URL=backend_url,
+               PULSE_RESPONSES_SPEC_POLICY='1' if args.verified_spec_patch else '0', PULSE_NATIVE_ENGINE='0', PULSE_CKPT='0', PULSE_JEV_MODE='request' if args.jev else 'off')
+    adapter = subprocess.Popen(['node', str(root / 'dist/server/index.js')], env=env)
+    children.append(adapter)
+    ready(f'http://127.0.0.1:{args.port}/ready', adapter)
+    print(f'Ready: BONSAI_CODEX_URL=http://127.0.0.1:{args.port}/v1 BONSAI_CODEX_CONTEXT={args.context} scripts/codex-bonsai', flush=True)
+    while all(child.poll() is None for child in children):
+        time.sleep(0.5)
+    raise RuntimeError('A service exited. See the service log above.')
+except KeyboardInterrupt:
+    pass
+finally:
+    for child in reversed(children):
+        if child.poll() is None:
+            child.terminate()
+    for child in reversed(children):
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()

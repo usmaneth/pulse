@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Install the verified corrected v2 draft without replacing an existing model."""
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import tempfile
+
+EXPECTED = 'a39f89a344155e90e76b2fb0f8a79ef0c3bd42634c5e229a5fc9ab281f94f31d'
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--source', type=Path, default=Path.home() / 'Documents/spark-orchestration/drafter-artifacts/bonsai2-v2-Q4_K_M-yarn32.gguf')
+p.add_argument('--destination', type=Path, default=Path.home() / 'Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.gguf')
+a = p.parse_args()
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+if not a.source.is_file():
+    p.error('The corrected artifact is missing. Follow the exact conversion procedure in docs/CODEX.md.')
+if digest(a.source) != EXPECTED:
+    p.error('The source hash differs from the validated corrected v2 artifact.')
+a.destination.parent.mkdir(parents=True, exist_ok=True)
+if a.destination.exists():
+    if digest(a.destination) != EXPECTED:
+        p.error('The destination exists with a different hash. The installer will not replace it.')
+    print(f'Verified existing corrected v2 draft: {a.destination}')
+    raise SystemExit(0)
+fd, name = tempfile.mkstemp(prefix='.bonsai-v2-', dir=a.destination.parent)
+os.close(fd)
+temporary = Path(name)
+try:
+    shutil.copyfile(a.source, temporary)
+    if digest(temporary) != EXPECTED:
+        raise RuntimeError('The copied artifact hash differs from the validated artifact.')
+    temporary.chmod(0o644)
+    # Link publication is atomic and refuses a destination created during the copy.
+    os.link(temporary, a.destination)
+finally:
+    temporary.unlink(missing_ok=True)
+print(f'Installed corrected v2 draft: {a.destination}')
+print(f'SHA256: {EXPECTED}')

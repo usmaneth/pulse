@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ ! -f "$ROOT/dist/jev/cli.js" ]]; then
+  echo 'Build the TypeScript files with npx tsc before this command.' >&2
+  exit 2
+fi
+exec node "$ROOT/dist/jev/cli.js" "$@"

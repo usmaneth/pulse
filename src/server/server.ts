@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { CheckpointManager } from './checkpoint.js';
 import { JevDecisionClient, SpeculationDecision, MemoryAdmissionDecision } from '../jev/client.js';
-import { NativePulseEngine } from './native_ffi.js';
+import type { NativePulseEngine } from './native_ffi.js';
+import { handleResponses } from './responses.js';
 export interface ServerConfig {
   port: number;
   host: string;
@@ -17,8 +18,7 @@ export class PulseServer {
   // its numbers are kernel timings, not inference. Nothing in the request path
   // calls it, yet constructing it held 1,264 MiB of unified memory on a box
   // where memory bandwidth is the binding constraint. Left off by default.
-  private readonly nativeEngine =
-    process.env.PULSE_NATIVE_ENGINE === '1' ? new NativePulseEngine() : null;
+  private nativeEngine: NativePulseEngine | null = null;
   private server: http.Server | null = null;
 
   private totalRequests = 0;
@@ -53,20 +53,31 @@ export class PulseServer {
     );
   }
 
-  start(): Promise<void> {
+  async start(): Promise<void> {
+    if (process.env.PULSE_NATIVE_ENGINE === '1') {
+      const { NativePulseEngine } = await import('./native_ffi.js');
+      this.nativeEngine = new NativePulseEngine();
+    }
     return new Promise((resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
         const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
         if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/ready')) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            status: 'ready',
-            engine: 'pulse',
-            version: '1.0.0',
-            hardware: 'NVIDIA GB10 (sm_121, 128GB LPDDR5X)',
-            backend: this.config.backendUrl,
-          }));
+          try {
+            const backend = await fetch(`${this.config.backendUrl}/health`, { signal: AbortSignal.timeout(3000) });
+            if (!backend.ok) throw new Error('backend unavailable');
+            const propsResponse = await fetch(`${this.config.backendUrl}/props`, { signal: AbortSignal.timeout(3000) });
+            if (!propsResponse.ok) throw new Error('backend properties unavailable');
+            const props = await propsResponse.json() as Record<string, any>;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'ready', engine: 'pulse', backend: this.config.backendUrl,
+              model: props.model_alias, model_path: props.model_path, context_per_slot: props.default_generation_settings?.n_ctx,
+              slots: props.total_slots, backend_build: props.build_info,
+              responses_spec_policy: process.env.PULSE_RESPONSES_SPEC_POLICY === '1' }));
+          } catch {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'unavailable', engine: 'pulse', backend: this.config.backendUrl }));
+          }
           return;
         }
 
@@ -88,12 +99,22 @@ export class PulseServer {
               // silently ignored by a stock llama.cpp, which drops per-request
               // speculative params behind `#if 0`. See src/jev/client.ts.
               speculation_k_decision: 'local measured heuristic (bench/kcurve.py): schema K=3, otherwise K=4; needs the per-request n_max patch on the backend',
-              jev_gateway_used_for: ['memory_admission'],
+              jev_gateway_used_for: [],
+              jev_advisory: { source: 'typesafe_native', model: 'jev-1.13.0', invocation: 'scripts/pulse-decide', automatic_requests: process.env.PULSE_JEV_MODE === 'request', mode: process.env.PULSE_JEV_MODE === 'request' ? 'request_boundary' : 'off' },
+              memory_admission: 'local deterministic compatibility policy; not called by this proxy',
               checkpoints: this.checkpoints.getStats(),
               last_checkpoint_restore: this.lastCheckpointRestore,
               last_jev_decision: this.lastJevDecision,
             }, null, 2)
           );
+          return;
+        }
+
+        if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname === '/responses')) {
+          this.totalRequests++;
+          this.activeStreams++;
+          try { await handleResponses(req, res, this.config.backendUrl, this.activeStreams); }
+          finally { this.activeStreams--; }
           return;
         }
 
@@ -140,8 +161,8 @@ export class PulseServer {
         console.log(` PULSE: Hardware-Specialized Blackwell Engine Live`);
         console.log(` Port: http://${this.config.host}:${this.config.port}`);
         console.log(` Backend Engine: ${this.config.backendUrl} (GB10 sm_121)`);
-        console.log(` Decision Engine: TypeSafe AI Jev (System One)`);
-        console.log(` Endpoints: /v1/chat/completions, /status, /health`);
+        console.log(` Decision Engine: local speculation policy; Jev advisory requires explicit CLI invocation`);
+        console.log(` Endpoints: /v1/responses, /v1/chat/completions, /status, /health`);
         console.log(`=======================================================\n`);
         resolve();
       });
@@ -254,7 +275,7 @@ export class PulseServer {
         abortController.abort();
       }
     };
-    req.on('close', onClientClose);
+    res.on('close', onClientClose);
 
     try {
       const backendPayload = {
@@ -417,7 +438,7 @@ export class PulseServer {
         res.end();
       }
     } finally {
-      req.off('close', onClientClose);
+      res.off('close', onClientClose);
       this.activeStreams--;
     }
   }

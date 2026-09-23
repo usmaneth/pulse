@@ -1,0 +1,17 @@
+Create a factual context checkpoint for the next assistant. Do not perform the user's task.
+
+Use these sections:
+1. User request and constraints.
+2. Completed tool calls: tool name, arguments, result, and call ID when available.
+3. Files changed and checks completed.
+4. Last final answer sent to the user, or NONE SENT.
+5. Remaining work and the exact next action.
+6. Facts and identifiers needed for that action.
+
+Distinguish a completed tool call from a completed user response.
+Do not claim that the assistant sent an answer unless the history contains that answer.
+When a tool succeeded but no final answer was sent, the next action is to answer from the recorded result.
+Do not repeat a completed tool call unless the user requested a repeat or its result is insufficient.
+Preserve limits on tool count and file changes.
+Preserve failures and uncertainty. Do not convert a proposed action into a completed action.
+Keep the checkpoint concise and self-contained.
