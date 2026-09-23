@@ -262,7 +262,10 @@ Every event has a `sequence_number`. `finish_reason: length` gives
 no tool call of that turn gets a `done` event or stays in the final output.
 Codex retries an incomplete turn, so a call that ran would run again. A stream
 that ends without a finish reason gives `response.failed`, never
-`response.completed`.
+`response.completed`. A stream that has a finish reason but no text, no
+reasoning and no tool call also gives `response.failed`. vLLM can generate
+tokens and stream none of them, and an empty completed response would end the
+Codex task with no answer.
 
 The reasoning text comes from the vLLM `qwen3` reasoning parser
 (`reasoning_content` or `reasoning`). Set `PULSE_GATEWAY_EMIT_REASONING=0` to

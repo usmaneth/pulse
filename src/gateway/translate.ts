@@ -692,6 +692,15 @@ export class ChatStreamTranslator {
    */
   finishStream(): ResponseEvent[] {
     if (!this.finish) return this.fail('backend stream ended before a finish reason');
+    if (!this.sawVisibleOutput && this.finish !== 'length') {
+      // vLLM can generate tokens and stream none of them (seen live: 156
+      // output tokens and no delta). A completed response without output
+      // ends the Codex task with no answer. A failed one tells the user, and
+      // Codex can retry the request.
+      const tokens = this.response.usage?.output_tokens;
+      return this.fail(`the backend finished (${this.finish}) without any text, reasoning or tool call` +
+        (tokens ? ` after ${tokens} output tokens` : ''));
+    }
     const events: ResponseEvent[] = [...this.closeReasoning()];
     const truncated = this.finish === 'length';
     events.push(...this.closeMessage(truncated ? 'incomplete' : 'completed'));

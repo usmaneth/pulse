@@ -554,6 +554,23 @@ test('stream: a stream without a finish reason fails', () => {
   assert(!types(events).includes('response.completed'));
 });
 
+test('stream: a finish reason without any output fails instead of an empty completed response', () => {
+  // Seen live: vLLM generated 156 tokens and streamed no delta. An empty
+  // completed response ends the Codex task with no answer.
+  const { events, t } = run([
+    chunk({ role: 'assistant', content: '' }),
+    chunk({}, 'stop'),
+    { choices: [], usage: { prompt_tokens: 11335, completion_tokens: 156, total_tokens: 11491 } },
+  ]);
+  assert.equal(events.at(-1)!.type, 'response.failed');
+  assert.equal(t.response.status, 'failed');
+  assert.match(t.response.error.message, /finished \(stop\) without any text, reasoning or tool call after 156 output tokens/);
+  assert(!types(events).includes('response.completed'));
+  // Hidden reasoning is still output: the model did answer.
+  const hidden = run([chunk({ reasoning_content: 'x' }), chunk({}, 'stop')], [], false);
+  assert.equal(hidden.t.response.status, 'completed');
+});
+
 test('stream: a backend error chunk throws', () => {
   const t = new ChatStreamTranslator('m', flattenTools([]).map);
   assert.throws(() => t.push({ error: { message: 'boom' } }), /boom/);
