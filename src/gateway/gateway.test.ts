@@ -203,6 +203,40 @@ test('codex exec --output-schema: a json_schema text.format reaches the backend 
   } finally { await gateway.stop(); await backend.close(); }
 });
 
+test('backend requests on a keep-alive socket do not pile up timeout listeners', async () => {
+  const warnings: Error[] = [];
+  const onWarning = (warning: Error) => { if (warning.name === 'MaxListenersExceededWarning') warnings.push(warning); };
+  process.on('warning', onWarning);
+  const sockets = new Set<unknown>();
+  const backend = await mockBackend((body, req, res) => {
+    sockets.add(req.socket);
+    if (body.messages.at(-1).content === 'stall') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'a' }, finish_reason: null }] })}\n\n`);
+      return;
+    }
+    sse(res, reply('ok'));
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { idleTimeoutMs: 300 });
+  try {
+    for (let i = 0; i < 25; i++) {
+      const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+      assert.equal(evs.at(-1)!.type, 'response.completed');
+    }
+    // The idle timeout still works on a socket that served many requests.
+    const stalled = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'stall', stream: true }));
+    assert.equal(stalled.at(-1)!.type, 'response.failed');
+    assert.match(stalled.at(-1)!.response.error.message, /idle/);
+    await new Promise((r) => setImmediate(r));
+    assert(sockets.size <= 2, `sockets: ${sockets.size}`);
+    assert.deepEqual(warnings.map((w) => w.message), []);
+  } finally {
+    process.off('warning', onWarning);
+    await gateway.stop();
+    await backend.close();
+  }
+});
+
 test('fails over from a dead endpoint and from a 503 endpoint, in order', async () => {
   const busy = await mockBackend((_b, _q, res) => { res.writeHead(503); res.end('loading'); });
   const good = await mockBackend((_b, _q, res) => sse(res, reply('from spark3')));

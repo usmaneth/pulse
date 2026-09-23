@@ -152,13 +152,17 @@ export function postChat(
       cleanup();
       const headersMs = performance.now() - started;
       const status = res.statusCode ?? 0;
-      // Idle timeout for the body. It resets on every socket read.
-      res.socket?.setTimeout(timeouts.idleTimeoutMs, () => {
-        res.destroy(new Error(`backend idle for ${timeouts.idleTimeoutMs} ms`));
-      });
+      // Idle timeout for the body. It resets on every socket read. The
+      // socket goes back to the keep-alive pool after the response, so the
+      // listener must go when the response closes. Else each request on the
+      // socket adds one more listener that holds its old response.
+      const socket = res.socket;
+      const onIdle = () => res.destroy(new Error(`backend idle for ${timeouts.idleTimeoutMs} ms`));
+      socket?.setTimeout(timeouts.idleTimeoutMs, onIdle);
       res.on('close', () => {
         signal.removeEventListener('abort', onAbort);
-        res.socket?.setTimeout(0);
+        socket?.setTimeout(0);
+        socket?.off('timeout', onIdle);
       });
       if (status < 200 || status >= 300) {
         const chunks: Buffer[] = [];
