@@ -13,5 +13,7 @@ bin/*
 *.gguf
 packages/**/*.gguf
 build/
+__pycache__/
+*.py[cod]
 *.gguf
 **/*.gguf

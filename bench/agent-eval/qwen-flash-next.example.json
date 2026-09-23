@@ -1,0 +1,40 @@
+{
+  "model": "qwen-flash-next",
+  "url": "http://127.0.0.1:8888/v1",
+  "nodes": [
+    "localhost"
+  ],
+  "model_sha256": "REQUIRED",
+  "engine_commit": "REQUIRED",
+  "template_sha256": "REQUIRED",
+  "protocol": "chat/completions",
+  "max_context_per_request": 131072,
+  "min_mem_available_gib": 8,
+  "min_disk_free_gib": 10,
+  "contexts": [
+    8192,
+    32768,
+    65536
+  ],
+  "concurrency": [
+    1,
+    2,
+    4
+  ],
+  "repeats": 3,
+  "max_tokens": 512,
+  "resource_check": [
+    "python3",
+    "/home/usman/pulse/bench/agent-eval/resource_check.py"
+  ],
+  "token_counter": [
+    "python3",
+    "/home/usman/pulse/bench/agent-eval/token_counter.py",
+    "/models/REQUIRED_LOCAL_TOKENIZER"
+  ],
+  "reset_cache": [
+    "REQUIRED_ENGINE_CACHE_RESET_HOOK"
+  ],
+  "fixture_mode": "equal_tokens",
+  "fixture_seed": 42
+}

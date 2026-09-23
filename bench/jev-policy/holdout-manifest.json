@@ -1,0 +1,28 @@
+{
+  "scope": "Frozen task definitions. No measured outcomes yet. Do not supply expected results to Jev.",
+  "tasks": [
+    {
+      "id": "invoice-discount",
+      "task": "Implement invoice_total(rows) in Python. Each row is a dict with quantity, unit_price_cents, and optional discount_percent (default 0). Return the sum of each row's integer cents after discount. Round each discounted row down with integer division. Reject any negative quantity or price with ValueError. Reject discounts outside 0 through 100 with ValueError. An empty invoice returns 0. Use one function, assignments, a for loop, if statements, arithmetic, dict subscripts, dict.get, and raise ValueError. Do not use helper functions, comprehensions, generators, decorators, imports, or other calls. Return only the function code, with no Markdown fences.",
+      "quality": "Run bench/agent-eval/code_fixture.py compatible heldout behavioral tests after extracting the completed function."
+    },
+    {
+      "id": "tool-multiply",
+      "task": "Use the multiply tool to calculate 37 times 19, then report the tool result.",
+      "quality": "Require the correct tool name and arguments, execute the tool locally, append its result, and require final answer 703."
+    }
+  ],
+  "context_tokens": [
+    3072,
+    8192,
+    32768
+  ],
+  "candidate_k": [
+    0,
+    2,
+    4,
+    7
+  ],
+  "initial_repeats": 1,
+  "confirmation_repeats": 3
+}

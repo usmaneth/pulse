@@ -1,0 +1,43 @@
+{
+  "state": {
+    "workload_description": "Continue a coding-agent task after a repository file search. The next step reads source and may propose a patch.",
+    "context_bucket": "short",
+    "telemetry_buckets": {
+      "k0": {
+        "net_rate_bucket": "moderate",
+        "acceptance_bucket": "low",
+        "quality_gate": "unproved",
+        "source": "drafter-paired-full/3072/repeat0/k0"
+      },
+      "k4": {
+        "net_rate_bucket": "fast",
+        "acceptance_bucket": "high",
+        "quality_gate": "unproved",
+        "source": "drafter-paired-full/3072/repeat0/yarn"
+      }
+    }
+  },
+  "constraints": {
+    "server_max_k": 7,
+    "block_cap": 7,
+    "legal": {
+      "speculation": [
+        "k0",
+        "k2",
+        "k4",
+        "k7"
+      ],
+      "kernel": [
+        "reference"
+      ],
+      "cache": [
+        "lru"
+      ]
+    },
+    "required_bytes": 12000000000,
+    "available_bytes": 20000000000,
+    "target_verification_required": true,
+    "graph_correctness_passed": false,
+    "simulation_only": false
+  }
+}

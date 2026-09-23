@@ -1,11 +1,11 @@
-# Bonsai 2 / qwen35 on GB10: the complete inference spec
+# Bonsai 2 / qwen35 on GB10: measured architecture notes
 
-Everything here was established by running one token through llama.cpp, dumping
-all 4,639 intermediate tensors, and checking each stage against them. Nothing is
-inferred from documentation, because there is none for this architecture.
+The initial measurements compared one token and 4,639 intermediate tensors with llama.cpp.
+Later sequence tests and source inspection corrected several initial conclusions.
+These notes describe the tested Bonsai model, not every model with the same architecture name.
+They do not establish that no other architecture documentation exists.
 
-Reproduce with `bin/pulse-dumpref <model.gguf> <token> <outdir> [filter]` then
-`bin/pulse-engine <model.gguf> <outdir>`.
+Use [the native correctness guide](NATIVE-CORRECTNESS.md) for current reproduction commands and sequence tests.
 
 ---
 
@@ -185,20 +185,21 @@ constant 48 times.
 
 ---
 
-## 5. RoPE, and why an engine can beat llama.cpp here
+## 5. Text RoPE and cache reuse limits
 
-`dimension_sections = [11, 11, 10, 0]` sums to 32 = `rope_dim/2`, fourth slot
-unused. Only the first 64 of each head's 256 dims are rotated.
+`dimension_sections = [11, 11, 10, 0]` sums to 32, or `rope_dim / 2`.
+Only the first 64 dimensions of each 256-dimension head receive the rotation.
 
-**On the text path every section indexes the same position, so mRoPE collapses
-to standard RoPE.** llama.cpp refuses K-shifting for any model with
-`n_pos_per_embd() > 1` (`llama-kv-cache.cpp:1176`) - correct for multimodal,
-unnecessary for text. That is why `--cache-reuse` is unavailable and a
-mid-context edit costs a full re-prefill.
+On the text path, every section uses the same position. The rotation therefore reduces to standard RoPE.
+The inspected llama.cpp revision rejects K-shifts when `n_pos_per_embd() > 1`.
+A text-only implementation can express the position rotation without that restriction.
 
-**An engine that owns RoPE can shift positions. llama.cpp will not.** This is a
-capability difference, not a percentage - and it is the strongest argument for
-owning the stack on this model.
+This observation does not establish correct cache reuse after a context edit.
+The changed prefix also changes GDN recurrent state and later hidden states.
+Position shifts alone cannot restore those states.
+Correct reuse requires valid state checkpoints and recomputation of dependent tokens.
+The native Pulse decoder does not implement this cache reuse path.
+The earlier claim of an established engine capability advantage is withdrawn.
 
 ---
 
@@ -302,32 +303,24 @@ both keys are genuinely live.
 That also confirms the RoPE implementation in composition at a nonzero position,
 which the single-token run could not do.
 
-## Open item: the multi-token GDN path is a DIFFERENT algorithm
+## Correction: the multi-token recurrence matches after the layout fix
 
-The single-token recurrence is exact (9.169e-08). Chaining it sequentially over
-two tokens does **not** reproduce `new_state`:
+The original two-token reconstruction treated strided Q/K/V views as contiguous arrays.
+That error produced a relative state error of 0.886557940360.
+The corrected view interpretation produced 0.0000000803380473226 with the same recurrence equations and weights.
+The earlier conclusion that sequential recurrence cannot reproduce this state is withdrawn.
 
-| reconstruction | worst rel vs `new_state-0` |
-|---|---|
-| sequential chain over both tokens | 8.866e-01 |
-| last token only, no state carry | 1.015e+00 |
+The reference dumper now writes contiguous logical values and records the layout contract.
+Do not use the old packed-array interpretation to infer an architectural difference.
 
-The chain is better than ignoring the carry, so state clearly propagates - but
-it is not plain sequential application.
+Source inspection at llama.cpp commit `999b0a9a6f2fb3e3b60bb3d6bbac4b6b0c0f7fd7` confirms two multi-token implementation routes.
+`delta-net-base.cpp` selects the fused operation when `fused_gdn_ch` is enabled.
+The CUDA implementation in `gated_delta_net.cu` iterates over tokens inside one kernel.
+The unfused route uses the separate chunk algorithm.
+The configuration name alone does not prove that the fused implementation uses a parallel scan.
 
-The reason is in `qwen35.cpp`: `n_tokens == 1` dispatches
-`LLM_FUSED_OP_GDN_AR` (autoregressive), and `n_tokens > 1` dispatches
-`LLM_FUSED_OP_GDN_CH` (**chunked**). `delta-net-base.cpp` is 648 lines of
-chunked parallel scan - cumulative decay products, a decay mask, a UT transform -
-which is mathematically equivalent to the recurrence over a full sequence but
-does not decompose into per-token steps with the same intermediate states.
-
-**So decode is complete and prefill is not.** The autoregressive path - one token
-at a time, which is what token generation uses - is validated end to end. The
-chunked path, used when a prompt is processed in a batch, is a separate
-implementation that has not been written here.
-
-That is the honest boundary: this engine can generate, and cannot yet prefill a
-multi-token prompt through the GDN layers without falling back.
-- **Attention output projection + gate.** Mapping confirmed; projection not yet
-  checked against `attn_output`.
+Native Pulse can process prompt token IDs through its sequential decoder.
+It does not yet provide a complete batched prefill path.
+A multi-token recurrent kernel is one possible first step.
+Complete batched prefill also needs matrix operations, convolution, causal attention, and state scheduling.
+See the native correctness guide for the current validated execution scope.
