@@ -18,14 +18,18 @@ import { GatewayMetrics } from './metrics.js';
 import { log } from './log.js';
 import { sseData } from './sse.js';
 import {
-  ChatStreamTranslator, RequestError, newId, responsesToChat, sseFrame,
+  ChatStreamTranslator, RequestError, isJsonObjectText, newId, responsesToChat, sseFrame,
 } from './translate.js';
-import type { Obj, ResponseEvent } from './translate.js';
+import type { ChatRequest, Obj, ResponseEvent } from './translate.js';
 
 const VERSION = '1.0.0';
 const HEARTBEAT_MS = 10_000;
 
 class HttpError extends Error {
+  /** The id of the Responses request that failed, when there is one. */
+  requestId?: string;
+  /** True when the `response` log line of the request already has this error. */
+  logged = false;
   constructor(readonly status: number, message: string, readonly code = 'invalid_request_error') { super(message); }
 }
 
@@ -117,8 +121,15 @@ export class Gateway {
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
       const code = error instanceof HttpError ? error.code : 'internal_error';
-      // HttpErrors from the Responses path are already in the `response` log line.
-      if (!(error instanceof HttpError)) log('error', 'request failed', { path, error: String(error) });
+      if (!(error instanceof HttpError)) {
+        log('error', 'request failed', { path, error: String(error) });
+      } else if (!error.logged) {
+        // An error before the backend call (bad JSON, unknown model,
+        // unsupported input, auth, route, shutdown) has no `response` line.
+        log('warn', 'request rejected', {
+          request_id: error.requestId ?? null, method: req.method, path, status, error: error.message,
+        });
+      }
       if (!res.headersSent) sendJson(res, status, { error: { type: code, message: (error as Error).message } });
       else res.end();
     }
@@ -247,30 +258,45 @@ export class Gateway {
     throw new HttpError(503, `no backend could take the request (${errors.join('; ') || 'no enabled backends'})`, 'backend_unavailable');
   }
 
+  /**
+   * Append one row to the trace file, when one is set. For debugging only.
+   * The file holds full prompts, so only the owner can read it.
+   */
+  private trace(row: Obj): void {
+    if (!this.config.traceFile) return;
+    try {
+      appendFileSync(this.config.traceFile, JSON.stringify(row) + '\n', { mode: 0o600 });
+    } catch (error) {
+      log('warn', 'could not write the trace file', { error: String(error) });
+    }
+  }
+
   private async handleResponses(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const requestId = newId('req', 16);
     const started = performance.now();
     const m = this.metrics;
     m.requests++;
-    if (this.draining) {
+    // A request that fails before the backend call. handle() writes its log
+    // line, and the trace keeps the request with the reason.
+    const reject = (error: unknown, request?: Obj): never => {
       m.clientErrors++;
-      throw new HttpError(503, 'the gateway is shutting down', 'unavailable');
-    }
+      if (error instanceof HttpError) error.requestId = requestId;
+      if (request !== undefined) this.trace({ request_id: requestId, request, error: (error as Error).message });
+      throw error;
+    };
+    if (this.draining) return reject(new HttpError(503, 'the gateway is shutting down', 'unavailable'));
 
     let request: Obj;
     try {
       request = JSON.parse(await this.readBody(req));
     } catch (error) {
-      m.clientErrors++;
-      if (error instanceof HttpError) throw error;
-      throw new HttpError(400, 'invalid JSON');
+      return reject(error instanceof HttpError ? error : new HttpError(400, 'invalid JSON'));
     }
     const route = this.routes.find((r) => r.config.id === request?.model);
     if (!route) {
-      m.clientErrors++;
-      throw new HttpError(400, `unknown model: ${String(request?.model)}; this gateway serves ${this.routes.map((r) => r.config.id).join(', ')}`);
+      return reject(new HttpError(400, `unknown model: ${String(request?.model)}; this gateway serves ${this.routes.map((r) => r.config.id).join(', ')}`), request);
     }
-    let chat;
+    let chat: ChatRequest;
     try {
       chat = responsesToChat(request, {
         profile: route.config.profile,
@@ -279,19 +305,9 @@ export class Gateway {
         replayReasoning: this.config.replayReasoning,
       });
     } catch (error) {
-      m.clientErrors++;
-      if (error instanceof RequestError) throw new HttpError(400, error.message);
-      throw error;
+      return reject(error instanceof RequestError ? new HttpError(400, error.message) : error, request);
     }
-
-    if (this.config.traceFile) {
-      // For debugging only. The file holds full prompts, so only the owner can read it.
-      try {
-        appendFileSync(this.config.traceFile, JSON.stringify({ request_id: requestId, request, payload: chat.payload }) + '\n', { mode: 0o600 });
-      } catch (error) {
-        log('warn', 'could not write the trace file', { error: String(error) });
-      }
-    }
+    this.trace({ request_id: requestId, request, payload: chat.payload });
 
     const streaming = request.stream === true;
     const controller = new AbortController();
@@ -309,6 +325,8 @@ export class Gateway {
     let firstTokenMs: number | null = null;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     let outcome = 'failed';
+    /** The reason of a failure that the translator does not hold. */
+    let failure: string | undefined;
     const write = (events: ResponseEvent[]) => streaming ? writeAll(res, events.map(sseFrame).join('')) : Promise.resolve();
 
     try {
@@ -321,6 +339,7 @@ export class Gateway {
         // longer than the context window). Pass it to the client unchanged.
         outcome = 'client_error';
         m.clientErrors++;
+        failure = (backend.errorText || `backend HTTP ${backend.status}`).slice(0, 1000);
         sendJson(res, backend.status || 502, {
           error: { type: 'backend_error', message: backend.errorText || `backend HTTP ${backend.status}` },
         });
@@ -359,6 +378,15 @@ export class Gateway {
         if (events.length) await write(events);
       }
       const final = translator.finishStream();
+      for (const item of translator.response.output) {
+        // Codex answers such a call with a parse error. The warning shows how
+        // often the backend sends one.
+        if (item.type === 'function_call' && !isJsonObjectText(item.arguments)) {
+          log('warn', 'tool call arguments are not a JSON object', {
+            request_id: requestId, name: item.name, arguments: String(item.arguments).slice(0, 300),
+          });
+        }
+      }
       await write(final);
       const response = translator.response;
       outcome = response.status;
@@ -373,8 +401,11 @@ export class Gateway {
       const reason = aborted && controller.signal.reason instanceof Error ? controller.signal.reason.message : (error as Error).message;
       const clientGone = res.destroyed || reason === 'client disconnected';
       outcome = clientGone ? 'cancelled' : 'failed';
+      failure = reason;
       if (error instanceof HttpError && !res.headersSent) {
         outcome = error.status === 499 ? 'cancelled' : error.status >= 500 ? 'failed' : 'client_error';
+        error.requestId = requestId;
+        error.logged = true;
         throw error;
       }
       if (endpoint && !clientGone) endpoint.stats.errors++;
@@ -405,7 +436,7 @@ export class Gateway {
         stream: streaming,
         effort: request.reasoning?.effort ?? null,
         status: outcome,
-        error: translator.response.error?.message ?? undefined,
+        error: translator.response.error?.message ?? failure,
         first_token_ms: firstTokenMs === null ? null : Math.round(firstTokenMs),
         elapsed_ms: Math.round(performance.now() - started),
         usage: translator.response.usage,

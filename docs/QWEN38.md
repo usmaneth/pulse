@@ -337,7 +337,7 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_MODEL_CATALOG` | none | Codex catalog file; `/v1/models` returns its matching entries |
 | `PULSE_GATEWAY_EMIT_REASONING` | `1` | `0` hides reasoning items |
 | `PULSE_GATEWAY_REPLAY_REASONING` | `1` | `0` does not send earlier reasoning back to the model |
-| `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload to this JSONL file (mode 0600; for debugging, it holds full prompts) |
+| `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload, or the reason the gateway refused it, to this JSONL file (mode 0600; for debugging, it holds full prompts) |
 | `PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS` | `12000` | tool output cap, 0 disables it |
 | `PULSE_GATEWAY_MAX_BODY_BYTES` | 64 MiB | request body limit |
 | `PULSE_GATEWAY_CONNECT_TIMEOUT_MS` | `3000` | connect limit per endpoint |
@@ -361,6 +361,19 @@ time to first token, elapsed time, usage and output item types:
 ```
 journalctl --user -u pulse-qwen38 -o cat | jq 'select(.msg == "response") | {backend, status, first_token_ms, elapsed_ms}'
 ```
+
+When the request fails, the `error` field of the `response` line holds the
+reason, also for a backend 4xx that goes to Codex unchanged. A request that
+the gateway refuses before the backend call (bad JSON, unknown model,
+unsupported input, wrong API key, shutdown) writes one `request rejected`
+line with the request id, HTTP status and message instead:
+
+```
+journalctl --user -u pulse-qwen38 -o cat | jq 'select(.msg == "request rejected") | {request_id, status, error}'
+```
+
+A `tool call arguments are not a JSON object` warning shows a function call
+from the backend that Codex cannot parse.
 
 ## Shutdown
 

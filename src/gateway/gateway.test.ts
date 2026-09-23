@@ -10,7 +10,7 @@ import { Gateway } from './server.js';
 import { defaultConfig, loadConfig, parseEndpointList } from './config.js';
 import type { GatewayConfig } from './config.js';
 import { sseData } from './sse.js';
-import { setLogLevel } from './log.js';
+import { setLogLevel, setLogSink } from './log.js';
 import type { Obj } from './translate.js';
 
 setLogLevel('error');
@@ -201,6 +201,57 @@ test('codex exec --output-schema: a json_schema text.format reaches the backend 
     assert(backend.requests[0].messages[0].content.endsWith(JSON.stringify(schema)));
     assert.equal(backend.requests[0].response_format, undefined);
   } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('rejected requests and backend errors get a log line with the reason', async () => {
+  const lines: Obj[] = [];
+  setLogLevel('info');
+  setLogSink((_level, line) => lines.push(JSON.parse(line)));
+  const trace = `${process.env.TMPDIR ?? '/tmp'}/pulse-gateway-reject-${process.pid}.jsonl`;
+  const bad = await mockBackend((body, _q, res) => {
+    if (body.messages.at(-1).content === 'cut') {
+      sse(res, [
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'shell_command', arguments: '{"command": "ls' } }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+      ]);
+      return;
+    }
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end('{"error":{"message":"Unterminated string starting at: line 1 column 9"}}');
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: bad.url }], { traceFile: trace });
+  try {
+    const tools = [{ type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } }];
+    assert.equal((await post(base, { model: 'qwen3.8-flash-next', input: 'x', store: true, stream: true })).status, 400);
+    assert.equal((await post(base, { model: 'gpt-5', input: 'x' })).status, 400);
+    assert.equal((await fetch(`${base}/v1/responses`, { method: 'POST', body: '{nope' })).status, 400);
+    assert.equal((await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true })).status, 400);
+    await events(await post(base, { model: 'qwen3.8-flash-next', input: 'cut', stream: true, tools }));
+    const rejected = lines.filter((l) => l.msg === 'request rejected');
+    assert.deepEqual(rejected.map((l) => [l.status, l.error]), [
+      [400, 'store=true is not supported; the gateway keeps no state, so set store=false'],
+      [400, 'unknown model: gpt-5; this gateway serves qwen3.8-flash-next'],
+      [400, 'invalid JSON'],
+    ]);
+    for (const l of rejected) assert.match(l.request_id, /^req_/);
+    const responses = lines.filter((l) => l.msg === 'response');
+    assert.equal(responses[0].status, 'client_error');
+    assert.match(responses[0].error, /Unterminated string/);
+    const warned = lines.find((l) => l.msg === 'tool call arguments are not a JSON object');
+    assert.deepEqual([warned?.name, warned?.arguments], ['shell_command', '{"command": "ls']);
+    // The trace file keeps the rejected request with its reason.
+    const rows = readFileSync(trace, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(rows[0].request_id, rejected[0].request_id);
+    assert.equal(rows[0].request.store, true);
+    assert.match(rows[0].error, /store=true/);
+    assert.equal(rows[0].payload, undefined);
+  } finally {
+    setLogSink(null);
+    setLogLevel('error');
+    rmSync(trace, { force: true });
+    await gateway.stop();
+    await bad.close();
+  }
 });
 
 test('backend requests on a keep-alive socket do not pile up timeout listeners', async () => {
