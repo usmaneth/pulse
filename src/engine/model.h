@@ -38,6 +38,10 @@ struct Hparams {
 
 class Model {
 public:
+    Model() = default;
+    Model(const Model&) = delete;
+    Model& operator=(const Model&) = delete;
+    ~Model() { for(auto& item:tensors_) cudaFree(item.second.ptr); }
     bool load(const char* path, bool verbose = true) {
         if (!r_.open(path) || !r_.parse()) return false;
 
@@ -62,6 +66,23 @@ public:
         hp_.full_attn_interval = geti((p+"full_attention_interval").c_str(), 0);
         hp_.rms_eps   = getf((p+"attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
 
+        // Register the read-only file pages during upload. Fall back on unsupported hosts.
+        struct HostRegistration {
+            void* data;
+            bool active=false;
+            ~HostRegistration() { if(active) cudaHostUnregister(data); }
+        } registration{const_cast<uint8_t*>(r_.mapped_data())};
+        const char* pin_setting=std::getenv("PULSE_PIN_MODEL");
+        if(pin_setting && std::strcmp(pin_setting,"0")!=0) {
+            cudaError_t status=cudaHostRegister(registration.data,r_.file_size(),
+                cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+            registration.active=status==cudaSuccess;
+            if(!registration.active) {
+                fprintf(stderr,"model host registration unavailable: %s; use pageable upload\n",cudaGetErrorString(status));
+                cudaGetLastError();
+            }
+        }
+        if(verbose) printf("model upload: %s host pages\n",registration.active?"registered":"pageable");
         size_t total = 0, skipped = 0;
         for (const auto& ti : r_.tensors()) {
             const size_t nb = tensor_bytes(ti);
@@ -82,8 +103,10 @@ public:
                    hp_.n_layer, hp_.n_embd, hp_.n_ff, hp_.n_head, hp_.n_head_kv);
             printf("vocab     : %d   train ctx %d   full-attn every %d\n",
                    hp_.n_vocab, hp_.n_ctx_train, hp_.full_attn_interval);
-            printf("uploaded  : %zu tensors, %.2f GB on GPU (%zu skipped)\n\n",
-                   tensors_.size(), total/1e9, skipped);
+            printf("uploaded  : %zu tensors, %zu bytes (%.3f GB, %.3f GiB), %zu skipped\n",
+                   tensors_.size(), total, total/1e9, total/double(1ULL<<30), skipped);
+            printf("model file: %zu bytes (%.3f GB, %.3f GiB)\n\n", r_.file_size(),
+                   r_.file_size()/1e9, r_.file_size()/double(1ULL<<30));
         }
         return true;
     }

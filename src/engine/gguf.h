@@ -36,7 +36,12 @@ public:
         struct stat st{};
         if (fstat(fd_, &st) != 0) { perror("fstat"); return false; }
         size_ = (size_t)st.st_size;
-        base_ = (const uint8_t*)mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        int map_flags=MAP_PRIVATE;
+#ifdef MAP_POPULATE
+        const char* prefetch=std::getenv("PULSE_PREFETCH_MODEL");
+        if(prefetch && std::strcmp(prefetch,"0")!=0) map_flags|=MAP_POPULATE;
+#endif
+        base_ = (const uint8_t*)mmap(nullptr, size_, PROT_READ, map_flags, fd_, 0);
         if (base_ == MAP_FAILED) { perror("mmap"); return false; }
         p_ = base_;
         return true;
@@ -94,6 +99,7 @@ public:
     uint64_t n_tensors() const { return n_tensors_; }
     uint64_t n_kv() const { return n_kv_; }
     size_t file_size() const { return size_; }
+    const uint8_t* mapped_data() const { return base_; }
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     const std::map<std::string,std::string>& kv() const { return kv_; }
 
@@ -117,6 +123,22 @@ public:
                 case GT_UINT32: { uint32_t v; memcpy(&v,a->data+i*4,4); out[i]=(int32_t)v; } break;
                 default: return false;
             }
+        }
+        return true;
+    }
+
+    bool array_strings(const std::string& key, std::vector<std::string>& out) const {
+        const ArrRef* a=array(key);
+        if(!a || a->type!=GT_STRING) return false;
+        const uint8_t* cursor=a->data;
+        const uint8_t* end=base_+size_;
+        out.clear();
+        for(uint64_t i=0;i<a->n;++i) {
+            if(cursor>end || size_t(end-cursor)<8) return false;
+            uint64_t length; memcpy(&length,cursor,8); cursor+=8;
+            if(length>uint64_t(end-cursor)) return false;
+            out.emplace_back(reinterpret_cast<const char*>(cursor),size_t(length));
+            cursor+=length;
         }
         return true;
     }

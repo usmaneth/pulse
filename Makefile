@@ -40,3 +40,33 @@ clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)/pulse $(BIN_DIR)/libpulse_engine.so
 
 .PHONY: all clean
+
+LLAMA_DIR ?= /home/usman/Bonsai-demo/llama.cpp
+LLAMA_LIB_DIR ?= $(LLAMA_DIR)/build-cuda/bin
+ENGINE_LINK = -L$(LLAMA_LIB_DIR) -Wl,-rpath,$(LLAMA_LIB_DIR) -lggml-base
+
+$(BIN_DIR)/pulse-engine: src/engine/engine.cu src/engine/pq2_q8.cuh src/engine/sequential.cuh src/engine/sequence_contract.h src/engine/normalization.h src/engine/model.h src/engine/gguf.h | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $< -L$(LLAMA_LIB_DIR) -Xlinker -rpath -Xlinker $(LLAMA_LIB_DIR) -lggml-base -o $@
+
+$(BIN_DIR)/pulse-dumpref: src/engine/dump_ref.cpp src/engine/reference_layout.h src/engine/sequence_contract.h | $(BIN_DIR)
+	$(CXX) -O2 -std=c++17 -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include $< $(ENGINE_LINK) -lllama -lggml -o $@
+
+$(BIN_DIR)/test-reference-layout: tests/engine/reference_layout.cpp src/engine/reference_layout.h | $(BIN_DIR)
+	$(CXX) -O2 -std=c++17 -Isrc/engine $< -o $@
+
+$(BIN_DIR)/test-sequence-contract: tests/engine/sequence_contract.cpp src/engine/sequence_contract.h src/engine/normalization.h | $(BIN_DIR)
+	$(CXX) -O2 -std=c++17 -Isrc/engine $< -o $@
+
+native-cpu-test: $(BIN_DIR)/test-reference-layout $(BIN_DIR)/test-sequence-contract
+	./$(BIN_DIR)/test-reference-layout
+	./$(BIN_DIR)/test-sequence-contract
+	python3 tests/engine/test_compare_sequence.py
+	python3 tests/engine/test_compare_native_dumps.py
+
+.PHONY: native-cpu-test
+
+$(BIN_DIR)/test-pq2-q8: tests/engine/pq2_q8.cu src/engine/pq2_q8.cuh | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) -I$(LLAMA_DIR)/ggml/include -Isrc/engine -I$(LLAMA_DIR)/ggml/src -I$(LLAMA_DIR)/ggml/src/ggml-cuda $< -L$(LLAMA_LIB_DIR) -Xlinker -rpath -Xlinker $(LLAMA_LIB_DIR) -lggml-cuda -lggml-base -o $@
+
+$(BIN_DIR)/test-gdn-prefill: tests/engine/gdn_prefill.cu src/engine/gdn_prefill.cuh | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) -Isrc/engine -I$(LLAMA_DIR)/ggml/include $< -L$(LLAMA_LIB_DIR) -Xlinker -rpath -Xlinker $(LLAMA_LIB_DIR) -lggml-cuda -lggml-base -o $@

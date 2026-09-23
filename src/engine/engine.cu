@@ -4,6 +4,7 @@
 // dequantised weights. An op that is not validated does not go in the layer
 // loop, because a silent numerical bug 30 layers deep is unfindable later.
 #include "model.h"
+#include "normalization.h"
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -22,8 +23,10 @@ struct __align__(2) blk { uint16_t d; uint8_t qs[QK/4]; };
 // ---------------------------------------------------------------- RMSNorm
 // y = x / sqrt(mean(x^2) + eps) * w     (one block per row)
 __global__ __launch_bounds__(256)
-void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
-               float* __restrict__ y, int n, float eps) {
+void k_rmsnorm(const float* x, const float* __restrict__ w,
+               float* y, int n, float eps) {
+    x += size_t(blockIdx.x)*n;
+    y += size_t(blockIdx.x)*n;
     __shared__ float red[8];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float ss = 0.0f;
@@ -80,13 +83,12 @@ __global__ void k_swiglu(const float* __restrict__ g, const float* __restrict__ 
 // over the first rope_dim dims of each head; the remaining head dims are left
 // unrotated (rope_dim=64 of key_length=256 here).
 //
-// This matters beyond correctness. llama.cpp refuses K-shifting on any model
-// with n_pos_per_embd() > 1 (src/llama-kv-cache.cpp), which is why
-// --cache-reuse is unavailable on this model and a mid-context edit costs a
-// full re-prefill. An engine that owns RoPE can shift positions itself on the
-// text path, because the multimodal sections collapse to one position.
+// Text-only RoPE permits attention position shifts. A changed prefix also changes
+// GDN recurrent state. Whole-model reuse requires valid state checkpoints or a
+// prefix recomputation. This kernel does not implement edited-prefix cache reuse.
 __global__ void k_rope(float* __restrict__ x, int n_head, int head_dim,
-                       int rope_dim, int pos, float freq_base) {
+                       int rope_dim, int pos, float freq_base, const int* control=nullptr) {
+    if(control) pos=control[1];
     const int h = blockIdx.x;                 // head
     const int i = threadIdx.x;                // pair index within rope_dim/2
     if (h >= n_head || i >= rope_dim/2) return;
@@ -127,7 +129,8 @@ void k_attention(const float* __restrict__ Q,      // [n_head][head_dim]
                  const float* __restrict__ K,      // [n_ctx][n_kv_head][head_dim]
                  const float* __restrict__ V,
                  float* __restrict__ O,            // [n_head][head_dim]
-                 int n_head, int n_kv_head, int head_dim, int n_kv, float scale) {
+                 int n_head, int n_kv_head, int head_dim, int n_kv, float scale, const int* control=nullptr) {
+    if(control) n_kv=control[1]+1;
     const int h  = blockIdx.x;
     if (h >= n_head) return;
     const int kvh = h / (n_head / n_kv_head);      // GQA mapping
@@ -342,7 +345,7 @@ __global__ void k_conv_silu_pos0(const float* __restrict__ qkv,
 
 // per-head L2 normalise, one block per head
 __global__ __launch_bounds__(128)
-void k_l2_head(float* __restrict__ x, int dk) {
+void k_l2_head(float* __restrict__ x, int dk, float epsilon=1e-6f) {
     const int h = blockIdx.x, t = threadIdx.x;
     float* p = x + (size_t)h*dk;
     float s = 0.0f;
@@ -353,16 +356,16 @@ void k_l2_head(float* __restrict__ x, int dk) {
     if ((t & 31) == 0) red[t>>5] = s;
     __syncthreads();
     if (t == 0) { float v = 0; for (int i = 0; i < (int)(blockDim.x>>5); ++i) v += red[i];
-                  red[0] = rsqrtf(fmaxf(v, 1e-30f)); }
+                  red[0] = rsqrtf(l2_squared_norm_floor(v,epsilon)); }
     __syncthreads();
     const float inv = red[0];
     for (int i = t; i < dk; i += blockDim.x) p[i] *= inv;
 }
 
 // gates: beta = sigmoid(b), g = exp(a * softplus(alpha + dt_bias))
-__global__ void k_gdn_gates(const float* __restrict__ alpha, const float* __restrict__ beta,
+__global__ void k_gdn_gates(const float* alpha, const float* beta,
                             const float* __restrict__ ssm_a, const float* __restrict__ dt_bias,
-                            float* __restrict__ g_out, float* __restrict__ b_out, int nvh) {
+                            float* g_out, float* b_out, int nvh) {
     const int h = blockIdx.x*blockDim.x + threadIdx.x;
     if (h >= nvh) return;
     const float x = alpha[h] + dt_bias[h];
@@ -414,6 +417,8 @@ __global__ void k_attn_gate_pos0(const float* __restrict__ qf, const float* __re
 
 } // namespace pulse
 
+#include "sequential.cuh"
+
 using namespace pulse;
 
 static void cpu_matvec_pq2(const uint8_t* W, const float* x, float* y, int ne0, int nrows) {
@@ -436,6 +441,8 @@ int main(int argc, char** argv) {
     CU(cudaEventRecord(t1)); CU(cudaEventSynchronize(t1));
     float load_ms = 0; CU(cudaEventElapsedTime(&load_ms,t0,t1));
     printf("load time : %.2f s  (%.1f GB/s)\n\n", load_ms/1000.0, m.bytes_on_gpu()/(load_ms*1e-3)/1e9);
+
+    if(argc>2 && std::string(argv[2])=="--decode") return sequential_cli(m,argc,argv);
 
     const auto& hp = m.hp();
     const int n = hp.n_embd;
@@ -694,7 +701,8 @@ int main(int argc, char** argv) {
             if (ty != 0) { fclose(f); return false; }          // f32 only
             size_t n = (size_t)ne[0]*ne[1]*ne[2]*ne[3];
             out.resize(n);
-            const bool ok = fread(out.data(),4,n,f)==n;
+            const bool ok = fread(out.data(),4,n,f)==n && fgetc(f)==EOF;
+            if (!ok) fprintf(stderr, "invalid reference payload: %s; regenerate with pulse-dumpref\n", path);
             fclose(f); return ok;
         };
         printf("\nvalidation against llama.cpp intermediates (%s):\n", refdir);
@@ -1797,196 +1805,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ================= DEVICE-RESIDENT FORWARD PASS =================
-    // Same arithmetic as the validated sweep, but nothing leaves the GPU and the
-    // recurrence runs in k_gdn_step instead of on the CPU in doubles.
-    {
-        printf("\n===== DEVICE-RESIDENT FORWARD PASS =====\n"); fflush(stdout);
-        const int HB = 1024; const float hs = 1.0f/std::sqrt((float)HB);
-        std::vector<int32_t> sv, sw;
-        m.reader().array_i32("prism.hadamard.sign_values", sv);
-        m.reader().array_i32("prism.hadamard.sign_widths",  sw);
-        auto mk = [&](int w)->float*{ size_t off=0;
-            for (size_t i=0;i<sw.size();++i){ if (sw[i]==w){ std::vector<float> f(w);
-                for (int j=0;j<w;++j) f[j]=(float)sv[off+j];
-                float* d; CU(cudaMalloc(&d,(size_t)w*4));
-                CU(cudaMemcpy(d,f.data(),(size_t)w*4,cudaMemcpyHostToDevice)); return d; }
-                off += (size_t)sw[i]; } return nullptr; };
-        float* S5=mk(5120); float* S6=mk(6144); float* S17=mk(17408);
-        const int nff=(int)m.layer(0,"ffn_gate.weight")->ne[1];
-        const int dk=128,dv=128,nvh=48,nkh=16;
-
-        float *dx,*dres,*dh,*dt,*dqkv,*dz,*dconv,*dstate,*dgg,*dbb,*do1,*dg,*du,*dfw,*dperm;
-        CU(cudaMalloc(&dx,(size_t)n*4));      CU(cudaMalloc(&dres,(size_t)n*4));
-        CU(cudaMalloc(&dh,(size_t)n*4));      CU(cudaMalloc(&dt,(size_t)n*4));
-        CU(cudaMalloc(&dqkv,(size_t)10240*4));CU(cudaMalloc(&dz,(size_t)6144*4));
-        CU(cudaMalloc(&dconv,(size_t)10240*4));
-        CU(cudaMalloc(&dstate,(size_t)nvh*dk*dv*4));
-        CU(cudaMalloc(&dgg,(size_t)48*4));    CU(cudaMalloc(&dbb,(size_t)48*4));
-        CU(cudaMalloc(&do1,(size_t)6144*4));  CU(cudaMalloc(&dg,(size_t)nff*4));
-        CU(cudaMalloc(&du,(size_t)nff*4));    CU(cudaMalloc(&dfw,(size_t)nff*4));
-        CU(cudaMalloc(&dperm,(size_t)6144*4));
-        float *dqf,*dvv,*dgate6;
-        CU(cudaMalloc(&dqf,(size_t)12288*4)); CU(cudaMalloc(&dvv,(size_t)1024*4));
-        CU(cudaMalloc(&dgate6,(size_t)6144*4));
-
-        std::vector<float> emb(n, 0.f);
-        if (argc > 2) {
-            char path[1100]; snprintf(path,sizeof path,"%s/model.input_embed.bin",argv[2]);
-            if (FILE* f = fopen(path,"rb")) {
-                int32_t ty; int64_t ne[4];
-                if (fread(&ty,4,1,f)==1 && fread(ne,8,4,f)==4 && ty==0) {
-                    size_t nn=(size_t)ne[0]*ne[1]*ne[2]*ne[3];
-                    if ((int)nn==n) { if (fread(emb.data(),4,nn,f)!=nn) emb.assign(n,0.f); }
-                }
-                fclose(f);
-            }
-        }
-
-        auto run_once = [&](){
-            CU(cudaMemcpyAsync(dx,emb.data(),(size_t)n*4,cudaMemcpyHostToDevice,g_stream));
-            CU(cudaMemsetAsync(dstate,0,(size_t)nvh*dk*dv*4,g_stream));
-            for (int il=0; il<hp.n_layer; ++il) {
-                CU(cudaMemcpyAsync(dres,dx,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-                k_rmsnorm<<<1,256, 0, g_stream>>>(dx,(const float*)m.layer(il,"attn_norm.weight")->ptr,dh,n,hp.rms_eps);
-                CU(cudaMemcpyAsync(dt,dh,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-                k_hadamard<<<(n+HB-1)/HB,512,HB*4, g_stream>>>(dt,S5,n,HB,hs);
-                if (m.is_full_attn(il)) {
-                    k_matvec_pq2<<<(12288+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"attn_q.weight")->ptr,dt,dqf,n,12288);
-                    k_matvec_pq2<<<(1024+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"attn_v.weight")->ptr,dt,dvv,n,1024);
-                    k_attn_gate_pos0<<<(6144+255)/256,256, 0, g_stream>>>(dqf,dvv,dgate6,24,4,256);
-                    k_hadamard<<<(6144+HB-1)/HB,512,HB*4, g_stream>>>(dgate6,S6,6144,HB,hs);
-                    k_matvec_pq2<<<(n+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"attn_output.weight")->ptr,dgate6,dt,6144,n);
-                } else {
-                    k_matvec_pq2<<<(10240+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"attn_qkv.weight")->ptr,dt,dqkv,n,10240);
-                    k_matvec_pq2<<<(6144+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"attn_gate.weight")->ptr,dt,dz,n,6144);
-                    k_matvec_bf16<<<48,256, 0, g_stream>>>((const uint16_t*)m.layer(il,"ssm_alpha.weight")->ptr,dh,dgg,n,48);
-                    k_matvec_bf16<<<48,256, 0, g_stream>>>((const uint16_t*)m.layer(il,"ssm_beta.weight")->ptr,dh,dbb,n,48);
-                    k_conv_silu_pos0<<<(10240+255)/256,256, 0, g_stream>>>(dqkv,
-                        (const float*)m.layer(il,"ssm_conv1d.weight")->ptr,dconv,10240);
-                    k_l2_head<<<nkh,128, 0, g_stream>>>(dconv,dk);
-                    k_l2_head<<<nkh,128, 0, g_stream>>>(dconv+2048,dk);
-                    k_gdn_gates<<<1,64, 0, g_stream>>>(dgg,dbb,(const float*)m.layer(il,"ssm_a")->ptr,
-                        (const float*)m.layer(il,"ssm_dt.bias")->ptr,dgg,dbb,48);
-                    k_gdn_step<<<nvh,128,2*dk*sizeof(float), g_stream>>>(dstate,dconv,dconv+2048,
-                        dconv+4096,dgg,dbb,do1,nvh,nkh,dk,dv);
-                    k_gdn_norm_gate<<<nvh,128, 0, g_stream>>>(do1,
-                        (const float*)m.layer(il,"ssm_norm.weight")->ptr,dz,dv,hp.rms_eps);
-                    k_perm_tiled_to_grouped<<<(6144+255)/256,256, 0, g_stream>>>(do1,dperm,128,16,3);
-                    k_hadamard<<<(6144+HB-1)/HB,512,HB*4, g_stream>>>(dperm,S6,6144,HB,hs);
-                    k_matvec_pq2<<<(n+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"ssm_out.weight")->ptr,dperm,dt,6144,n);
-                }
-                k_add<<<(n+255)/256,256, 0, g_stream>>>(dt,dres,n);
-                CU(cudaMemcpyAsync(dx,dt,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-                CU(cudaMemcpyAsync(dres,dx,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-                k_rmsnorm<<<1,256, 0, g_stream>>>(dx,(const float*)m.layer(il,"post_attention_norm.weight")->ptr,dh,n,hp.rms_eps);
-                CU(cudaMemcpyAsync(dt,dh,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-                k_hadamard<<<(n+HB-1)/HB,512,HB*4, g_stream>>>(dt,S5,n,HB,hs);
-                k_matvec_pq2<<<(nff+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"ffn_gate.weight")->ptr,dt,dg,n,nff);
-                k_matvec_pq2<<<(nff+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"ffn_up.weight")->ptr,dt,du,n,nff);
-                k_swiglu<<<(nff+255)/256,256, 0, g_stream>>>(dg,du,dfw,nff);
-                k_hadamard<<<(nff+HB-1)/HB,512,HB*4, g_stream>>>(dfw,S17,nff,HB,hs);
-                k_matvec_pq2<<<(n+7)/8,256, 0, g_stream>>>((const blk*)m.layer(il,"ffn_down.weight")->ptr,dfw,dt,nff,n);
-                k_add<<<(n+255)/256,256, 0, g_stream>>>(dt,dres,n);
-                CU(cudaMemcpyAsync(dx,dt,(size_t)n*4,cudaMemcpyDeviceToDevice,g_stream));
-            }
-        };
-
-        printf("  warming...\n"); fflush(stdout);
-        run_once();
-        bool warm_ok = true;
-        { cudaError_t e2 = cudaDeviceSynchronize();
-          if (e2 != cudaSuccess) { printf("  warm run failed: %s\n", cudaGetErrorString(e2));
-                                   warm_ok = false; fflush(stdout); } }
-        if (warm_ok) printf("  warm ok, timing...\n"); fflush(stdout);
-        cudaEvent_t a,b; CU(cudaEventCreate(&a)); CU(cudaEventCreate(&b));
-        const int iters = 5;
-        CU(cudaEventRecord(a));
-        if (warm_ok) for (int i=0;i<iters;++i) run_once();
-        CU(cudaEventRecord(b)); CU(cudaEventSynchronize(b));
-        float ms=0; CU(cudaEventElapsedTime(&ms,a,b));
-        const double per = ms/iters;
-
-        // ---- CUDA graph capture -------------------------------------------
-        // ~15 kernels per layer x 64 layers is close to a thousand launches.
-        // llama.cpp CANNOT do this on this model: its graphs are rejected at
-        // runtime because Gated DeltaNet nodes fail
-        // ggml_cuda_graph_check_compability (recorded in bench/RESULTS.md).
-        // An engine that owns its own launch sequence has no such restriction.
-        double per_graph = 0.0;
-        if (warm_ok) {
-            cudaStream_t st; CU(cudaStreamCreate(&st));
-            g_stream = st;                       // kernels below launch on it
-            cudaGraph_t graph; cudaGraphExec_t inst;
-            CU(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-            run_once();
-            cudaError_t cerr = cudaStreamEndCapture(st, &graph);
-            if (cerr != cudaSuccess) {
-                printf("  graph capture failed: %s\n", cudaGetErrorString(cerr));
-                g_stream = 0;
-            } else {
-                CU(cudaGraphInstantiate(&inst, graph, nullptr, nullptr, 0));
-                CU(cudaGraphLaunch(inst, st)); CU(cudaStreamSynchronize(st));
-                cudaEvent_t c,d; CU(cudaEventCreate(&c)); CU(cudaEventCreate(&d));
-                CU(cudaEventRecord(c, st));
-                for (int i=0;i<iters;++i) CU(cudaGraphLaunch(inst, st));
-                CU(cudaEventRecord(d, st)); CU(cudaEventSynchronize(d));
-                float gm=0; CU(cudaEventElapsedTime(&gm,c,d));
-                per_graph = gm/iters;
-                cudaGraphExecDestroy(inst); cudaGraphDestroy(graph);
-                g_stream = 0;
-            }
-            cudaStreamDestroy(st);
-        }
-        // --- attribute the non-matvec cost: time each kernel class in isolation
-        {
-            auto bench_k = [&](const char* nm, int reps, auto&& fn){
-                fn(); CU(cudaDeviceSynchronize());
-                cudaEvent_t c,d; cudaEventCreate(&c); cudaEventCreate(&d);
-                cudaEventRecord(c);
-                for (int i=0;i<reps;++i) fn();
-                cudaEventRecord(d); cudaEventSynchronize(d);
-                float t=0; cudaEventElapsedTime(&t,c,d);
-                printf("    %-26s %7.3f us/call  x%4d/pass = %6.2f ms\n",
-                       nm, t/reps*1000.0, reps, t/reps*reps/reps*0);
-                return (double)(t/reps);
-            };
-            const double t_norm = bench_k("k_rmsnorm (1 blk, 256t)", 200, [&]{
-                k_rmsnorm<<<1,256,0,g_stream>>>(dx,(const float*)m.layer(0,"attn_norm.weight")->ptr,dh,n,hp.rms_eps); });
-            const double t_had  = bench_k("k_hadamard (5120)", 200, [&]{
-                k_hadamard<<<(n+HB-1)/HB,512,HB*4,g_stream>>>(dt,S5,n,HB,hs); });
-            const double t_mv   = bench_k("k_matvec_pq2 (5120x17408)", 20, [&]{
-                k_matvec_pq2<<<(nff+7)/8,256,0,g_stream>>>((const blk*)m.layer(0,"ffn_gate.weight")->ptr,dt,dg,n,nff); });
-            const double t_gdn  = bench_k("k_gdn_step (48 heads)", 100, [&]{
-                k_gdn_step<<<nvh,128,2*dk*sizeof(float),g_stream>>>(dstate,dconv,dconv+2048,
-                    dconv+4096,dgg,dbb,do1,nvh,nkh,dk,dv); });
-            printf("\n    per forward pass (64 layers):\n");
-            printf("      rmsnorm   x128 = %6.2f ms\n", t_norm*128);
-            printf("      hadamard  x~230 = %6.2f ms\n", t_had*230);
-            printf("      gdn_step  x48  = %6.2f ms\n", t_gdn*48);
-            printf("      (matvec 5120x17408 is %6.3f ms each; ~2.3 of those per layer)\n", t_mv);
-        }
-        printf("\n  per forward pass      : %7.2f ms\n", per);
-        printf("  harness version       : %7.2f ms  (host round-trips + CPU recurrence)\n", 65.9);
-        printf("  llama.cpp decode step : %7.2f ms\n", 36.65);
-        printf("  weight-sweep bound    : %7.2f ms  (6.70 GB at 176 GB/s)\n", 6.70/176.0*1000.0);
-        printf("  effective bandwidth   : %7.1f GB/s\n", 6.70/(per*1e-3));
-        printf("  vs llama.cpp          : %7.2fx\n", per/36.65);
-        if (per_graph > 0) {
-            printf("\n  --- with CUDA graph capture ---\n");
-            printf("  per forward pass      : %7.2f ms   (%.2fx faster than streamed)\n",
-                   per_graph, per/per_graph);
-            printf("  effective bandwidth   : %7.1f GB/s\n", 6.70/(per_graph*1e-3));
-            printf("  vs llama.cpp          : %7.2fx\n", per_graph/36.65);
-            printf("  NOTE: llama.cpp cannot use graphs on this model - its GDN\n");
-            printf("        nodes fail ggml_cuda_graph_check_compability.\n");
-        }
-        cudaFree(dx);cudaFree(dres);cudaFree(dh);cudaFree(dt);cudaFree(dqkv);cudaFree(dz);
-        cudaFree(dconv);cudaFree(dstate);cudaFree(dgg);cudaFree(dbb);cudaFree(do1);
-        cudaFree(dg);cudaFree(du);cudaFree(dfw);cudaFree(dperm);cudaFree(dqf);
-        cudaFree(dvv);cudaFree(dgate6);
-        if(S5)cudaFree(S5); if(S6)cudaFree(S6); if(S17)cudaFree(S17);
-    }
+    // The former timed path omitted the output head and shared state across layers.
+    // Use --decode for the experimental complete sequential path.
 
     printf("\n%d/%d ops validated\n", pass, total);
     cudaFree(d_x); cudaFree(d_y);
