@@ -107,6 +107,12 @@ SRC_OUT_ANCHORS = {
          "        return self.logits_processor(self.lm_head, hidden_states)\n"),
     ],
 }
+# The rejected fused-QSA record: a diff against this pristine image file.
+QSA_REL = "models/qwen3_8_flash_next/common/qsa_cache.py"
+QSA_DIFF = os.path.join(PKG, "rejected", "qsa_cache.diff")
+QSA_PRISTINE = "e3460b06cd7ed309e47ad5dfd3d4250890539b912385503133bd98a003f73ba8"
+QSA_EDITED = "0b8079aeab062f3bc71e66571e710b6f757677bf9c7a889368dd4dbc6e29fc42"
+MANIFEST_MD = os.path.join(PKG, "MANIFEST.md")
 # Anchors of patch_mtp_fp8_head.py in the output of patch_mtp_draft_vocab.py.
 FP8_ANCHORS = [
     "\n    full_gib = ",
@@ -151,6 +157,16 @@ def parse_args_line(line):
         else:
             raise AssertionError(f"unexpected token {flag!r}")
     return items
+
+
+def sourced_values(path, keys):
+    """Return {key: value} after bash sources path, as start.sh does."""
+    script = 'source "$1" >/dev/null || exit 1; shift; for k; do printf "%s\\0" "${!k-<unset>}"; done'
+    p = subprocess.run(["bash", "--noprofile", "--norc", "-c", script, "bash", path, *keys],
+                       capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+    if p.returncode != 0:
+        raise AssertionError(f"cannot source {path}: {p.stderr}")
+    return dict(zip(keys, p.stdout.split("\0")))
 
 
 def gen(script, *argv):
@@ -220,6 +236,49 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("git does not ignore it", p.stderr)
         self.assertFalse(os.path.exists(bad))
+
+
+    def test_profile_owned_items_match_profile(self):
+        # Each KEY=VALUE item that MANIFEST.md lists as owned by the profile
+        # must be the value that the profile gives.
+        text = read(MANIFEST_MD)
+        section = text.split("## Items that the profile owns", 1)[1].split("\n## ", 1)[0]
+        items = dict(re.findall(r"`([A-Z][A-Z0-9_]*)=([^`\s]*)`", section))
+        for key in ("MEMWATCH_RELIEF", "HOST_RESERVE_GIB", "HOST_SLACK_GIB",
+                    "CHAT_TEMPLATE", "MTP_INDEX_SHARE", "MAX_NUM_BATCHED_TOKENS"):
+            self.assertIn(key, items)
+        if not os.path.isfile(PROFILE):
+            self.skipTest(f"profile {PROFILE} not present")
+        got = sourced_values(PROFILE, sorted(items))
+        for key, value in items.items():
+            self.assertEqual(got[key], value, f"MANIFEST.md says {key}={value}")
+
+
+@unittest.skipUnless(image_present(), f"docker or image {IMAGE} not present")
+class RejectedRecordTest(unittest.TestCase):
+
+    def test_qsa_diff_rebuilds_the_rejected_file(self):
+        if shutil.which("patch") is None:
+            self.skipTest("patch not present")
+        with tempfile.TemporaryDirectory() as t:
+            build.extract(IMAGE, [QSA_REL], t)
+            path = os.path.join(t, QSA_REL)
+            self.assertEqual(sha256(path), QSA_PRISTINE)
+            p = subprocess.run(["patch", "--fuzz=0", "--no-backup-if-mismatch",
+                                path, QSA_DIFF], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(sha256(path), QSA_EDITED)
+            ast.parse(read(path, "rb"), filename=path)
+            self.assertIn("VLLM_QSA_FUSED_DRAFT", read(path))
+            served = os.path.join(RECIPE, "files", "ours", "qsa_cache.py")
+            if os.path.isfile(served):
+                self.assertEqual(sha256(served), QSA_EDITED)
+
+    def test_qsa_target_is_not_an_overlay_or_recipe_mount(self):
+        target = build.VLLM_PKG + "/" + QSA_REL
+        self.assertNotIn(target, build.RECIPE_TARGETS)
+        for o in build.OVERLAYS:
+            self.assertNotIn(QSA_REL, o["sources"])
 
 
 @unittest.skipUnless(image_present(), f"docker or image {IMAGE} not present")
@@ -476,6 +535,27 @@ class BuildTest(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stderr)
             for rel, want in PINNED_OUTPUTS.items():
                 self.assertEqual(sha256(os.path.join(t, rel)), want, rel)
+
+    def test_capture_dir_env_override(self):
+        with tempfile.TemporaryDirectory() as t:
+            cap = os.path.join(t, "cap-dir")
+            out = os.path.join(t, "out")
+            env = dict(os.environ, QWEN38_CAPTURE_DIR=cap)
+            p = subprocess.run([BUILD_SH, "--out", out, "--set", "capture", "--src", self.src],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            m = json.loads(read(os.path.join(out, "manifest.json")))
+            self.assertEqual(m["overlays"][0]["dirs"],
+                             [{"src": cap, "mount_target": "/cap", "mode": "rw"}])
+            toks = shlex.split(read(os.path.join(out, "docker-args.txt")))
+            self.assertIn(("-v", f"{cap}:/cap"), list(zip(toks[::2], toks[1::2])))
+            # The option still wins over the environment.
+            other = os.path.join(t, "other")
+            p = subprocess.run([BUILD_SH, "--out", out, "--set", "capture", "--src", self.src,
+                                "--capture-dir", other], capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            m = json.loads(read(os.path.join(out, "manifest.json")))
+            self.assertEqual(m["overlays"][0]["dirs"][0]["src"], other)
 
     def test_recipe_generator_drift_fails_the_build(self):
         if not self.has_recipe:

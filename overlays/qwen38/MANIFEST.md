@@ -33,13 +33,14 @@ The builder does these steps:
    `<dir>/manifest.json`.
 
 A rebuild with the same inputs writes no file. A changed file is replaced with
-`os.replace`, so a running container keeps the inode that it mounted.
+`os.replace`, so a container that runs keeps the inode that it mounted.
 
 `docker-args.txt` is one line: the `-e` and `-v` arguments that a recipe
 profile adds to `EXTRA_DOCKER_ARGS`. The recipe pastes `EXTRA_DOCKER_ARGS`
-unquoted into its launch script, so the builder accepts only the characters
-`A-Z a-z 0-9 _ . / : @ + = , -` in each argument. The builder also refuses a
-mount target that repeats or that the recipe `start.sh` mounts itself.
+into its launch script with no quotes. So the builder accepts only these
+characters in each argument: `A-Z a-z 0-9 _ . / : @ + = , -`. The builder
+also refuses a mount target that repeats or that the recipe `start.sh` mounts
+itself.
 
 `manifest.json` has the keys `image`, `image_digest`, `vllm_pkg`, `sources`
 (sha256 of each pristine file) and `overlays`. Each overlay entry has `name`,
@@ -61,7 +62,7 @@ Options:
 |---|---|---|
 | `--image` | `vllm/vllm-openai:qwen38-flash-next` | Image to extract from. |
 | `--recipe` | `$QWEN38_RECIPE_DIR`, else `/models/usman/qwen38-flash` | Recipe checkout. `mtp-fp8-head` needs it for its reference file. |
-| `--capture-dir` | `/models/usman/distill/cap` | Host directory that `capture` mounts on `/cap`. |
+| `--capture-dir` | `$QWEN38_CAPTURE_DIR`, else `/models/usman/distill/cap` | Host directory that `capture` mounts on `/cap`. |
 | `--src` | none | An extracted vLLM package to use instead of the image. |
 | `--no-recipe-check` | off | Do not compare with the recipe copy of `patch_mtp_fp8_head.py`. |
 
@@ -89,16 +90,18 @@ cannot change output correctness.
 
 Evidence (spark1, one stream, probe-gated codexbench):
 
-- TTFT on cached Codex turns went from 1.8 s to 0.8-0.9 s. The `code_edit`
-  case measured 878 ms against 1776 ms for the stock recipe.
-- Prefill went up 15%, measured together with `MAX_NUM_BATCHED_TOKENS=8192`.
+- Measured together with `MAX_NUM_BATCHED_TOKENS=8192` (tag
+  `ttft-blockdrop-8k`): TTFT on cached Codex turns 1.8 s to 0.8-0.9 s,
+  prefill +15%. The `code_edit` case measured 878 ms against 1776 ms for the
+  stock recipe (tag `base-mia-K3`). No run measured block-drop without the
+  8192-token chunks, so the two changes share this result.
 - HumanEval: 79/80.
 
 Turn it on: mount the three files and set `MTP_DISABLE_BLOCK_DROP=1` in the
 profile. The scheduler then logs `EAGLE trailing prefix-cache block dropping
 is disabled (vllm#53388 backport).` at startup.
 
-Coupling: always remove the mounts and the knob together. `start.sh` merges
+Rule: always remove the mounts and the knob together. `start.sh` merges
 the knob into the speculative config as `"disable_eagle_block_drop": true`. A
 comment in `start.sh` says that a vLLM without the key ignores it. The vLLM
 code does not agree: `SpeculativeConfig` uses `extra="forbid"`
@@ -121,10 +124,10 @@ Evidence:
 - HumanEval: 79/80.
 
 Turn it on: set `-e VLLM_MTP_DRAFT_HEAD_FP8=1` and a non-empty
-`MTP_DRAFT_VOCAB`. The FP8 copy attaches only after the reduced head exists,
-and the speculator reads the reduced head only when `start.sh` sets
-`use_local_argmax_reduction`, which it does only when `MTP_DRAFT_VOCAB` is set.
-The server logs `MTP draft head: FP8 rowwise copy engaged` at load.
+`MTP_DRAFT_VOCAB`. The FP8 copy attaches only after the reduced head exists.
+The speculator reads the reduced head only when `start.sh` sets
+`use_local_argmax_reduction`. `start.sh` sets it only when `MTP_DRAFT_VOCAB`
+is set. The server logs `MTP draft head: FP8 rowwise copy engaged` at load.
 
 How Pulse owns it. The patch applies to `nvidia/mtp.py` after the recipe's
 `files/patch_mtp_draft_vocab.py` (MiaAI Lab, AGPL-3.0). At each launch
@@ -140,18 +143,19 @@ point`. So:
   `mtp_patched.py` next to itself, as before). Its anchors are short
   fragments, not full lines of the MiaAI Lab code. It stops when an anchor
   does not occur exactly once.
-- The builder runs the full launch chain on the pristine `mtp.py`: the
-  recipe's `patch_mtp_draft_vocab.py` (from the recipe checkout, never copied
-  into Pulse), then the Pulse generator. It writes the result to
-  `<dir>/mtp-fp8-head/mtp_patched.py` as a reference and records its sha256.
+- The builder runs the full launch chain on the pristine `mtp.py`. First it
+  runs the recipe's `patch_mtp_draft_vocab.py` from the recipe checkout. That
+  script is never copied into Pulse. Then it runs the Pulse generator. It
+  writes the result to `<dir>/mtp-fp8-head/mtp_patched.py` as a reference and
+  records its sha256.
 - The builder also runs the recipe copy of the generator on the same input.
   The build fails if the two outputs are not byte-equal.
 - The overlay emits only `-e VLLM_MTP_DRAFT_HEAD_FP8=1`. Its `files` list is
   empty. Do not mount the reference file.
 
 On the pinned image the reference sha256 is
-`ddcb79c3b701fc235488ce5afced291730ac5baabe9d97668fe9e75e8d2c1892`. A running
-server serves the same bytes when `sha256sum` of `nvidia/mtp.py` inside the
+`ddcb79c3b701fc235488ce5afced291730ac5baabe9d97668fe9e75e8d2c1892`. A server
+that runs serves the same bytes when `sha256sum` of `nvidia/mtp.py` inside the
 container gives this value.
 
 ### capture (experimental)
@@ -182,8 +186,18 @@ repeat test on a future image. Do not use it on a serving profile.
 
 ## Items that the profile owns
 
-These items are in the spark1 best profile but are not overlays. A profile
-that uses the builder must keep them:
+The overlays replace only a part of `EXTRA_DOCKER_ARGS`. A profile that uses
+the builder keeps every key of the recipe `profiles/spark1-best.env` with its
+value. In `EXTRA_DOCKER_ARGS`, the builder output replaces only two kinds of
+tokens. These are the `-e` arguments with an overlay env key, and the `-v`
+mounts on a file in the vLLM package. All other tokens stay.
+
+A node can change only the keys that give a host path or a host check, for
+example `HF_HOME` or `REQUIRE_IDLE_GPU`. It must not change a speed, memory
+or model knob. Such a change makes a different profile, and its numbers do
+not compare with the best profile.
+
+These items are not overlays, and they are easy to lose in a new profile:
 
 - `-e VLLM_USE_V2_MODEL_RUNNER=1`.
 - The persistent Triton cache: `-e TRITON_CACHE_DIR=/triton-cache` and
@@ -194,8 +208,16 @@ that uses the builder must keep them:
   `model-00034-of-00034.safetensors` in the HF snapshot.
 - `MTP_INDEX_SHARE=1`, `MTP_DISABLE_BLOCK_DROP=1`,
   `MAX_NUM_BATCHED_TOKENS=8192`, `YARN=1` and the KV pin
-  (`--kv-cache-memory-bytes 10737418240`). Put them in `.env`. `start.sh` does
-  not keep `MTP_INDEX_SHARE` from the environment, so the `.env` value wins.
+  (`--kv-cache-memory-bytes 10737418240`). `start.sh` does not keep
+  `MTP_INDEX_SHARE` from the environment, so the `.env` value wins.
+- The host memory budget: `HOST_RESERVE_GIB=32` and `HOST_SLACK_GIB=4`.
+- The fixed chat template:
+  `CHAT_TEMPLATE=files/chat-template/chat_template.jinja`.
+- The watchdog relief: `MEMWATCH_RELIEF=drop_caches`. Without it, the MemFree
+  floor can stop the server while clean page cache is still resident.
+
+A test checks each key and value in this section against the value that
+`source` of the profile gives.
 
 Example `EXTRA_DOCKER_ARGS` for the best set (host paths are examples):
 
@@ -203,11 +225,40 @@ Example `EXTRA_DOCKER_ARGS` for the best set (host paths are examples):
 EXTRA_DOCKER_ARGS="-e VLLM_USE_V2_MODEL_RUNNER=1 -e TRITON_CACHE_DIR=/triton-cache -v /models/usman/triton-cache:/triton-cache -v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache <contents of docker-args.txt> -v <r2 shard>:/root/.cache/huggingface/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/<revision>/model-00034-of-00034.safetensors:ro"
 ```
 
-## Not covered
+## Rejected records
 
-- `files/ours/qsa_cache.py` (fused QSA draft metadata) is a hand-edited vLLM
-  file with no generator. Its A/B was neutral after probe normalization, and
-  it is rejected. It is not an overlay.
+These changes are not overlays. The builder does not build them. Each one is
+kept in this directory so that the work is not lost and a repeat test can use
+it.
+
+### qsa-fused-draft (rejected)
+
+`rejected/qsa_cache.diff` is a unified diff against the pristine
+`models/qwen3_8_flash_next/common/qsa_cache.py` of the pinned image. It holds
+the hand edit that the recipe kept as `files/ours/qsa_cache.py` (sha256
+`0b8079aeab062f3bc71e66571e710b6f757677bf9c7a889368dd4dbc6e29fc42`). That
+file was not in any git history.
+
+The edit lets the multi-step MTP draft refresh the QSA metadata in place.
+When `VLLM_QSA_FUSED_DRAFT=1` is set, the metadata builder sets
+`supports_draft_decode_metadata_update`. The builder then runs the same
+metadata kernel again on its persistent buffers between draft steps.
+
+Evidence: A/B 2 (tag `ab2-fusedqsa`) was neutral after probe normalization.
+So it is rejected.
+
+A repeat test on this image:
+
+```bash
+cid=$(docker create vllm/vllm-openai:qwen38-flash-next /bin/true)
+docker cp "$cid:/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/common/qsa_cache.py" qsa_cache.py
+docker rm "$cid"
+patch qsa_cache.py overlays/qwen38/rejected/qsa_cache.diff
+```
+
+Then mount `qsa_cache.py` read-only on that path and add
+`-e VLLM_QSA_FUSED_DRAFT=1`. A test applies the diff to the pinned image file
+and checks the sha256 above.
 
 ## Recipe hook follow-up
 
@@ -229,7 +280,8 @@ win over `.env`.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s overlays/qwen38/tests -v
+make overlays-test
+python3 -m unittest discover -s overlays/qwen38/tests -v   # the same tests
 ```
 
 The tests use docker without the GPU. They skip when docker or the pinned
@@ -237,7 +289,7 @@ image is not present. They check that:
 
 - every generator applies to the pristine image files (`mtp-fp8-head`: to
   the output of the recipe `patch_mtp_draft_vocab.py`);
-- every generator fails on a missing anchor and on a repeated anchor, for
+- every generator fails on an absent anchor and on a repeated anchor, for
   each of its anchors;
 - the SRC/OUT generators refuse a source that they already patched, and the
   FP8 generator makes no change on a second run;
@@ -251,4 +303,10 @@ image is not present. They check that:
 - no mount target repeats or collides with a recipe mount;
 - `docker-args.txt` is one shell-safe line, and `manifest.json` matches the
   schema above (each `files[].src` is a regular file, and only `capture` has
-  `dirs`).
+  `dirs`);
+- `$QWEN38_CAPTURE_DIR` sets the capture directory, and `--capture-dir` wins
+  over it;
+- `rejected/qsa_cache.diff` applies to the pinned image file with no fuzz and
+  gives the recorded sha256;
+- each key and value in "Items that the profile owns" equals the profile
+  value.

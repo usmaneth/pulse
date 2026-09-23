@@ -17,7 +17,7 @@ Use overlays/qwen38/out/ or a directory outside the repository.
     build.sh --out OUT --set best
 
 A rebuild with the same inputs writes no file. A changed file is replaced
-with os.replace, so a running container keeps the inode that it mounted.
+with os.replace, so a container that runs keeps the inode that it mounted.
 See MANIFEST.md for each overlay, its status and its evidence.
 """
 import argparse
@@ -37,7 +37,7 @@ GENERATORS = os.path.join(HERE, "generators")
 IMAGE_DEFAULT = "vllm/vllm-openai:qwen38-flash-next"
 VLLM_PKG = "/usr/local/lib/python3.12/dist-packages/vllm"
 RECIPE_DEFAULT = os.environ.get("QWEN38_RECIPE_DIR", "/models/usman/qwen38-flash")
-CAPTURE_DIR_DEFAULT = "/models/usman/distill/cap"
+CAPTURE_DIR_DEFAULT = os.environ.get("QWEN38_CAPTURE_DIR", "/models/usman/distill/cap")
 
 MTP_REL = "models/qwen3_8_flash_next/nvidia/mtp.py"
 
@@ -446,7 +446,8 @@ def main(argv=None):
     ap.add_argument("--recipe", default=RECIPE_DEFAULT,
                     help="recipe checkout (default $QWEN38_RECIPE_DIR or %(default)s)")
     ap.add_argument("--capture-dir", default=CAPTURE_DIR_DEFAULT,
-                    help="host directory for capture files (default %(default)s)")
+                    help="host directory for capture files "
+                    "(default $QWEN38_CAPTURE_DIR or %(default)s)")
     ap.add_argument("--src", help="use an extracted vLLM package instead of the image")
     ap.add_argument("--no-recipe-check", action="store_true",
                     help="do not compare with the recipe copy of patch_mtp_fp8_head.py")

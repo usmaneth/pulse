@@ -14,7 +14,7 @@ scaling, soft cap and vocab trimming as before. The FP8 copy is built on the
 first eager call (profile run), never inside CUDA graph capture.
 
 Unlike the draft head, this changes the target's own logits: gate it with
-driftgate.py (top-1 agreement, KL) and the HumanEval gate before shipping.
+driftgate.py (top-1 agreement, KL) and the HumanEval gate before you ship it.
 
     python3 patch_lm_head_fp8.py SRC OUT
 
