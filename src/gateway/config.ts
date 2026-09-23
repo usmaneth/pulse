@@ -36,6 +36,10 @@ export interface GatewayConfig {
   models: ModelConfig[];
   /** Emit backend reasoning text as Responses reasoning items. */
   emitReasoning: boolean;
+  /** Send the text of earlier reasoning items back to the model. */
+  replayReasoning: boolean;
+  /** Append each request and its translated payload to this JSONL file. */
+  traceFile?: string;
   /** Cap for one tool output in characters. 0 disables the cap. */
   maxToolOutputChars: number;
   maxBodyBytes: number;
@@ -66,6 +70,7 @@ export function defaultConfig(): GatewayConfig {
       endpoints: [{ name: 'spark1', baseUrl: DEFAULT_QWEN_URL }],
     }],
     emitReasoning: true,
+    replayReasoning: true,
     maxToolOutputChars: 12_000,
     maxBodyBytes: 64 * 1024 * 1024,
     // A cold 500k-token prefill takes minutes. vLLM can send the headers
@@ -168,6 +173,8 @@ export function loadConfig(
   }
 
   if (env.PULSE_GATEWAY_EMIT_REASONING) config.emitReasoning = env.PULSE_GATEWAY_EMIT_REASONING !== '0';
+  if (env.PULSE_GATEWAY_REPLAY_REASONING) config.replayReasoning = env.PULSE_GATEWAY_REPLAY_REASONING !== '0';
+  if (env.PULSE_GATEWAY_TRACE_FILE) config.traceFile = env.PULSE_GATEWAY_TRACE_FILE;
   config.maxToolOutputChars = num(env, 'PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS') ?? config.maxToolOutputChars;
   config.maxBodyBytes = num(env, 'PULSE_GATEWAY_MAX_BODY_BYTES') ?? config.maxBodyBytes;
   config.headersTimeoutMs = num(env, 'PULSE_GATEWAY_HEADERS_TIMEOUT_MS') ?? config.headersTimeoutMs;

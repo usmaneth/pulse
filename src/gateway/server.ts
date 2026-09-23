@@ -10,7 +10,7 @@
 
 import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import type { GatewayConfig } from './config.js';
 import { Endpoint, HealthChecker, ModelRoute, RetryableBackendError, postChat, closeAgents } from './backends.js';
 import type { BackendStream } from './backends.js';
@@ -276,11 +276,21 @@ export class Gateway {
         profile: route.config.profile,
         upstreamModel: route.upstreamModel,
         maxToolOutputChars: this.config.maxToolOutputChars,
+        replayReasoning: this.config.replayReasoning,
       });
     } catch (error) {
       m.clientErrors++;
       if (error instanceof RequestError) throw new HttpError(400, error.message);
       throw error;
+    }
+
+    if (this.config.traceFile) {
+      // For debugging only. The file holds full prompts, so only the owner can read it.
+      try {
+        appendFileSync(this.config.traceFile, JSON.stringify({ request_id: requestId, request, payload: chat.payload }) + '\n', { mode: 0o600 });
+      } catch (error) {
+        log('warn', 'could not write the trace file', { error: String(error) });
+      }
     }
 
     const streaming = request.stream === true;

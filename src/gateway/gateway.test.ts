@@ -4,6 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { readFileSync, rmSync, statSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { Gateway } from './server.js';
 import { defaultConfig, loadConfig, parseEndpointList } from './config.js';
@@ -116,6 +117,72 @@ test('non-streaming request returns one Responses object with a tool call', asyn
     assert.equal(body.status, 'completed');
     assert.equal(body.output[0].type, 'custom_tool_call');
     assert.equal(body.output[0].input, '*** Begin Patch');
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('tool call arguments reach the client before the backend finishes', async () => {
+  let finish!: () => void;
+  const backend = await mockBackend((_b, _q, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'shell_command', arguments: '{"command":' } }] }, finish_reason: null }] })}\n\n`);
+    finish = () => {
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    };
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }]);
+  try {
+    const tools = [{ type: 'function', name: 'shell_command', parameters: { type: 'object', properties: {} } }];
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'ls', stream: true, tools });
+    const seen: Obj[] = [];
+    for await (const data of sseData(res.body!)) {
+      const event = JSON.parse(data);
+      seen.push(event);
+      // The backend holds the rest of the call until the first delta arrives here.
+      if (event.type === 'response.function_call_arguments.delta' && event.delta === '{"command":') finish();
+    }
+    assert.deepEqual(seen.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => e.delta), ['{"command":', '"ls"}']);
+    const final = seen.at(-1)!;
+    assert.equal(final.type, 'response.completed');
+    assert.equal(final.response.output[0].arguments, '{"command":"ls"}');
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('reasoning replay can be turned off, and the trace file gets the payload', async () => {
+  const backend = await mockBackend((_b, _q, res) => sse(res, reply('ok')));
+  const trace = `${process.env.TMPDIR ?? '/tmp'}/pulse-gateway-trace-${process.pid}.jsonl`;
+  const input = [
+    { type: 'message', role: 'user', content: 'q' },
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'plan' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'a' }] },
+    { type: 'message', role: 'user', content: 'q2' },
+  ];
+  for (const replayReasoning of [true, false]) {
+    const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { replayReasoning, traceFile: trace });
+    try {
+      await events(await post(base, { model: 'qwen3.8-flash-next', input, stream: true }));
+    } finally { await gateway.stop(); }
+  }
+  try {
+    assert.equal(backend.requests[0].messages[1].reasoning_content, 'plan');
+    assert.equal(backend.requests[1].messages[1].reasoning_content, undefined);
+    const lines = readFileSync(trace, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].payload.messages[1].reasoning_content, 'plan');
+    assert.equal(lines[0].request.input.length, 4);
+    assert.equal(statSync(trace).mode & 0o777, 0o600);
+  } finally { rmSync(trace, { force: true }); await backend.close(); }
+});
+
+test('unsupported input returns 400 before any backend call', async () => {
+  const backend = await mockBackend((_b, _q, res) => sse(res, reply('no')));
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }]);
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', store: true, stream: true });
+    assert.equal(res.status, 400);
+    assert.match((await res.json() as Obj).error.message, /store=true/);
+    assert.equal(backend.requests.length, 0);
   } finally { await gateway.stop(); await backend.close(); }
 });
 
