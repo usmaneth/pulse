@@ -10,7 +10,9 @@
   "scripts": {
     "build": "tsc && make",
     "serve": "node --env-file=.env.local dist/server/index.js",
+    "gateway": "node dist/gateway/index.js",
     "test:jev": "node --env-file=.env.local dist/jev/test.js",
+    "test:gateway": "tsc && node --test dist/gateway/*.test.js",
     "bench": "python3 bench/sweep.py"
   },
   "dependencies": {
