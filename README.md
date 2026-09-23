@@ -40,18 +40,19 @@ Start a second terminal in the project that you want to edit:
 /home/usman/pulse/scripts/codex-bonsai
 ```
 
-## Qwen3.8-Flash-Next on vLLM
-
-Codex CLI on Qwen3.8-Flash-Next (vLLM) goes through the Pulse gateway, a
-Responses API endpoint with failover across Sparks. See
-[docs/QWEN38.md](docs/QWEN38.md).
-
 The private service uses ports 18085 and 18086.
 The launcher preserves project instructions, permissions, skills, and configured MCP servers.
 The default uses the validated corrected v2 draft at fixed K4.
 Use `--legacy-v1` for the original draft control.
 The guide describes the optional historical depth policy and its backend requirements.
 The guide provides a baseline without speculative decode.
+
+
+## Qwen3.8-Flash-Next on vLLM
+
+Codex CLI on Qwen3.8-Flash-Next (vLLM) goes through the Pulse gateway, a
+Responses API endpoint with failover across Sparks. See
+[docs/QWEN38.md](docs/QWEN38.md).
 
 ## Validation and measurement
 
