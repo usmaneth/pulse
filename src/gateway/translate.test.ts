@@ -134,7 +134,8 @@ test('unsupported input gets a clear RequestError instead of a silent drop', () 
     [{ input: 'x', conversation: 'c' }, /conversation is not supported/],
     [{ input: 'x', background: true }, /background is not supported/],
     [{ input: 'x', store: true }, /store=true is not supported/],
-    [{ input: 'x', text: { format: { type: 'json_schema', schema: {} } } }, /text.format json_schema/],
+    [{ input: 'x', text: { format: { type: 'xml' } } }, /text.format xml is not supported/],
+    [{ input: 'x', text: { format: { type: 'json_schema', name: 'n' } } }, /json_schema needs a schema object/],
     [{ input: [{ type: 'web_search_call', id: 'w' }] }, /unsupported input item type: web_search_call/],
     [{ input: [{ type: 'message', role: 'tool', content: 'x' }] }, /unsupported message role: tool/],
   ];
@@ -162,6 +163,32 @@ test('history: only the plugin block leaves the Codex context message', () => {
   // A block inside a text part goes, and the text around it stays.
   const inline = responsesToChat({ model: 'm', input: [{ type: 'message', role: 'user', content: `a\n${plugins}\nb` }] }, qwen);
   assert.deepEqual(inline.payload.messages, [{ role: 'user', content: 'a\nb' }]);
+});
+
+test('text.format: json_schema and json_object become an instruction at the end of the system prompt', () => {
+  const schema = { type: 'object', properties: { answer: { type: 'integer' } }, required: ['answer'], additionalProperties: false };
+  const input = [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'dev' }] },
+    { type: 'message', role: 'user', content: 'what is 2+3?' },
+  ];
+  // The shape that `codex exec --output-schema` sends.
+  const text = { verbosity: 'low', format: { type: 'json_schema', name: 'codex_output_schema', strict: true, schema } };
+  const { payload } = responsesToChat({ model: 'm', instructions: 'base', tools: CODEX_TOOLS, input, text }, qwen);
+  const system = payload.messages[0];
+  assert.equal(system.role, 'system');
+  assert(system.content.startsWith('base\n\ndev\n\n'), system.content);
+  assert(system.content.endsWith(JSON.stringify(schema)), system.content);
+  assert.match(system.content, /final answer must be one JSON object that matches this JSON schema/);
+  // The tool loop must keep working, so the backend gets no response_format.
+  assert.equal(payload.response_format, undefined);
+  assert.equal(payload.tools.length, 3);
+  assert.deepEqual(payload.messages.slice(1), [{ role: 'user', content: 'what is 2+3?' }]);
+  const plain = responsesToChat({ model: 'm', input: 'x', text: { format: { type: 'json_object' } } }, qwen).payload;
+  assert.equal(plain.messages[0].role, 'system');
+  assert.match(plain.messages[0].content, /final answer must be one JSON object/);
+  assert.deepEqual(plain.messages[1], { role: 'user', content: 'x' });
+  const none = responsesToChat({ model: 'm', input: 'x', text: { format: { type: 'text' } } }, qwen).payload;
+  assert.deepEqual(none.messages, [{ role: 'user', content: 'x' }]);
 });
 
 test('grammar hint: only custom tools with a grammar format get one', () => {

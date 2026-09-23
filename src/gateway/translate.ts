@@ -213,6 +213,31 @@ export function applyReasoning(payload: Obj, profile: ProfileName, effort: unkno
   payload.reasoning_effort = value;
 }
 
+/**
+ * The system prompt text for a structured `text.format` (`codex exec
+ * --output-schema` sends `json_schema`). vLLM can force a format with
+ * `response_format`, but the constraint applies to every answer. Codex sends
+ * the format on each request of the task, so tool calls would become
+ * impossible. The model gets the schema as an instruction instead. The
+ * gateway does not check the answer against the schema.
+ */
+export function outputFormatNote(format: unknown): string {
+  if (format == null) return '';
+  if (typeof format !== 'object' || Array.isArray(format)) throw new RequestError('text.format must be an object');
+  const f = format as Obj;
+  if (f.type === 'text') return '';
+  const bare = 'The final answer must be one JSON object, with no other text and no code fence.';
+  if (f.type === 'json_object') return bare;
+  if (f.type === 'json_schema') {
+    if (!f.schema || typeof f.schema !== 'object' || Array.isArray(f.schema)) {
+      throw new RequestError('text.format json_schema needs a schema object');
+    }
+    return 'The final answer must be one JSON object that matches this JSON schema, with no other text and no code fence:\n' +
+      JSON.stringify(f.schema);
+  }
+  throw new RequestError(`text.format ${String(f.type)} is not supported; use text, json_schema or json_object`);
+}
+
 /** Top-level request fields that need server-side state. */
 const STATEFUL_KEYS = ['previous_response_id', 'conversation', 'background'];
 
@@ -266,10 +291,7 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
     if (body[key]) throw new RequestError(`${key} is not supported; send the full input history`);
   }
   if (body.store === true) throw new RequestError('store=true is not supported; the gateway keeps no state, so set store=false');
-  const format = body.text?.format;
-  if (format && typeof format === 'object' && format.type !== 'text') {
-    throw new RequestError(`text.format ${String(format.type)} is not supported; only text output is available`);
-  }
+  const formatNote = outputFormatNote(body.text?.format);
   const replayReasoning = options.replayReasoning ?? true;
   const messages: Obj[] = [];
   if (typeof body.instructions === 'string' && body.instructions) {
@@ -324,9 +346,16 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
     throw new RequestError('input must be a string or an array');
   }
 
+  const arranged = arrangeSystem(mergeAssistantTurns(messages), options.profile);
+  if (formatNote) {
+    // At the end of the leading system message, the note does not change the
+    // prompt prefix that a session without a format shares.
+    if (arranged[0]?.role === 'system') arranged[0] = { ...arranged[0], content: `${arranged[0].content}\n\n${formatNote}` };
+    else arranged.unshift({ role: 'system', content: formatNote });
+  }
   const payload: Obj = {
     model: options.upstreamModel,
-    messages: arrangeSystem(mergeAssistantTurns(messages), options.profile),
+    messages: arranged,
     stream: true,
     stream_options: { include_usage: true },
   };

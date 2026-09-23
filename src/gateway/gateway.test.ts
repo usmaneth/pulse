@@ -186,6 +186,23 @@ test('unsupported input returns 400 before any backend call', async () => {
   } finally { await gateway.stop(); await backend.close(); }
 });
 
+test('codex exec --output-schema: a json_schema text.format reaches the backend as an instruction', async () => {
+  const backend = await mockBackend((_b, _q, res) => sse(res, reply('{"answer": 5}')));
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }]);
+  try {
+    const schema = { type: 'object', properties: { answer: { type: 'integer' } }, required: ['answer'] };
+    const res = await post(base, {
+      model: 'qwen3.8-flash-next', input: 'What is 2+3?', stream: true, store: false,
+      text: { verbosity: 'low', format: { type: 'json_schema', name: 'codex_output_schema', strict: true, schema } },
+    });
+    assert.equal(res.status, 200);
+    assert.equal((await events(res)).at(-1)!.type, 'response.completed');
+    assert.equal(backend.requests[0].messages[0].role, 'system');
+    assert(backend.requests[0].messages[0].content.endsWith(JSON.stringify(schema)));
+    assert.equal(backend.requests[0].response_format, undefined);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
 test('fails over from a dead endpoint and from a 503 endpoint, in order', async () => {
   const busy = await mockBackend((_b, _q, res) => { res.writeHead(503); res.end('loading'); });
   const good = await mockBackend((_b, _q, res) => sse(res, reply('from spark3')));

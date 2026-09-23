@@ -202,12 +202,24 @@ backend, for:
 - `previous_response_id`, `conversation` or `background` (the gateway keeps
   no state),
 - `store: true`,
-- `text.format` other than `text` (structured output),
+- `text.format` other than `text`, `json_schema` or `json_object`, or a
+  `json_schema` format without a `schema` object,
 - an input item type other than `message`, `reasoning`, `function_call`,
   `function_call_output`, `custom_tool_call` and `custom_tool_call_output`,
 - a message role other than `system`, `developer`, `user` and `assistant`.
 
 Tool types that the backend cannot run are dropped, not refused (see Tools).
+
+### Structured output
+
+`codex exec --output-schema <file>` sends `text.format` of type
+`json_schema`. The gateway adds the schema to the end of the system message
+as an instruction: the final answer must be one JSON object that matches the
+schema. `json_object` gets the same instruction without a schema. The gateway
+does not send `response_format` to vLLM. That constraint applies to every
+answer, and Codex sends the format on each request of the task, so the model
+could not call tools. The gateway does not check the answer against the
+schema.
 
 ### Stream events
 
@@ -358,5 +370,5 @@ systemd sends SIGKILL.
   request is the durable record: journald keeps it, and `jq` can add up tokens,
   statuses and latency for any period. A metrics file would repeat that
   record, and the latency windows cannot merge across restarts.
-- Structured output (`text.format` of type `json_schema`) is refused. vLLM
-  can do it with `response_format`, but no Codex flow on this model needs it.
+- Structured output is an instruction only (see Structured output). The
+  answer can differ from the schema.
