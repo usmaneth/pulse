@@ -302,6 +302,10 @@ pulse bench --levels 1,4,16   # reproduce the concurrency table
 pulse profile                 # print the tuning profile with provenance
 ```
 
+Codex CLI on Qwen3.8-Flash-Next (vLLM) goes through the Pulse gateway, a
+Responses API endpoint with failover across Sparks. See
+[docs/QWEN38.md](docs/QWEN38.md).
+
 ## What would actually move the number
 
 **The drafter's forward pass is the cost, and it scales with its weight volume.**

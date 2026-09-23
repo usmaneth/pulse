@@ -1,0 +1,40 @@
+# Pulse gateway for Qwen3.8-Flash-Next (systemd user unit).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user ~/.config/pulse
+#   cp deploy/systemd/pulse-qwen38.service ~/.config/systemd/user/
+#   cp deploy/systemd/pulse-qwen38.env.example ~/.config/pulse/qwen38.env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pulse-qwen38.service
+#
+# Logs:   journalctl --user -u pulse-qwen38 -f
+# Status: curl -s http://127.0.0.1:8800/health | jq
+#
+# The unit runs the build in ~/pulse. Run `npm run build` there after a pull.
+# systemd does not read the shell profile, so the node path is absolute.
+# Change it when the Node version under nvm changes.
+
+[Unit]
+Description=Pulse gateway (Responses API for Codex) for Qwen3.8-Flash-Next
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pulse
+Environment=NODE_ENV=production
+Environment=PULSE_GATEWAY_CONFIG=%h/pulse/config/qwen38-gateway.json
+EnvironmentFile=-%h/.config/pulse/qwen38.env
+ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/pulse/dist/gateway/index.js
+# SIGTERM starts a graceful drain. The gateway waits up to
+# PULSE_GATEWAY_SHUTDOWN_GRACE_MS (default 30 s) for in-flight requests.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=3
+# The gateway holds no model weights. A small cap protects the GPU host.
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

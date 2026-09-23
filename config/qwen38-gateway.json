@@ -1,0 +1,24 @@
+{
+  "host": "127.0.0.1",
+  "port": 8800,
+  "models": [
+    {
+      "id": "qwen3.8-flash-next",
+      "upstreamModel": "qwen3.8-flash-next",
+      "profile": "qwen38",
+      "endpoints": [
+        { "name": "spark1", "baseUrl": "http://127.0.0.1:8888/v1" },
+        { "name": "spark2", "baseUrl": "http://10.99.0.2:8888/v1", "enabled": false }
+      ]
+    }
+  ],
+  "emitReasoning": true,
+  "maxToolOutputChars": 12000,
+  "headersTimeoutMs": 900000,
+  "idleTimeoutMs": 900000,
+  "requestTimeoutMs": 3600000,
+  "connectTimeoutMs": 3000,
+  "healthIntervalMs": 10000,
+  "healthTimeoutMs": 3000,
+  "shutdownGraceMs": 30000
+}
