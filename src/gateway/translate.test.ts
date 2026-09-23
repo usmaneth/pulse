@@ -191,6 +191,25 @@ test('text.format: json_schema and json_object become an instruction at the end 
   assert.deepEqual(none.messages, [{ role: 'user', content: 'x' }]);
 });
 
+test('history: call arguments that are not a JSON object go back as {}', () => {
+  // vLLM parses the arguments of each earlier call to render the template. A
+  // call cut short in the stream made every later request of the session fail
+  // with 400 "Unterminated string".
+  const input = [
+    { type: 'message', role: 'user', content: 'go' },
+    { type: 'function_call', call_id: 'a', name: 'shell_command', arguments: '{"command": "ls -la' },
+    { type: 'function_call_output', call_id: 'a', output: 'failed to parse function arguments: EOF while parsing a string' },
+    { type: 'function_call', call_id: 'b', name: 'shell_command', arguments: '["ls"]' },
+    { type: 'function_call_output', call_id: 'b', output: 'x' },
+    { type: 'function_call', call_id: 'c', name: 'shell_command', arguments: '{"command": "pwd"}' },
+    { type: 'function_call_output', call_id: 'c', output: '/w' },
+  ];
+  const { payload } = responsesToChat({ model: 'm', input }, qwen);
+  const args = payload.messages.filter((m: Obj) => m.tool_calls).flatMap((m: Obj) => m.tool_calls.map((c: Obj) => c.function.arguments));
+  // A valid object keeps its exact bytes, so the prompt prefix does not change.
+  assert.deepEqual(args, ['{}', '{}', '{"command": "pwd"}']);
+});
+
 test('grammar hint: only custom tools with a grammar format get one', () => {
   assert.equal(grammarHint(undefined), '');
   assert.equal(grammarHint({ type: 'text' }), '');

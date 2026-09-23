@@ -193,6 +193,13 @@ deltas and then:
   `<environment_context>` (cwd, shell, date, workspace roots). Only the block
   goes. The rest of the message stays, because without the cwd the model
   searches the whole disk for the files of the task.
+- A function call whose arguments are not a JSON object (for example
+  `{"cmd": "ls` from a stream that stopped early) goes back with `{}` as its
+  arguments. vLLM parses the arguments of each earlier call to render the
+  template and refuses the request when they are not an object, so one such
+  call would fail every later request of the session. Codex already gave the
+  model the parse error as the output of the call. Valid arguments keep their
+  exact text.
 
 ### Unsupported input
 

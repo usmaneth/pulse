@@ -238,6 +238,17 @@ export function outputFormatNote(format: unknown): string {
   throw new RequestError(`text.format ${String(f.type)} is not supported; use text, json_schema or json_object`);
 }
 
+/** True when the text is a JSON object, which is what a function call needs as arguments. */
+export function isJsonObjectText(text: unknown): boolean {
+  if (typeof text !== 'string') return false;
+  try {
+    const value = JSON.parse(text);
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
 /** Top-level request fields that need server-side state. */
 const STATEFUL_KEYS = ['previous_response_id', 'conversation', 'background'];
 
@@ -327,8 +338,15 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
         const text = replayReasoning ? reasoningText(item) : '';
         if (text) messages.push({ role: 'assistant', content: null, reasoning_content: text });
       } else if (CALL_TYPES.has(type)) {
+        // vLLM and llama.cpp parse the arguments of each earlier call to render
+        // the template, and refuse the request when they are not a JSON
+        // object. One call that the stream cut short (for example
+        // '{"cmd": "ls') would then fail every later request of the session.
+        // Codex already gave the model the parse error as the call output, so
+        // the call goes back with empty arguments. A valid object keeps its
+        // bytes, so the prompt prefix does not change.
         const args = typeof item.arguments === 'string'
-          ? item.arguments
+          ? (isJsonObjectText(item.arguments) ? item.arguments : '{}')
           : JSON.stringify({ input: typeof item.input === 'string' ? item.input : '' });
         const call = { id: item.call_id ?? item.id, type: 'function', function: { name: flatName(item), arguments: args } };
         messages.push({ role: 'assistant', content: null, tool_calls: [call] });
