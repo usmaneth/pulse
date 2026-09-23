@@ -669,4 +669,3 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   const args = process.argv.slice(2);
   main(args[0] === 'model' ? args.slice(1) : args).then((code) => process.exit(code));
 }
-

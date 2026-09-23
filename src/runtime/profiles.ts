@@ -426,4 +426,3 @@ export function diffMaps(current: Record<string, string>, next: Record<string, s
   }
   return out;
 }
-
