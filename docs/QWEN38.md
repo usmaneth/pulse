@@ -139,10 +139,21 @@ The chat template on the server maps the effort aliases to its own levels.
 | Codex tool | backend tool |
 |---|---|
 | `function` | the same function |
-| `custom` (freeform, for example `apply_patch`) | a function with one string argument `input` |
+| `custom` (freeform, for example `apply_patch`) | a function with one string argument `input`; a `grammar` format goes into the description |
 | `namespace` (MCP servers) | one function per nested tool, named `<namespace>__<name>` |
-| `tool_search` | a function named `tool_search` |
+| `tool_search` | dropped; Codex accepts a `tool_search` call only in its own item shape |
 | `web_search`, `local_shell`, other hosted tools | dropped |
+
+Codex sends the Lark grammar of `apply_patch` in the tool `format`. A
+function tool cannot carry a grammar, so the gateway appends it to the
+description (`The input string must follow this lark grammar: ...`).
+
+`tool_choice` maps as follows: `auto`, `none` and `required` pass through. A
+named `function` or `custom` tool becomes `{"type": "function", "function":
+{"name": ...}}`, with `<namespace>__<name>` for a namespaced tool. A name that
+is not in `tools` gives HTTP 400. `parallel_tool_calls` passes through. Both
+go to vLLM only when the request has tools, because vLLM rejects
+`tool_choice` without tools.
 
 vLLM runs with `--enable-auto-tool-choice --tool-call-parser qwen3_xml`. The
 parser returns tool calls as OpenAI `tool_calls` deltas. The gateway joins the
@@ -156,16 +167,43 @@ deltas and then:
 
 ### History
 
-- `instructions` and `developer` or `system` messages merge into one system
-  message at the start.
-- Consecutive tool calls merge into one assistant message with several
-  `tool_calls`.
+- `instructions` and the leading `developer` or `system` messages merge into
+  one system message at the start. A later `developer` message (Codex sends
+  one when a setting changes during a session) stays in its position. The
+  template renders it in place. If it moved to the start, the prompt prefix
+  would change and the vLLM prefix cache would miss for the full history.
+- The items of one model turn (reasoning, text, tool calls) merge into one
+  assistant message, in that order. That is the order in which the model
+  wrote them. Reasoning after text or tool calls starts a new turn, and so
+  does text after tool calls.
+- The summary text of a `reasoning` item goes back to the model as
+  `reasoning_content`. The Qwen3.8 template renders each assistant turn as
+  `<think>reasoning</think>content` (`preserve_thinking` is on by default), so
+  the history is the text that the model wrote. Without the replay, each
+  earlier turn has an empty think block. Set `PULSE_GATEWAY_REPLAY_REASONING=0`
+  to turn the replay off.
 - Tool calls without an output, and outputs without a call, are dropped. An
   interrupted turn leaves such items.
 - A tool output longer than 12,000 characters keeps its first and last 6,000
   characters (`maxToolOutputChars`, 0 disables the cap).
-- `reasoning` items, image parts and the `<recommended_plugins>` block are
+- Image parts, reasoning items without text (for example encrypted
+  reasoning from another provider) and the `<recommended_plugins>` block are
   dropped.
+
+### Unsupported input
+
+The gateway returns HTTP 400 with a clear message, and does not call the
+backend, for:
+
+- `previous_response_id`, `conversation` or `background` (the gateway keeps
+  no state),
+- `store: true`,
+- `text.format` other than `text` (structured output),
+- an input item type other than `message`, `reasoning`, `function_call`,
+  `function_call_output`, `custom_tool_call` and `custom_tool_call_output`,
+- a message role other than `system`, `developer`, `user` and `assistant`.
+
+Tool types that the backend cannot run are dropped, not refused (see Tools).
 
 ### Stream events
 
@@ -180,15 +218,27 @@ response.in_progress
                    reasoning_summary_part.done, output_item.done
   message item:    output_item.added, content_part.added, output_text.delta...,
                    output_text.done, content_part.done, output_item.done
-  each tool call:  output_item.added, function_call_arguments.delta/.done
-                   (or custom_tool_call_input.delta/.done), output_item.done
+  function calls:  output_item.added, function_call_arguments.delta...
+                   (for each call, when it arrives)
+  -- the backend sends the finish reason --
+  function calls:  function_call_arguments.done, output_item.done
+  custom calls:    output_item.added, custom_tool_call_input.delta,
+                   custom_tool_call_input.done, output_item.done
 response.completed | response.incomplete | response.failed
 ```
 
-Text and reasoning go out as they arrive. Tool calls go out complete after the
-backend finishes. Every event has a `sequence_number`. `finish_reason: length`
-gives `response.incomplete` with `incomplete_details.reason = max_output_tokens`.
-A stream that ends without a finish reason gives `response.failed`, never
+Text, reasoning and function-call arguments go out as they arrive. The
+message item closes when the first tool call starts. The `done` events of the
+function calls wait for the finish reason, because Codex runs a call when its
+`output_item.done` arrives. Custom tool calls go out complete after the
+finish reason, because their arguments are JSON that the gateway unwraps as a
+whole.
+
+Every event has a `sequence_number`. `finish_reason: length` gives
+`response.incomplete` with `incomplete_details.reason = max_output_tokens`, and
+no tool call of that turn gets a `done` event or stays in the final output.
+Codex retries an incomplete turn, so a call that ran would run again. A stream
+that ends without a finish reason gives `response.failed`, never
 `response.completed`.
 
 The reasoning text comes from the vLLM `qwen3` reasoning parser
@@ -260,6 +310,8 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_API_KEY` | none | bearer key for `/v1/*` |
 | `PULSE_GATEWAY_MODEL_CATALOG` | none | Codex catalog file; `/v1/models` returns its matching entries |
 | `PULSE_GATEWAY_EMIT_REASONING` | `1` | `0` hides reasoning items |
+| `PULSE_GATEWAY_REPLAY_REASONING` | `1` | `0` does not send earlier reasoning back to the model |
+| `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload to this JSONL file (mode 0600; for debugging, it holds full prompts) |
 | `PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS` | `12000` | tool output cap, 0 disables it |
 | `PULSE_GATEWAY_MAX_BODY_BYTES` | 64 MiB | request body limit |
 | `PULSE_GATEWAY_CONNECT_TIMEOUT_MS` | `3000` | connect limit per endpoint |
@@ -298,5 +350,9 @@ systemd sends SIGKILL.
   `store = false`.
 - Images are dropped. The model is text only.
 - Hosted tools (`web_search`, `local_shell`) are dropped, as in the router.
-- Metrics are in memory and reset on restart.
-- Reasoning from earlier turns is not sent back to the template.
+- Metrics are in memory and reset on restart. The `response` log line of each
+  request is the durable record: journald keeps it, and `jq` can add up tokens,
+  statuses and latency for any period. A metrics file would repeat that
+  record, and the latency windows cannot merge across restarts.
+- Structured output (`text.format` of type `json_schema`) is refused. vLLM
+  can do it with `response_format`, but no Codex flow on this model needs it.
