@@ -70,6 +70,19 @@ export function messageText(content: unknown): string {
     .join('');
 }
 
+const PLUGIN_BLOCK = /<recommended_plugins>[\s\S]*?<\/recommended_plugins>\n*/g;
+
+/**
+ * Remove the plugin advertisement block of Codex from a message text. The
+ * block only adds prompt tokens for a model that cannot use the plugins.
+ * Codex sends it as one part of the user message that also holds the AGENTS.md
+ * instructions and the environment context (cwd, shell, date). Those parts
+ * stay, because without the cwd the model searches the whole disk for files.
+ */
+export function dropPluginBlock(text: string): string {
+  return text.replace(PLUGIN_BLOCK, '');
+}
+
 /**
  * Convert a tool output to plain text and cap its length. The cap keeps the
  * head and the tail, because the error at the end of a build log matters as
@@ -277,10 +290,11 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
         if (!['system', 'user', 'assistant'].includes(role)) {
           throw new RequestError(`unsupported message role: ${String(item.role)}`);
         }
-        const text = messageText(item.content);
-        // Codex adds a plugin advertisement block. The router drops it; it
-        // only adds prompt tokens for a model that cannot use the plugins.
-        if (text.includes('<recommended_plugins>')) continue;
+        let text = messageText(item.content);
+        if (text.includes('<recommended_plugins>')) {
+          text = dropPluginBlock(text);
+          if (!text.trim()) continue;
+        }
         messages.push({ role, content: text });
       } else if (type === 'reasoning') {
         // The Qwen3.8 template renders each assistant turn as

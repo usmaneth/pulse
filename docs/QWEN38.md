@@ -186,9 +186,13 @@ deltas and then:
   interrupted turn leaves such items.
 - A tool output longer than 12,000 characters keeps its first and last 6,000
   characters (`maxToolOutputChars`, 0 disables the cap).
-- Image parts, reasoning items without text (for example encrypted
-  reasoning from another provider) and the `<recommended_plugins>` block are
-  dropped.
+- Image parts and reasoning items without text (for example encrypted
+  reasoning from another provider) are dropped.
+- The `<recommended_plugins>` block is dropped. Codex sends it in one user
+  message together with the AGENTS.md instructions and the
+  `<environment_context>` (cwd, shell, date, workspace roots). Only the block
+  goes. The rest of the message stays, because without the cwd the model
+  searches the whole disk for the files of the task.
 
 ### Unsupported input
 

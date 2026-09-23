@@ -143,6 +143,27 @@ test('unsupported input gets a clear RequestError instead of a silent drop', () 
   responsesToChat({ input: 'x', store: false, text: { format: { type: 'text' }, verbosity: 'low' } }, qwen);
 });
 
+test('history: only the plugin block leaves the Codex context message', () => {
+  // Codex 0.156 sends the plugin list, AGENTS.md and the environment context
+  // as three parts of one user message.
+  const plugins = '<recommended_plugins>\n- Box (box@openai-curated-remote)\n</recommended_plugins>';
+  const agents = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\nUse short sentences.\n</INSTRUCTIONS>';
+  const env = '<environment_context>\n  <cwd>/work/app</cwd>\n  <shell>zsh</shell>\n</environment_context>';
+  const { payload } = responsesToChat({ model: 'm', input: [
+    { type: 'message', role: 'user', content: [
+      { type: 'input_text', text: plugins }, { type: 'input_text', text: agents }, { type: 'input_text', text: env },
+    ] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fix the bug' }] },
+  ] }, qwen);
+  assert.deepEqual(payload.messages, [
+    { role: 'user', content: agents + env },
+    { role: 'user', content: 'fix the bug' },
+  ]);
+  // A block inside a text part goes, and the text around it stays.
+  const inline = responsesToChat({ model: 'm', input: [{ type: 'message', role: 'user', content: `a\n${plugins}\nb` }] }, qwen);
+  assert.deepEqual(inline.payload.messages, [{ role: 'user', content: 'a\nb' }]);
+});
+
 test('grammar hint: only custom tools with a grammar format get one', () => {
   assert.equal(grammarHint(undefined), '');
   assert.equal(grammarHint({ type: 'text' }), '');
