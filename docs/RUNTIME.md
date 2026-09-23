@@ -130,6 +130,13 @@ The shipped profiles:
 | `capture` | MTP hidden-state capture. Each request needs a unique `cache_salt` and `X-Request-Id: cap-<row>`. |
 | `tp2` | Draft only. Two nodes with tensor parallel size 2. It is render-only (see below). |
 
+`best`, `datagen` and `capture` set `MEMWATCH_RELIEF=drop_caches`. Before the
+MemFree floor of the recipe watchdog stops the container, the watchdog drops the
+clean page cache one time with `sudo -n` and samples again. The recipe added
+this setting on 2026-09-23, after the floor stopped spark1 with 5.7 GiB of page
+cache resident. The relief needs `sudo -n` on the node. If `sudo -n` fails, the
+watchdog logs the failure one time and then works as with the relief off.
+
 ### The rendered .env
 
 Each value is written as `KEY="value"`. A header comes first:

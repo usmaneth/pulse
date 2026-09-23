@@ -109,6 +109,7 @@ const SPARK1_BEST: Record<string, string> = {
   MAX_MODEL_LEN: '262144',
   MAX_NUM_BATCHED_TOKENS: '8192',
   MAX_NUM_SEQS: '4',
+  MEMWATCH_RELIEF: 'drop_caches',
   MTP_DISABLE_BLOCK_DROP: '1',
   MTP_DRAFT_VOCAB: 'files/draft_vocab_en_code_47k.txt',
   MTP_INDEX_SHARE: '1',
@@ -131,7 +132,8 @@ const SPARK2_DATAGEN: Record<string, string> = {
   YARN: '0',
 };
 
-// The effective key map of /models/usman/qwen38-flash/.env.capture on spark1.
+// The effective key map of /models/usman/qwen38-flash/.env.capture on spark1, plus
+// MEMWATCH_RELIEF: the recipe added the watchdog relief after that file was written.
 const SPARK1_CAPTURE: Record<string, string> = {
   ...Object.fromEntries(Object.entries(SPARK1_BEST).filter(([k]) => k !== 'MTP_DISABLE_BLOCK_DROP')),
   EXTRA_DOCKER_ARGS: [
@@ -598,7 +600,7 @@ test('cli: --dry-run --preflight runs exactly the read-only preflight script', a
   assert.equal(rec.calls.length, 1);
   assert.match(rec.calls[0].script, /@pulse preflight-fails/);
   const text = c.out.join('\n');
-  assert.match(text, /change none: the effective key map of the current \.env equals the render \(25 keys\)/);
+  assert.match(text, /change none: the effective key map of the current \.env equals the render \(26 keys\)/);
   assert.match(text, /8 open client connection/);
 
   const failing = new RecordingRunner(() => ({ code: 1, stdout: '@pulse fail mount-source /models/usman/distill/shard34_r2.safetensors is missing (profile:best)\n@pulse preflight-fails 1\n' }));
