@@ -3,10 +3,12 @@
 // and curl commands. No ssh, no GPU and no model server is needed.
 // Run: npm run test:runtime
 
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { Writable } from 'node:stream';
@@ -17,7 +19,7 @@ import {
   ProfileError, diffMaps, loadNodes, loadProfile, listProfiles, readOverlay, renderEnv,
 } from './profiles.js';
 import type { NodeConfig, NodesFile, Rendered } from './profiles.js';
-import { planDown, planUp, refusals, shq } from './plan.js';
+import { keyedCurl, planDown, planUp, refusals, shq, writeEnvScript } from './plan.js';
 import { ExecRunner, RecordingRunner, SSH_OPTIONS, commandFor, wrapScript } from './runner.js';
 import { parseContainerState, parseEnvHeader, parseKvLine, parseModels, parseSmoke, parseStatus } from './status.js';
 import { buildFragment, writeFragment, writeNodeState } from './fragment.js';
@@ -30,9 +32,17 @@ const NODES_FILE = path.join(ROOT, 'runtime', 'nodes.json');
 const PROFILES = path.join(ROOT, 'runtime', 'qwen38', 'profiles');
 const NOW = new Date('2026-09-23T10:15:00Z');
 
+const TMP_DIRS: string[] = [];
+
 function tmpdir(prefix = 'pulse-runtime-'): string {
-  return mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
+  TMP_DIRS.push(dir);
+  return dir;
 }
+
+after(() => {
+  for (const dir of TMP_DIRS) rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+});
 
 function nodes(): NodesFile {
   return loadNodes(NODES_FILE);
@@ -293,7 +303,8 @@ test('overlay: docker-args.txt adds pairs, a clash needs --overlay-wins, a missi
   assert.match(r.map.EXTRA_DOCKER_ARGS, /-v \/ov\/speculative\.py:/);
   assert.match(r.map.EXTRA_DOCKER_ARGS, /-e VLLM_OVERLAY=1/);
   assert.equal(r.replaced.length, 1);
-  assert.match(r.text, /# pulse-overlay: .* manifest-sha256=/);
+  assert.match(r.text, new RegExp(`# pulse-overlay: ${ov.dir} overlay-sha256=${ov.sha256}\n`));
+  assert.match(ov.sha256, /^[0-9a-f]{64}$/);
   const d = renderEnv(loadProfile(PROFILES, 'datagen'), spark2, { overlay: ov });
   assert.match(d.map.EXTRA_DOCKER_ARGS, /speculative\.py/);
   assert.throws(() => readOverlay(tmpdir()), /docker-args\.txt is missing/);
@@ -305,13 +316,66 @@ test('diffMaps: EXTRA_DOCKER_ARGS compares as pairs without order', () => {
   assert.deepEqual(diffMaps({ YARN: '0' }, { YARN: '1' }), ['~ YARN: 0 -> 1']);
 });
 
+/** An overlay dir with one mounted file, as overlays/qwen38/build.sh writes it: all pairs on one line. */
+function overlayDir(build: number, dir = tmpdir()): string {
+  writeFileSync(path.join(dir, 'patch.py'), 'x = 1\n');
+  writeFileSync(path.join(dir, 'docker-args.txt'), `-e VLLM_OVERLAY=1 -v ${path.join(dir, 'patch.py')}:/opt/overlay/patch.py:ro\n`);
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ build }, null, 2) + '\n');
+  return dir;
+}
+
+test('overlay: a new manifest.json with the same docker-args.txt changes the .env identity, not the body', () => {
+  const dir = overlayDir(1);
+  const a = readOverlay(dir);
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ build: 2 }, null, 2) + '\n');
+  const b = readOverlay(dir);
+  assert.deepEqual(a.words, b.words);
+  assert.notEqual(a.sha256, b.sha256);
+  const datagen = loadProfile(PROFILES, 'datagen');
+  const spark2 = nodes().nodes.spark2;
+  const ra = renderEnv(datagen, spark2, { overlay: a, now: NOW });
+  const rb = renderEnv(datagen, spark2, { overlay: b, now: NOW });
+  assert.equal(ra.sha256, rb.sha256, 'the assignment lines are the same');
+  assert.notEqual(ra.overlayLine, rb.overlayLine);
+  assert.equal(parseEnvHeader(rb.text.split('\n')).overlay, rb.overlayLine);
+  assert.equal(renderEnv(datagen, spark2, { now: NOW }).overlayLine, 'none');
+});
+
+test('write-env: the node script writes a new .env when only the overlay changed, and keeps an equal one', () => {
+  const fake = fakeNode();
+  const node = loadNodes(fake.nodesFile).nodes.fake;
+  const datagen = loadProfile(PROFILES, 'datagen');
+  const dir = overlayDir(1);
+  const ra = renderEnv(datagen, node, { overlay: readOverlay(dir), now: NOW });
+  writeFileSync(path.join(dir, 'manifest.json'), '{"build": 2}\n');
+  const rb = renderEnv(datagen, node, { overlay: readOverlay(dir), now: NOW });
+  // The script runs in the recipe dir of the render: make sure that it is the fake one.
+  assert.ok(ra.recipe.dir.startsWith(os.tmpdir()), ra.recipe.dir);
+  const run = (r: Rendered, ts: string) => execFileSync('bash', ['-s'], { input: wrapScript(writeEnvScript(r, `${r.recipe.dir}/.env.pulse-bak-${ts}`)), encoding: 'utf8' });
+  assert.match(run(ra, 'T1'), /@pulse env written/);
+  assert.match(run(ra, 'T2'), /@pulse env unchanged/);
+  const out = run(rb, 'T3');
+  assert.match(out, /@pulse env-backup .*\.env\.pulse-bak-T3/);
+  assert.match(out, /@pulse env written/);
+  assert.equal(parseEnvHeader(readFileSync(path.join(fake.recipe, '.env'), 'utf8').split('\n')).overlay, rb.overlayLine);
+  assert.deepEqual(backups(fake), ['.env.pulse-bak-T1', '.env.pulse-bak-T3']);
+});
+
+test('profiles: --api-key in EXTRA_VLLM_ARGS is refused', () => {
+  const head = '# pulse-recipe: qwen38-flash\nIMAGE="i"\n';
+  assert.throws(() => loadProfile(tmpProfile(head + 'EXTRA_VLLM_ARGS="--max-num-seqs 4 --api-key abc"\n'), 'x'), /--api-key is not allowed/);
+  assert.throws(() => loadProfile(tmpProfile(head + 'EXTRA_VLLM_ARGS="--api-key=abc"\n'), 'x'), /--api-key is not allowed/);
+  assert.equal(loadProfile(tmpProfile(head + 'EXTRA_VLLM_ARGS="--api-server-count 1"\n'), 'x').entries.length, 2);
+});
+
 // ---------------------------------------------------------------- plans
 
 const planOpts = { ts: '20260923T101500Z', stateDir: '/tmp/state' };
 
 test('plan: up has the steps in order, and only preflight, wait-mem, wait-ready and verify read only', () => {
   const plan = planUp(render('best', 'spark2'), nodes(), planOpts);
-  assert.deepEqual(plan.steps.map((s) => s.id), ['preflight', 'mkdir', 'write-env', 'stop', 'wait-mem', 'start', 'wait-ready', 'verify', 'state']);
+  // The .env changes only after the old server is gone: stop.sh reads the .env.
+  assert.deepEqual(plan.steps.map((s) => s.id), ['preflight', 'mkdir', 'stop', 'wait-mem', 'write-env', 'start', 'wait-ready', 'verify', 'state']);
   assert.deepEqual(plan.steps.filter((s) => !s.mutates).map((s) => s.id), ['preflight', 'wait-mem', 'wait-ready', 'verify']);
   assert.deepEqual(plan.refusals, []);
   assert.equal(plan.backupPath, '/models/usman/qwen38-flash/.env.pulse-bak-20260923T101500Z');
@@ -377,6 +441,31 @@ test('runner: ssh runs `bash -s` with batch mode, and the script reaches bash on
   assert.equal(r.code, 0);
   assert.deepEqual(r.records, ['after cat', 'quote a b']);
   assert.equal(shq("it's"), `'it'\\''s'`);
+});
+
+test('keyedCurl: real curl sends the API_KEY of the .env as a bearer token, and nothing without a key', async () => {
+  const seen: (string | undefined)[] = [];
+  const server = createServer((req, res) => { seen.push(req.headers.authorization); res.end('ok'); });
+  await new Promise<void>((res) => server.listen(0, '127.0.0.1', res));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const dir = tmpdir();
+    const call = async (envText: string) => {
+      writeFileSync(path.join(dir, '.env'), envText);
+      const script = `${keyedCurl(shq(path.join(dir, '.env')))}\nkcurl -s -m 5 http://127.0.0.1:${port}/v1/models\n`;
+      // execFile, not execFileSync: the server in this process must answer.
+      return new Promise<string>((res, rej) => {
+        const child = execFile('bash', ['-s'], { encoding: 'utf8' }, (e, out) => (e ? rej(e) : res(out)));
+        child.stdin!.end(wrapScript(script));
+      });
+    };
+    assert.equal(await call(`IMAGE="i"\nAPI_KEY='sk-a\\b"c'\n`), 'ok');
+    assert.equal(await call('IMAGE="i"\n'), 'ok');
+    assert.equal(await call('API_KEY=plain_key-1\n'), 'ok');
+    assert.deepEqual(seen, ['Bearer sk-a\\b"c', undefined, 'Bearer plain_key-1']);
+  } finally {
+    server.close();
+  }
 });
 
 // ---------------------------------------------------------------- parsers
@@ -534,10 +623,64 @@ test('cli: a real up on spark1 without --yes and on tp2 runs nothing', async () 
   assert.equal(made, 0);
 });
 
+test('cli: status sends no HTTP request to a protected node without --yes; smoke and --gpu-probe refuse it', async () => {
+  const calls: { node: string; script: string }[] = [];
+  const deps = (c: ReturnType<typeof capture>) => ({
+    ...c.deps,
+    env: { PULSE_STATE_DIR: tmpdir() },
+    now: () => NOW,
+    runnerFor: (node: NodeConfig) => new RecordingRunner((script) => { calls.push({ node: node.name, script }); return { code: 0, stdout: '' }; }),
+  });
+  // A bare status queries both nodes: spark1 without curl, spark2 with it.
+  let c = capture();
+  assert.equal(await main(['status'], deps(c)), 0);
+  assert.deepEqual(calls.map((x) => x.node), ['spark1', 'spark2']);
+  assert.ok(!/curl/.test(calls[0].script), 'no HTTP request to spark1');
+  assert.ok(!calls[0].script.includes('probe.sh'));
+  assert.match(calls[1].script, /kcurl -s -o \/dev\/null -m 5 -w '%\{http_code\}' 'http:\/\/127\.0\.0\.1:8888\/health'/);
+  assert.match(c.out.join('\n'), /http {8}skipped \(spark1 is protected; pass --yes/);
+  // The JSON form says why.
+  calls.length = 0;
+  c = capture();
+  assert.equal(await main(['status', '--node', 'spark1', '--json'], deps(c)), 0);
+  assert.match(JSON.parse(c.out.join('\n'))[0].httpSkipped, /protected/);
+  assert.ok(!/curl/.test(calls[0].script));
+  // --gpu-probe refuses when a protected node is in the list, and runs nothing.
+  calls.length = 0;
+  c = capture();
+  assert.equal(await main(['status', '--gpu-probe'], deps(c)), 2);
+  assert.equal(await main(['status', '--node', 'spark1', '--gpu-probe'], deps(c)), 2);
+  assert.equal(calls.length, 0);
+  assert.match(c.err.join('\n'), /--gpu-probe starts a GPU container on spark1/);
+  // smoke refuses spark1 and runs nothing.
+  assert.equal(await main(['smoke', '--node', 'spark1'], deps(c)), 2);
+  assert.equal(calls.length, 0);
+  assert.match(c.err.join('\n'), /smoke: node spark1 is protected/);
+  // spark2 is not protected: its probe runs when asked for.
+  c = capture();
+  assert.equal(await main(['status', '--node', 'spark2', '--gpu-probe'], deps(c)), 0);
+  assert.deepEqual(calls.map((x) => x.node), ['spark2']);
+  assert.match(calls[0].script, /bash \/models\/usman\/distill\/probe\.sh/);
+  // --yes allows the request on spark1.
+  calls.length = 0;
+  assert.equal(await main(['status', '--node', 'spark1', '--yes'], deps(capture())), 0);
+  assert.match(calls[0].script, /kcurl/);
+});
+
 // ---------------------------------------------------------------- end to end with a fake recipe
 
-/** A fake node: a recipe dir with start.sh and stop.sh, and stub docker, curl and ss commands. */
-function fakeNode(): { root: string; nodesFile: string; env: NodeJS.ProcessEnv } {
+/**
+ * A fake node: a recipe dir with start.sh and stop.sh, and stub docker, curl and
+ * ss commands. Files in the fake state dir change the behavior:
+ *   stop-fails     stop.sh leaves the container
+ *   start-noop     start.sh exits 0 and starts no container
+ *   models-body    the /v1/models body
+ *   require-key    curl answers 401 without this bearer key in its -K - config
+ * curl-argv gets the arguments of each curl call.
+ * With `second`, nodes.json also has a node fake2 with no state, so the
+ * fragment does not keep the fake endpoint on as the last usable one.
+ */
+function fakeNode(opts: { second?: boolean } = {}): { root: string; nodesFile: string; env: NodeJS.ProcessEnv; state: string; recipe: string } {
   const root = tmpdir('pulse-fake-');
   const bin = path.join(root, 'bin');
   const recipe = path.join(root, 'recipe');
@@ -548,8 +691,8 @@ function fakeNode(): { root: string; nodesFile: string; env: NodeJS.ProcessEnv }
   const script = (file: string, body: string) => { writeFileSync(file, `#!/usr/bin/env bash\n${body}\n`); chmodSync(file, 0o755); };
   const S = st;
   // start.sh and stop.sh run under env -i, so they find the state dir from their own path.
-  script(path.join(recipe, 'start.sh'), `S="$(dirname "$0")/../state"; echo "fake start, HF_TOKEN=\${HF_TOKEN:-unset}"; date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$S/started"; touch "$S/running"; exit 0`);
-  script(path.join(recipe, 'stop.sh'), `S="$(dirname "$0")/../state"; rm -f "$S/running"; echo "fake stop"`);
+  script(path.join(recipe, 'start.sh'), `S="$(dirname "$0")/../state"; echo "fake start, HF_TOKEN=\${HF_TOKEN:-unset}"; [ -f "$S/start-noop" ] && exit 0; date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$S/started"; touch "$S/running"; exit 0`);
+  script(path.join(recipe, 'stop.sh'), `S="$(dirname "$0")/../state"; if [ -f "$S/stop-fails" ]; then echo "fake stop failed"; exit 1; fi; rm -f "$S/running"; echo "fake stop"`);
   script(path.join(bin, 'docker'), `S=${shq(S)}
 case "$1 $2" in
   "image inspect") echo '["sha256:aaa","sha256:bbb"]' ;;
@@ -569,11 +712,20 @@ case "$1 $2" in
   *) exit 1 ;;
 esac`);
   script(path.join(bin, 'curl'), `S=${shq(S)}
+printf '%s\\n' "$*" >> "$S/curl-argv"
+cfg=
+if [ "\${1:-}" = -K ] && [ "\${2:-}" = - ]; then cfg=$(cat); fi
 [ -f "$S/running" ] || { case "$*" in *http_code*) printf 000 ;; esac; exit 7; }
+if [ -f "$S/require-key" ]; then
+  case "$cfg" in
+    *"Authorization: Bearer $(cat "$S/require-key")"*) ;;
+    *) case "$*" in *http_code*) printf 401 ;; *) echo '{"error":{"message":"Unauthorized","code":401}}' ;; esac; exit 0 ;;
+  esac
+fi
 case "$*" in
   *http_code*) printf 200 ;;
   *chat/completions*) echo '{"choices":[{"message":{"content":"ready"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":2,"total_tokens":22}}' ;;
-  *) echo '{"object":"list","data":[{"id":"qwen3.8-flash-next","max_model_len":262144}]}' ;;
+  *) if [ -f "$S/models-body" ]; then cat "$S/models-body"; else echo '{"object":"list","data":[{"id":"qwen3.8-flash-next","max_model_len":262144}]}'; fi ;;
 esac`);
   script(path.join(bin, 'ss'), 'exit 0');
   script(path.join(bin, 'nvidia-smi'), 'exit 0');
@@ -591,10 +743,42 @@ esac`);
         gatewayUrl: 'http://127.0.0.1:18999/v1',
         recipes: { 'qwen38-flash': { dir: recipe, start: './start.sh', stop: './stop.sh', container: 'vllm-fn-tp1', dockerArgs: ['-v', `${path.join(root, 'ple')}:/ple`] } },
       },
+      ...(opts.second ? { fake2: { host: 'local', env: { PORT: '18998' }, vars: {}, gatewayUrl: 'http://127.0.0.1:18998/v1', recipes: {} } } : {}),
     },
   }));
   // HF_TOKEN in the caller environment must not reach start.sh (env -i).
-  return { root, nodesFile, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HF_TOKEN: 'caller_token' } };
+  return { root, nodesFile, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, HF_TOKEN: 'caller_token' }, state: S, recipe };
+}
+
+/** CLI dependencies that run node scripts locally against a fake node. */
+function fakeDeps(fake: ReturnType<typeof fakeNode>, c: ReturnType<typeof capture>, now = NOW) {
+  const sink = new Writable({ write(_c, _e, cb) { cb(); } });
+  return {
+    ...c.deps,
+    env: { PULSE_STATE_DIR: path.join(fake.root, 'pulse-state') },
+    now: () => now,
+    pollS: 1,
+    retryDelayMs: 0,
+    runnerFor: (node: NodeConfig) => new ExecRunner(node, sink, fake.env),
+  };
+}
+
+function readState(fake: ReturnType<typeof fakeNode>, node = 'fake'): NodeState {
+  return JSON.parse(readFileSync(path.join(fake.root, 'pulse-state', 'nodes', `${node}.json`), 'utf8')) as NodeState;
+}
+
+function readEndpoints(fake: ReturnType<typeof fakeNode>): { name: string; enabled: boolean }[] {
+  const frag = JSON.parse(readFileSync(path.join(fake.root, 'pulse-state', 'gateway-backends.json'), 'utf8'));
+  return frag.models[0].endpoints.map((e: { name: string; enabled: boolean }) => ({ name: e.name, enabled: e.enabled }));
+}
+
+function startLogs(fake: ReturnType<typeof fakeNode>): number {
+  const dir = path.join(fake.recipe, 'logs');
+  return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.log')).length : 0;
+}
+
+function backups(fake: ReturnType<typeof fakeNode>): string[] {
+  return readdirSync(fake.recipe).filter((f) => f.startsWith('.env.pulse-bak-')).sort();
 }
 
 test('e2e: up datagen, status, smoke and down on a fake local recipe', async () => {
@@ -688,4 +872,170 @@ test('e2e: a failed preflight changes nothing on the node', async () => {
   assert.match(c.out.join('\n'), /FAIL   mount-source \/does\/not\/exist is missing/);
   assert.equal(readFileSync(path.join(fake.root, 'recipe', '.env'), 'utf8'), 'IMAGE="old"\nMAX_NUM_SEQS=4\nHF_TOKEN=hf_secret_value\n');
   assert.ok(!existsSync(stateDir));
+});
+
+test('e2e: a stop that leaves the container marks the node failed and keeps the old .env', async () => {
+  const fake = fakeNode({ second: true });
+  const c = capture();
+  const deps = fakeDeps(fake, c);
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--timeout-s', '60'], deps), 0, c.err.join('\n'));
+  assert.equal(readState(fake).state, 'up');
+  const envBefore = readFileSync(path.join(fake.recipe, '.env'), 'utf8');
+  writeFileSync(path.join(fake.state, 'stop-fails'), '');
+  c.err.length = 0;
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--restart'], deps), 1);
+  const st = readState(fake);
+  assert.equal(st.state, 'failed');
+  assert.match(st.error!, /^stop: stop container vllm-fn-tp1 still exists/);
+  assert.deepEqual(readEndpoints(fake), [{ name: 'fake', enabled: false }, { name: 'fake2', enabled: true }]);
+  // The .env did not change, because the write comes after the stop.
+  assert.equal(readFileSync(path.join(fake.recipe, '.env'), 'utf8'), envBefore);
+  assert.match(c.err.join('\n'), /to go back: pulse model up datagen --node fake/);
+  // down with the same failure also marks the node failed.
+  writeNodeState(path.join(fake.root, 'pulse-state'), { ...st, state: 'up', error: undefined });
+  assert.equal(await main(['down', '--node', 'fake', '--nodes', fake.nodesFile], deps), 1);
+  assert.equal(readState(fake).state, 'failed');
+  assert.match(readState(fake).error!, /^stop: /);
+});
+
+test('e2e: a memory wait that times out after the stop marks the node failed, and the .env stays old', async () => {
+  const fake = fakeNode({ second: true });
+  const cfg = JSON.parse(readFileSync(fake.nodesFile, 'utf8'));
+  cfg.memTimeoutS = 0;
+  writeFileSync(fake.nodesFile, JSON.stringify(cfg));
+  // A node that the last up marked up, with a server that runs.
+  writeFileSync(path.join(fake.state, 'started'), '2026-09-23T09:00:00.000000000Z');
+  writeFileSync(path.join(fake.state, 'running'), '');
+  writeNodeState(path.join(fake.root, 'pulse-state'), { node: 'fake', state: 'up', updatedAt: NOW.toISOString(), recipe: 'qwen38-flash', bind: '127.0.0.1' });
+  const c = capture();
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--min-mem-gib', '100000'], fakeDeps(fake, c)), 1);
+  assert.ok(!existsSync(path.join(fake.state, 'running')), 'the stop ran');
+  const st = readState(fake);
+  assert.equal(st.state, 'failed');
+  assert.match(st.error!, /^wait-mem: mem MemAvailable is \d+ GiB, below 100000 GiB/);
+  assert.deepEqual(readEndpoints(fake), [{ name: 'fake', enabled: false }, { name: 'fake2', enabled: true }]);
+  assert.equal(readFileSync(path.join(fake.recipe, '.env'), 'utf8'), 'IMAGE="old"\nMAX_NUM_SEQS=4\nHF_TOKEN=hf_secret_value\n');
+  assert.deepEqual(backups(fake), []);
+  assert.equal(startLogs(fake), 0, 'no start');
+  const err = c.err.join('\n');
+  assert.match(err, /may have no server now\. The \.env did not change/);
+  assert.match(err, /to go back: run \.\/start\.sh in /);
+});
+
+test('e2e: a readiness timeout marks the node failed and names the backup', async () => {
+  const fake = fakeNode({ second: true });
+  writeFileSync(path.join(fake.state, 'start-noop'), '');
+  const c = capture();
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--timeout-s', '1'], fakeDeps(fake, c)), 1);
+  const st = readState(fake);
+  assert.equal(st.state, 'failed');
+  assert.match(st.error!, /^wait-ready: timeout \/v1\/models did not return 200/);
+  assert.deepEqual(readEndpoints(fake), [{ name: 'fake', enabled: false }, { name: 'fake2', enabled: true }]);
+  assert.equal(st.backup, path.join(fake.recipe, '.env.pulse-bak-20260923T101500Z'));
+  assert.match(c.err.join('\n'), /the previous \.env is saved as .*\.env\.pulse-bak-20260923T101500Z/);
+});
+
+test('e2e: verify fails on a wrong max_model_len and on a wrong model id', async () => {
+  const fake = fakeNode({ second: true });
+  writeFileSync(path.join(fake.state, 'models-body'), '{"object":"list","data":[{"id":"qwen3.8-flash-next","max_model_len":1234}]}');
+  const c = capture();
+  const deps = fakeDeps(fake, c);
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--timeout-s', '60'], deps), 1);
+  assert.equal(readState(fake).state, 'failed');
+  assert.match(readState(fake).error!, /^verify: verify max_model_len is 1234, expected 262144/);
+  assert.deepEqual(readEndpoints(fake), [{ name: 'fake', enabled: false }, { name: 'fake2', enabled: true }]);
+  // The server runs this .env now, so the next up only checks it, and the check fails again.
+  writeFileSync(path.join(fake.state, 'models-body'), '{"object":"list","data":[{"id":"other-model","max_model_len":262144}]}');
+  c.out.length = 0;
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--timeout-s', '60'], deps), 1);
+  assert.match(c.out.join('\n'), /already runs profile datagen/);
+  assert.match(readState(fake).error!, /^verify: verify \/v1\/models serves other-model, expected qwen3\.8-flash-next/);
+  assert.equal(startLogs(fake), 1);
+});
+
+test('e2e: a missing proof line is a warning, not a failure', async () => {
+  const fake = fakeNode();
+  const profiles = tmpdir();
+  const datagen = readFileSync(path.join(PROFILES, 'datagen.env'), 'utf8');
+  writeFileSync(path.join(profiles, 'proofy.env'), datagen.replace('# pulse-recipe: qwen38-flash', '# pulse-recipe: qwen38-flash\n# pulse-proof: this text is not in the log'));
+  const c = capture();
+  assert.equal(await main(['up', 'proofy', '--node', 'fake', '--nodes', fake.nodesFile, '--profiles-dir', profiles, '--timeout-s', '60'], fakeDeps(fake, c)), 0, c.err.join('\n'));
+  assert.match(c.out.join('\n'), /proof MISSING this text is not in the log/);
+  assert.match(c.out.join('\n'), /WARN at least one proof line is missing/);
+  const st = readState(fake);
+  assert.equal(st.state, 'up');
+  assert.deepEqual(st.proofs, [{ text: 'this text is not in the log', ok: false }]);
+});
+
+test('e2e: a rebuilt overlay restarts the server: a new manifest, or a replaced mounted file', async () => {
+  const fake = fakeNode();
+  const ov = path.join(fake.root, 'ov');
+  mkdirSync(ov);
+  overlayDir(1, ov);
+  const c = capture();
+  const up = (at: string) => main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--overlay', ov, '--timeout-s', '60'], fakeDeps(fake, c, new Date(at)));
+  const header = () => parseEnvHeader(readFileSync(path.join(fake.recipe, '.env'), 'utf8').split('\n'));
+
+  assert.equal(await up('2026-09-23T10:00:00Z'), 0, c.err.join('\n'));
+  const first = header().overlay!;
+  assert.match(first, /overlay-sha256=[0-9a-f]{64}$/);
+  assert.equal(startLogs(fake), 1);
+  // Nothing changed: no restart.
+  c.out.length = 0;
+  assert.equal(await up('2026-09-23T10:01:00Z'), 0);
+  assert.match(c.out.join('\n'), /already runs profile datagen/);
+  assert.equal(startLogs(fake), 1);
+
+  // A new manifest.json with the same docker-args.txt: a new .env and a restart.
+  writeFileSync(path.join(ov, 'manifest.json'), JSON.stringify({ build: 2 }, null, 2) + '\n');
+  c.out.length = 0;
+  assert.equal(await up('2026-09-23T10:02:00Z'), 0, c.err.join('\n'));
+  assert.ok(!c.out.join('\n').includes('already runs'));
+  assert.equal(startLogs(fake), 2);
+  assert.notEqual(header().overlay, first);
+  assert.equal(backups(fake).length, 2);
+  assert.equal(readState(fake).overlay!.manifestSha256, readOverlay(ov).manifestSha256);
+
+  // The build replaces a mounted file with a new inode (os.replace). The .env
+  // stays the same, but the running container still has the old file.
+  await new Promise((res) => setTimeout(res, 100));
+  writeFileSync(path.join(ov, 'patch.py.tmp'), 'x = 2\n');
+  renameSync(path.join(ov, 'patch.py.tmp'), path.join(ov, 'patch.py'));
+  c.out.length = 0;
+  assert.equal(await up('2026-09-23T10:03:00Z'), 0, c.err.join('\n'));
+  const out = c.out.join('\n');
+  assert.match(out, /a mounted file changed after the container started/);
+  assert.match(out, /\.env unchanged/);
+  assert.equal(startLogs(fake), 3);
+  assert.equal(backups(fake).length, 2, 'no new backup: the .env did not change');
+
+  // Now the container is newer than every mounted file: no restart.
+  c.out.length = 0;
+  assert.equal(await up('2026-09-23T10:04:00Z'), 0);
+  assert.match(c.out.join('\n'), /already runs profile datagen/);
+  assert.equal(startLogs(fake), 3);
+});
+
+test('e2e: with API_KEY in the node .env, up, status and smoke send the key, and never on a command line', async () => {
+  const fake = fakeNode();
+  const key = 'sk-test-key-123';
+  writeFileSync(path.join(fake.recipe, '.env'), `IMAGE="old"\nAPI_KEY=${key}\n`);
+  writeFileSync(path.join(fake.state, 'require-key'), key);
+  const c = capture();
+  const deps = fakeDeps(fake, c);
+  assert.equal(await main(['up', 'datagen', '--node', 'fake', '--nodes', fake.nodesFile, '--timeout-s', '30'], deps), 0, c.err.join('\n'));
+  assert.match(c.out.join('\n'), /\/v1\/models: qwen3\.8-flash-next, max_model_len 262144/);
+  assert.match(readFileSync(path.join(fake.recipe, '.env'), 'utf8'), new RegExp(`\\nAPI_KEY=${key}\\n$`));
+  c.out.length = 0;
+  assert.equal(await main(['status', '--node', 'fake', '--nodes', fake.nodesFile, '--json'], deps), 0);
+  const status = JSON.parse(c.out.join('\n'));
+  assert.equal(status[0].health, '200');
+  assert.equal(status[0].models.id, 'qwen3.8-flash-next');
+  c.out.length = 0;
+  assert.equal(await main(['smoke', '--node', 'fake', '--nodes', fake.nodesFile], deps), 0);
+  assert.match(c.out.join('\n'), /smoke on fake \(qwen3\.8-flash-next\): ok/);
+  const argv = readFileSync(path.join(fake.state, 'curl-argv'), 'utf8');
+  assert.match(argv, /^-K - /m);
+  assert.ok(!argv.includes(key), 'the key is not on a curl command line');
+  assert.ok(!c.out.join('\n').includes(key) && !c.err.join('\n').includes(key));
 });

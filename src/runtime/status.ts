@@ -1,6 +1,6 @@
 // `pulse model status` and `pulse model smoke`: scripts and parsers.
 
-import { shq, probeHost } from './plan.js';
+import { keyedCurl, shq, probeHost } from './plan.js';
 import type { NodeConfig, RecipeRef } from './profiles.js';
 
 export interface KvInfo {
@@ -141,8 +141,9 @@ export function statusScript(node: NodeConfig, recipe: RecipeRef, opts: StatusOp
   ];
   if (opts.http) {
     lines.push(
-      `echo "@pulse health $(curl -s -o /dev/null -m 5 -w '%{http_code}' ${shq(`http://${host}:${port}/health`)} 2>/dev/null)"`,
-      `echo "@pulse models-body $(curl -s -m 5 ${shq(`http://${host}:${port}/v1/models`)} 2>/dev/null | tr -d '\\n')"`,
+      keyedCurl('"$DIR/.env"'),
+      `echo "@pulse health $(kcurl -s -o /dev/null -m 5 -w '%{http_code}' ${shq(`http://${host}:${port}/health`)} 2>/dev/null)"`,
+      `echo "@pulse models-body $(kcurl -s -m 5 ${shq(`http://${host}:${port}/v1/models`)} 2>/dev/null | tr -d '\\n')"`,
     );
   }
   lines.push(
@@ -178,6 +179,8 @@ export interface NodeStatus {
   vm?: string;
   thp?: string;
   gpuProbe?: string;
+  /** Why the status made no HTTP request to the server, when it made none. */
+  httpSkipped?: string;
 }
 
 export function parseStatus(nodeName: string, recs: string[], savedKv: string | undefined, now = new Date()): NodeStatus {
@@ -225,7 +228,7 @@ export function parseStatus(nodeName: string, recs: string[], savedKv: string | 
   };
 }
 
-export function smokeScript(node: NodeConfig, servedModel: string): string {
+export function smokeScript(node: NodeConfig, recipe: RecipeRef, servedModel: string): string {
   const port = node.env.PORT ?? '8888';
   const host = probeHost(node.env.BIND ?? '0.0.0.0');
   const body = JSON.stringify({
@@ -237,8 +240,10 @@ export function smokeScript(node: NodeConfig, servedModel: string): string {
   });
   return [
     'set -u',
+    `DIR=${shq(recipe.dir)}`,
+    keyedCurl('"$DIR/.env"'),
     't0=$(date +%s%N)',
-    `resp=$(curl -s -m 300 -H 'Content-Type: application/json' -d ${shq(body)} ${shq(`http://${host}:${port}/v1/chat/completions`)} | tr -d '\\n')`,
+    `resp=$(kcurl -s -m 300 -H 'Content-Type: application/json' -d ${shq(body)} ${shq(`http://${host}:${port}/v1/chat/completions`)} | tr -d '\\n')`,
     't1=$(date +%s%N)',
     'echo "@pulse smoke-ms $(( (t1 - t0) / 1000000 ))"',
     'echo "@pulse smoke-body $resp"',

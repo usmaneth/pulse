@@ -3,8 +3,8 @@
 //   pulse model profiles [--json]
 //   pulse model up <profile> --node <name> [--overlay <dir>] [--dry-run [--preflight]]
 //   pulse model down --node <name> [--dry-run]
-//   pulse model status [--node <name>] [--json] [--no-http] [--gpu-probe]
-//   pulse model smoke --node <name>
+//   pulse model status [--node <name>] [--json] [--no-http] [--gpu-probe] [--yes]
+//   pulse model smoke --node <name> [--yes]
 //   pulse model fragment
 //
 // See docs/RUNTIME.md.
@@ -57,7 +57,10 @@ const HELP = `pulse model - bring a measured vLLM profile up or down on a node
   pulse model down --node N         stop the server on the node
   pulse model status [--node N]     container, profile, drift, health, KV, memory
     --json --no-http --gpu-probe (starts a GPU container; off by default)
+    on a protected node, status sends no HTTP request without --yes, and
+    --gpu-probe needs --yes
   pulse model smoke --node N        send one short chat completion on the node
+                                    (a protected node needs --yes)
   pulse model fragment              rewrite the gateway backend fragment from the state
 
   --verbose shows the raw @pulse records. --nodes FILE and --profiles-dir DIR
@@ -245,8 +248,11 @@ interface PreflightReport {
   fails: string[];
   currentProfile?: string;
   unchanged: boolean;
-  /** The recipe container runs and started after the last change of the .env. */
-  runningSinceEnv: boolean;
+  /**
+   * The recipe container runs, and it started after the last change of the
+   * .env and after the last change of each mounted file.
+   */
+  runningCurrent: boolean;
 }
 
 function reportPreflight(ctx: Ctx, rendered: Rendered, r: RunResult, plan: Plan): PreflightReport {
@@ -277,8 +283,12 @@ function reportPreflight(ctx: Ctx, rendered: Rendered, r: RunResult, plan: Plan)
   const container = first(m, 'container') ?? 'unknown';
   ctx.out(`  server ${rendered.recipe.container}: ${container}`);
   const [cstate, cstarted] = container.split(' ');
+  const started = cstarted ? Date.parse(cstarted) / 1000 : NaN;
+  const running = cstate === 'running' && Number.isFinite(started);
   const envMtime = Number(first(m, 'env-mtime') ?? 'NaN');
-  const runningSinceEnv = cstate === 'running' && !!cstarted && Number.isFinite(envMtime) && Date.parse(cstarted) / 1000 > envMtime;
+  const mountsCtime = Number(first(m, 'mounts-ctime') ?? 'NaN');
+  const runningSinceEnv = running && Number.isFinite(envMtime) && started > envMtime;
+  const runningSinceMounts = running && Number.isFinite(mountsCtime) && started > mountsCtime;
   const header = parseEnvHeader((m.get('env-header') ?? []).map((l) => l));
   const bodySha = first(m, 'env-body-sha');
   let unchanged = false;
@@ -287,7 +297,8 @@ function reportPreflight(ctx: Ctx, rendered: Rendered, r: RunResult, plan: Plan)
   } else {
     if (!header.sha256) ctx.out('  .env   unmanaged (no pulse header)');
     else ctx.out(`  .env   profile ${header.profile ?? '?'}, rendered ${header.rendered ?? '?'}${bodySha === header.sha256 ? '' : ', EDITED after the render'}`);
-    unchanged = !!header.sha256 && header.sha256 === rendered.sha256 && bodySha === rendered.sha256 && header.profile === rendered.profile.name;
+    unchanged = !!header.sha256 && header.sha256 === rendered.sha256 && bodySha === rendered.sha256
+      && header.profile === rendered.profile.name && (header.overlay ?? 'none') === rendered.overlayLine;
     const current: Record<string, string> = {};
     const secrets: string[] = [];
     for (const kv of m.get('env-var') ?? []) {
@@ -303,15 +314,21 @@ function reportPreflight(ctx: Ctx, rendered: Rendered, r: RunResult, plan: Plan)
       for (const d of diff) ctx.out(`           ${d}`);
     }
     if (secrets.length) ctx.out(`  keep   ${secrets.join(', ')} from the current .env (the value is not shown)`);
+    if (header.sha256 && (header.overlay ?? 'none') !== rendered.overlayLine) {
+      ctx.out(`  overlay the .env has overlay ${header.overlay ?? 'none'}; the render has ${rendered.overlayLine}`);
+    }
     ctx.out(unchanged
-      ? '  write  not needed: the .env already has this sha256 and profile'
+      ? '  write  not needed: the .env already has this sha256, profile and overlay'
       : `  write  a new .env; the current one is saved as ${plan.backupPath}`);
+  }
+  if (running && Number.isFinite(mountsCtime) && !runningSinceMounts) {
+    ctx.out('  mounts a mounted file changed after the container started; the running server does not see the new file');
   }
   const clients = Number(first(m, 'clients') ?? '0');
   if (clients > 0) ctx.out(`  WARN   ${clients} open client connection(s) on port ${rendered.port}; they drop when the server stops`);
   const mem = first(m, 'mem-available-gib');
   if (mem) ctx.out(`  memory MemAvailable ${mem} GiB now`);
-  return { fails, currentProfile: header.profile, unchanged, runningSinceEnv };
+  return { fails, currentProfile: header.profile, unchanged, runningCurrent: runningSinceEnv && runningSinceMounts };
 }
 
 function printRenderSummary(ctx: Ctx, r: Rendered, dryRun: boolean): void {
@@ -320,16 +337,23 @@ function printRenderSummary(ctx: Ctx, r: Rendered, dryRun: boolean): void {
   ctx.out(`  profile  ${r.profile.name} (${r.profile.status}${r.profile.runnable ? '' : ', render only'}): ${r.profile.description}`);
   ctx.out(`  node     ${n.name} (${n.host === 'ssh' ? `ssh ${n.ssh}` : 'local'}${n.protected ? ', protected' : ''}), recipe ${r.recipeName} in ${r.recipe.dir}`);
   ctx.out(`  serves   ${r.servedModel}, max_model_len ${r.expectedMaxModelLen ?? '?'}, ${r.bind}:${r.port}, container ${r.recipe.container}`);
-  if (r.overlay) ctx.out(`  overlay  ${r.overlay.dir}${r.overlay.manifestSha256 ? ` (manifest sha256 ${r.overlay.manifestSha256.slice(0, 16)})` : ' (no manifest.json)'}`);
+  if (r.overlay) ctx.out(`  overlay  ${r.overlay.dir} (overlay sha256 ${r.overlay.sha256.slice(0, 16)}${r.overlay.manifestSha256 ? `, manifest sha256 ${r.overlay.manifestSha256.slice(0, 16)}` : ', no manifest.json'})`);
   for (const line of r.replaced) ctx.out(`  replace  ${line}`);
   ctx.out(`  sha256   ${r.sha256}`);
   for (const note of r.profile.clientNotes) ctx.out(`  client   ${note}`);
 }
 
-function restoreHint(ctx: Ctx, plan: Plan, backupWritten: string | undefined, previousProfile: string | undefined): void {
-  if (!backupWritten) return;
+function restoreHint(ctx: Ctx, plan: Plan, backupWritten: string | undefined, previousProfile: string | undefined, stopRan: boolean): void {
+  const yes = plan.node.protected ? ' --yes' : '';
+  if (!backupWritten) {
+    if (!stopRan) return;
+    ctx.err(`the stop ran, so ${plan.node.name} may have no server now. The .env did not change.`);
+    if (previousProfile) ctx.err(`to go back: pulse model up ${previousProfile} --node ${plan.node.name}${yes}`);
+    else ctx.err(`to go back: run ${plan.recipe.start} in ${plan.recipe.dir}`);
+    return;
+  }
   ctx.err(`the previous .env is saved as ${backupWritten}.`);
-  if (previousProfile) ctx.err(`to go back: pulse model up ${previousProfile} --node ${plan.node.name}`);
+  if (previousProfile) ctx.err(`to go back: pulse model up ${previousProfile} --node ${plan.node.name}${yes}`);
   else ctx.err(`to go back: cp -p ${backupWritten} ${plan.recipe.dir}/.env, then run ${plan.recipe.start} in ${plan.recipe.dir}`);
 }
 
@@ -411,7 +435,7 @@ async function cmdUp(ctx: Ctx, profileName: string | undefined): Promise<number>
     return 1;
   }
 
-  const alreadyUp = report.unchanged && report.runningSinceEnv;
+  const alreadyUp = report.unchanged && report.runningCurrent;
   if (alreadyUp && !ctx.opts.restart) {
     ctx.out(`\n${node.name} already runs profile ${profile.name} with this .env; checking it (pass --restart to restart it)`);
   }
@@ -422,18 +446,24 @@ async function cmdUp(ctx: Ctx, profileName: string | undefined): Promise<number>
     overlay: overlay ? { dir: overlay.dir, manifestSha256: overlay.manifestSha256, manifest: overlay.manifest } : null,
   };
   let backupWritten: string | undefined;
+  // After the stop step starts, the old server can be gone. From then on, a
+  // failure marks the node failed, so the state and the fragment do not keep
+  // an endpoint that has no server.
+  let stopRan = false;
   const failStep = (step: Step, r: RunResult, idx: number): number => {
     ctx.err(`\npulse model up: step ${idx} [${step.id}] failed (exit ${r.code})`);
     for (const f of failLines(r)) ctx.err(`  ${f}`);
     if (r.stderr.trim() && !failLines(r).length) ctx.err(indent(r.stderr.trim()));
-    if (['start', 'wait-ready', 'verify'].includes(step.id)) {
+    if (stopRan || ['start', 'wait-ready', 'verify'].includes(step.id)) {
       state.state = 'failed';
       state.error = `${step.id}: ${failLines(r)[0] ?? `exit ${r.code}`}`;
       state.updatedAt = ctx.now().toISOString();
-      writeNodeState(ctx.stateDir, state);
-      writeFragment(ctx.stateDir, nodes);
+      const file = writeNodeState(ctx.stateDir, state);
+      const frag = writeFragment(ctx.stateDir, nodes);
+      ctx.err(`state: ${file} (failed)`);
+      for (const e of frag.endpoints) ctx.err(`  endpoint ${e.name}: ${e.enabled ? 'enabled' : 'disabled'} (${e.reason})`);
     }
-    restoreHint(ctx, plan, backupWritten, report.currentProfile);
+    restoreHint(ctx, plan, backupWritten, report.currentProfile, stopRan);
     return 1;
   };
 
@@ -444,13 +474,17 @@ async function cmdUp(ctx: Ctx, profileName: string | undefined): Promise<number>
     const idx = i + 2;
     ctx.out(`\n[${idx}/${plan.steps.length}] ${step.title}`);
     if (step.id === 'state') break;
+    if (step.id === 'stop') stopRan = true;
     const r = await runStep(ctx, runner, node, step);
     const m = recordMap(r.records);
-    if (r.code !== 0) return failStep(step, r, idx);
+    // The backup exists also when a later command of the write step failed.
     if (step.id === 'write-env') {
       backupWritten = first(m, 'env-backup');
       state.backup = backupWritten ?? null;
-      if (m.has('env') && first(m, 'env') === 'unchanged') ctx.out('  .env unchanged (same sha256 and profile)');
+    }
+    if (r.code !== 0) return failStep(step, r, idx);
+    if (step.id === 'write-env') {
+      if (m.has('env') && first(m, 'env') === 'unchanged') ctx.out('  .env unchanged (same sha256, profile and overlay)');
       else ctx.out(`  .env written${backupWritten ? `; backup ${backupWritten}` : ''}${m.has('env-carried') ? `; kept ${first(m, 'env-carried')} secret line(s)` : ''}`);
     } else if (step.id === 'start') {
       state.startLog = first(m, 'start-log');
@@ -507,6 +541,13 @@ async function cmdDown(ctx: Ctx): Promise<number> {
   if (stop.code !== 0) {
     ctx.err(`pulse model down: the stop failed (exit ${stop.code})`);
     for (const f of failLines(stop)) ctx.err(`  ${f}`);
+    // The stop ran, so the server can be in any state now. Do not keep an "up" record.
+    const failed: NodeState = {
+      ...(prev ?? { node: node.name, recipe: recipeName }), node: node.name, state: 'failed',
+      updatedAt: ctx.now().toISOString(), error: `stop: ${failLines(stop)[0] ?? `exit ${stop.code}`}`,
+    } as NodeState;
+    writeNodeState(ctx.stateDir, failed);
+    writeFragment(ctx.stateDir, nodes);
     return 1;
   }
   const rep = await runStep(ctx, runner, node, plan.steps[1], false);
@@ -519,7 +560,7 @@ async function cmdDown(ctx: Ctx): Promise<number> {
   return 0;
 }
 
-function printStatus(ctx: Ctx, s: NodeStatus, node: NodeConfig, saved: NodeState | undefined, http: boolean): void {
+function printStatus(ctx: Ctx, s: NodeStatus, node: NodeConfig, saved: NodeState | undefined): void {
   ctx.out(`${node.name} (${node.host === 'ssh' ? `ssh ${node.ssh}` : 'local'})`);
   if (!s.reachable) {
     ctx.out(`  unreachable: ${s.error}`);
@@ -533,10 +574,10 @@ function printStatus(ctx: Ctx, s: NodeStatus, node: NodeConfig, saved: NodeState
   else if (!s.env.managed) ctx.out('  .env        unmanaged (no pulse header)');
   else ctx.out(`  .env        profile ${h.profile}, rendered ${h.rendered}, sha256 ${h.sha256?.slice(0, 16)}`);
   ctx.out(`  drift       ${s.env.drift.length ? s.env.drift.join('; ') : 'none'}`);
-  if (http) {
+  if (!s.httpSkipped) {
     ctx.out(`  /health     ${s.health || 'no answer'}`);
     ctx.out(`  /v1/models  ${s.models ? `${s.models.id}, max_model_len ${s.models.maxModelLen}` : 'no model'}`);
-  } else ctx.out('  http        skipped (--no-http)');
+  } else ctx.out(`  http        skipped (${s.httpSkipped})`);
   if (s.kv) ctx.out(`  kv cache    ${s.kv.tokens.toLocaleString('en-US')} tokens${s.kv.maxConcurrency ? ` (${s.kv.maxConcurrency}x at ${s.kv.perRequestTokens?.toLocaleString('en-US')} per request)` : ''}${s.kvSource === 'state' ? ' (saved at up; the log rotated)' : ''}`);
   if (s.memAvailableGiB !== undefined) ctx.out(`  memory      MemAvailable ${s.memAvailableGiB} of ${s.memTotalGiB} GiB`);
   ctx.out(`  gpu apps    ${s.gpuApps.length ? s.gpuApps.join('; ') : 'none listed'} (for information only: not a reliable signal on spark2)`);
@@ -549,7 +590,13 @@ function printStatus(ctx: Ctx, s: NodeStatus, node: NodeConfig, saved: NodeState
 async function cmdStatus(ctx: Ctx): Promise<number> {
   const nodes = loadNodes(ctx.nodesFile);
   const list = ctx.opts.node ? [getNode(nodes, ctx.opts.node)] : Object.values(nodes.nodes);
-  const http = !ctx.opts['no-http'];
+  // The GPU probe starts a GPU container next to the server. On a protected
+  // node that needs --yes, also when the node list comes from nodes.json.
+  const guarded = list.filter((n) => n.protected).map((n) => n.name);
+  if (ctx.opts['gpu-probe'] && guarded.length && !ctx.opts.yes) {
+    ctx.err(`pulse model status: --gpu-probe starts a GPU container on ${guarded.join(', ')}, which is protected (it serves live traffic). Pass --yes, or name another node with --node.`);
+    return 2;
+  }
   const results: NodeStatus[] = [];
   let bad = 0;
   for (const node of list) {
@@ -558,6 +605,11 @@ async function cmdStatus(ctx: Ctx): Promise<number> {
     const recipe = node.recipes[recipeName];
     if (!recipe) throw new ProfileError(`node ${node.name} has no recipe ${recipeName}`);
     if (ctx.opts['gpu-probe'] && !node.gpuProbe) ctx.err(`node ${node.name} has no gpuProbe in ${ctx.nodesFile}`);
+    // Requests to the server of a protected node can disturb live traffic and benchmarks.
+    let httpSkipped: string | undefined;
+    if (ctx.opts['no-http']) httpSkipped = '--no-http';
+    else if (node.protected && !ctx.opts.yes) httpSkipped = `${node.name} is protected; pass --yes to send requests to its server`;
+    const http = !httpSkipped;
     const script = statusScript(node, recipe, { http, gpuProbe: !!ctx.opts['gpu-probe'] });
     const step: Step = { id: 'report', title: 'status', mutates: false, where: 'node', script, timeoutS: ctx.opts['gpu-probe'] ? 300 : 90 };
     const r = await runStep(ctx, ctx.runnerFor(node), node, step, false);
@@ -568,9 +620,10 @@ async function cmdStatus(ctx: Ctx): Promise<number> {
     } else {
       s = parseStatus(node.name, r.records, saved?.kv, ctx.now());
     }
+    if (httpSkipped) s.httpSkipped = httpSkipped;
     results.push(s);
     if (!ctx.opts.json) {
-      printStatus(ctx, s, node, saved, http);
+      printStatus(ctx, s, node, saved);
       if (list.length > 1) ctx.out('');
     }
   }
@@ -581,9 +634,16 @@ async function cmdStatus(ctx: Ctx): Promise<number> {
 async function cmdSmoke(ctx: Ctx): Promise<number> {
   const nodes = loadNodes(ctx.nodesFile);
   const node = getNode(nodes, ctx.opts.node);
+  if (node.protected && !ctx.opts.yes) {
+    ctx.err(`pulse model smoke: node ${node.name} is protected (it serves live traffic). Pass --yes to send a request to its server.`);
+    return 2;
+  }
   const saved = readNodeState(ctx.stateDir, node.name);
+  const recipeName = saved?.recipe ?? 'qwen38-flash';
+  const recipe = node.recipes[recipeName];
+  if (!recipe) throw new ProfileError(`node ${node.name} has no recipe ${recipeName}`);
   const model = saved?.servedModel ?? 'qwen3.8-flash-next';
-  const step: Step = { id: 'report', title: 'smoke', mutates: false, where: 'node', script: smokeScript(node, model), timeoutS: 330 };
+  const step: Step = { id: 'report', title: 'smoke', mutates: false, where: 'node', script: smokeScript(node, recipe, model), timeoutS: 330 };
   const r = await runStep(ctx, ctx.runnerFor(node), node, step, false);
   const s = parseSmoke(r.records);
   if (ctx.opts.json) ctx.out(JSON.stringify({ node: node.name, model, ...s }, null, 2));

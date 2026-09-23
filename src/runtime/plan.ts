@@ -103,6 +103,26 @@ function cleanEnv(): string {
   return 'env -i HOME="$HOME" USER="${USER:-$(id -un)}" PATH="$PATH" LANG=C.UTF-8';
 }
 
+/**
+ * Bash lines that define kcurl: curl with the API_KEY of the recipe .env as a
+ * bearer token. start.sh gives API_KEY to vLLM as --api-key, and then vLLM
+ * refuses /v1 requests without the key. The key goes to curl as a config file
+ * on stdin (-K -), so it is never on a command line and never in the output.
+ * envFile is a bash word, for example ./.env or "$DIR/.env".
+ */
+export function keyedCurl(envFile: string): string {
+  return [
+    `PULSE_KEY=$(env -i bash -c 'set -a; . "$1" >/dev/null 2>&1; printf %s "\${API_KEY:-}"' _ ${envFile} </dev/null 2>/dev/null) || PULSE_KEY=`,
+    'kcurl() {',
+    '  if [ -z "$PULSE_KEY" ]; then curl "$@"; return; fi',
+    '  local k',
+    '  k=${PULSE_KEY//\\\\/\\\\\\\\}',
+    '  k=${k//\\"/\\\\\\"}',
+    `  printf 'header = "Authorization: Bearer %s"\\n' "$k" | curl -K - "$@"`,
+    '}',
+  ].join('\n');
+}
+
 function hfTarget(dst: string, hfHome: string): string | null {
   const root = '/root/.cache/huggingface/';
   return dst.startsWith(root) ? `${hfHome.replace(/\/+$/, '')}/${dst.slice(root.length)}` : null;
@@ -148,6 +168,15 @@ export function preflightScript(r: Rendered): string {
       lines.push(`if [ -e ${shq(target)} ]; then ok hf-target ${shq(target)}; else fail hf-target ${shq(target)} is missing: the mount over it would create it; fi`);
     }
   }
+  // A bind mount of a file keeps the inode that it mounted at the start. A
+  // file that a build replaced later (a new inode) is not in the running
+  // container. The CLI compares the newest ctime with the container start.
+  const files = [...new Set(r.mounts.filter((m) => !mkdirs.has(m.src)).map((m) => m.src))];
+  lines.push('newest=0');
+  for (const f of files) {
+    lines.push(`if [ -f ${shq(f)} ]; then t=$(stat -L -c %.9Z -- ${shq(f)}); if awk -v a="$t" -v b="$newest" 'BEGIN { exit !(a > b) }'; then newest=$t; fi; fi`);
+  }
+  lines.push('echo "@pulse mounts-ctime $newest"');
   for (const key of ['CHAT_TEMPLATE', 'MTP_DRAFT_VOCAB']) {
     const v = r.map[key];
     if (v) {
@@ -187,7 +216,11 @@ export function mkdirScript(dirs: string[]): string {
   return ['set -eu', ...dirs.map((d) => `mkdir -p -- ${shq(d)} && echo "@pulse ok mkdir "${shq(d)}`)].join('\n') + '\n';
 }
 
-/** Write the .env with a backup. Keeps HF_TOKEN and API_KEY lines of the old file without printing them. */
+/**
+ * Write the .env with a backup. Keeps HF_TOKEN and API_KEY lines of the old
+ * file without printing them. The file stays as it is when the body sha256,
+ * the profile and the overlay line are the same.
+ */
 export function writeEnvScript(r: Rendered, backupPath: string): string {
   const eof = 'PULSE_ENV_EOF';
   if (r.text.split('\n').includes(eof)) throw new Error('rendered .env contains the heredoc end marker');
@@ -196,11 +229,13 @@ export function writeEnvScript(r: Rendered, backupPath: string): string {
     'set -e',
     `NEW_SHA=${shq(r.sha256)}`,
     `NEW_PROFILE=${shq(r.profile.name)}`,
+    `NEW_OVERLAY=${shq(r.overlayLine)}`,
     'if [ -f .env ]; then',
     `  cur=$(${BODY_SHA})`,
     '  hdr=$(sed -n \'s/^# pulse-sha256: *//p\' .env | head -n 1)',
     '  prof=$(sed -n \'s/^# pulse-profile: *//p\' .env | head -n 1)',
-    '  if [ "$cur" = "$NEW_SHA" ] && [ "$hdr" = "$NEW_SHA" ] && [ "$prof" = "$NEW_PROFILE" ]; then',
+    '  ovl=$(sed -n \'s/^# pulse-overlay: *//p\' .env | head -n 1)',
+    '  if [ "$cur" = "$NEW_SHA" ] && [ "$hdr" = "$NEW_SHA" ] && [ "$prof" = "$NEW_PROFILE" ] && [ "$ovl" = "$NEW_OVERLAY" ]; then',
     '    echo "@pulse env unchanged"',
     '    exit 0',
     '  fi',
@@ -267,6 +302,7 @@ export function waitReadyScript(r: Rendered, logPath: string, rcPath: string, ti
     prelude(r.recipe),
     `rc=${shq(rcPath)}; log=${shq(logPath)}; c=${shq(r.recipe.container)}`,
     `url=${shq(`http://${host}:${r.port}/v1/models`)}`,
+    keyedCurl('./.env'),
     `timeout=${timeoutS}; t0=$(date +%s); last=0; seen=0`,
     'tails() { echo "--- last 40 lines of $DIR/$log"; tail -n 40 "$log" 2>/dev/null; }',
     'while :; do',
@@ -275,7 +311,7 @@ export function waitReadyScript(r: Rendered, logPath: string, rcPath: string, ti
     '  st=$(docker inspect -f \'{{.State.Status}}\' "$c" 2>/dev/null || echo absent)',
     '  [ "$st" = running ] && seen=1',
     '  if [ "$seen" = 1 ] && [ "$st" != running ]; then echo "@pulse fail container $c is $st"; tails; exit 1; fi',
-    '  code=$(curl -s -o /dev/null -m 5 -w \'%{http_code}\' "$url" 2>/dev/null); [ -n "$code" ] || code=000',
+    '  code=$(kcurl -s -o /dev/null -m 5 -w \'%{http_code}\' "$url" 2>/dev/null); [ -n "$code" ] || code=000',
     '  if [ "$code" = 200 ]; then echo "@pulse ready-s $el"; echo "/v1/models returned 200 after ${el}s"; exit 0; fi',
     '  if [ "$el" -ge "$timeout" ]; then echo "@pulse fail timeout /v1/models did not return 200 in ${el}s"; tails; exit 1; fi',
     '  if [ $((now - last)) -ge 60 ]; then last=$now; echo "waiting for /v1/models: ${el}s, container $st, last HTTP code $code"; fi',
@@ -291,7 +327,8 @@ export function verifyScript(r: Rendered): string {
     `c=${shq(r.recipe.container)}`,
     'logs=$(mktemp); trap \'rm -f "$logs"\' EXIT',
     'docker logs "$c" > "$logs" 2>&1 </dev/null',
-    `echo "@pulse models-body $(curl -s -m 10 ${shq(`http://${host}:${r.port}/v1/models`)} | tr -d '\\n')"`,
+    keyedCurl('./.env'),
+    `echo "@pulse models-body $(kcurl -s -m 10 ${shq(`http://${host}:${r.port}/v1/models`)} | tr -d '\\n')"`,
     'echo "@pulse container $(docker inspect -f \'{{.State.Status}} {{.State.StartedAt}}\' "$c" 2>/dev/null || echo absent)"',
     'echo "@pulse kv $(grep -E \'GPU KV cache size|Available KV cache|Maximum concurrency\' "$logs" | tail -n 1)"',
   ];
@@ -318,9 +355,11 @@ export function planUp(r: Rendered, nodes: NodesFile, opts: PlanOptions): Plan {
   if (r.mkdirs.length) {
     plan.steps.push({ id: 'mkdir', title: `create directories: ${r.mkdirs.join(', ')}`, mutates: true, where: 'node', script: mkdirScript(r.mkdirs), timeoutS: 60 });
   }
-  plan.steps.push({ id: 'write-env', title: `write ${recipe.dir}/.env (backup ${backupPath}; no write when the sha256 is unchanged)`, mutates: true, where: 'node', script: writeEnvScript(r, backupPath), timeoutS: 60 });
+  // stop.sh reads the .env, so the old .env stays in place until the old
+  // server is gone. The new .env is never next to a server that it did not start.
   plan.steps.push({ id: 'stop', title: `stop the running server (${recipe.stop}) and check that ${recipe.container} is gone`, mutates: true, where: 'node', script: stopScript(recipe), timeoutS: 180 });
   plan.steps.push({ id: 'wait-mem', title: `wait until MemAvailable >= ${minMem} GiB (timeout ${nodes.memTimeoutS} s)`, mutates: false, where: 'node', script: waitMemScript(minMem, nodes.memTimeoutS), timeoutS: nodes.memTimeoutS + 60 });
+  plan.steps.push({ id: 'write-env', title: `write ${recipe.dir}/.env (backup ${backupPath}; no write when the sha256, profile and overlay are unchanged)`, mutates: true, where: 'node', script: writeEnvScript(r, backupPath), timeoutS: 60 });
   plan.steps.push({ id: 'start', title: `start ${recipe.start} in the background, log ${recipe.dir}/${logPath}`, mutates: true, where: 'node', script: startScript(recipe, logPath, rcPath), timeoutS: 60 });
   plan.steps.push({ id: 'wait-ready', title: `wait until /v1/models returns 200 on ${probeHost(r.bind)}:${r.port} (timeout ${readyTimeout} s)`, mutates: false, where: 'node', script: waitReadyScript(r, logPath, rcPath, readyTimeout, opts.pollS), timeoutS: readyTimeout + 120 });
   plan.steps.push({ id: 'verify', title: `verify: served model ${r.servedModel}, max_model_len ${r.expectedMaxModelLen ?? '?'}, KV line, ${r.proofs.length} proof line(s)`, mutates: false, where: 'node', script: verifyScript(r), timeoutS: 180 });

@@ -188,6 +188,9 @@ export function loadProfile(dir: string, name: string): Profile {
     seen.add(a.key);
     need(!NODE_KEYS.includes(a.key), `profile ${name}:${a.line}: ${a.key} is a node key. Set it in runtime/nodes.json`);
     need(!(a.key in REFUSED_KEYS), `profile ${name}:${a.line}: ${a.key} is not allowed in a profile: ${REFUSED_KEYS[a.key]}`);
+    // pulse sends the key of the node .env (API_KEY) with its requests. A key
+    // in EXTRA_VLLM_ARGS would be a secret in the repo, and pulse cannot send it.
+    need(!(a.key === 'EXTRA_VLLM_ARGS' && /(^|\s)--api-key(\s|=|$)/.test(a.value)), `profile ${name}:${a.line}: --api-key is not allowed in EXTRA_VLLM_ARGS: ${REFUSED_KEYS.API_KEY}`);
   }
   const many = (d: string) => parsed.directives.filter((x) => x.name === d).map((x) => x.value);
   return {
@@ -210,11 +213,18 @@ export interface Overlay {
   /** manifest.json as written by the overlay build, or null when it is missing. */
   manifest: unknown;
   manifestSha256: string | null;
+  /**
+   * The sha256 of docker-args.txt and manifest.json. The .env header records
+   * it, so a rebuilt overlay gives a different .env identity and `up` restarts
+   * the server, also when docker-args.txt did not change.
+   */
+  sha256: string;
 }
 
 /**
  * Read an overlay build output directory. docker-args.txt must exist. It holds
- * -e and -v pairs separated by white space; lines that start with # are comments.
+ * -e and -v pairs separated by white space, on one line or more; lines that
+ * start with # are comments.
  */
 export function readOverlay(dir: string): Overlay {
   const argsFile = path.join(dir, 'docker-args.txt');
@@ -227,12 +237,14 @@ export function readOverlay(dir: string): Overlay {
   const manifestFile = path.join(dir, 'manifest.json');
   let manifest: unknown = null;
   let manifestSha256: string | null = null;
+  let rawManifest = '';
   if (existsSync(manifestFile)) {
-    const raw = readFileSync(manifestFile, 'utf8');
-    manifest = JSON.parse(raw);
-    manifestSha256 = createHash('sha256').update(raw).digest('hex');
+    rawManifest = readFileSync(manifestFile, 'utf8');
+    manifest = JSON.parse(rawManifest);
+    manifestSha256 = createHash('sha256').update(rawManifest).digest('hex');
   }
-  return { dir: path.resolve(dir), words, manifest, manifestSha256 };
+  const sha256 = createHash('sha256').update(`docker-args.txt\0${text}\0manifest.json\0${rawManifest}`).digest('hex');
+  return { dir: path.resolve(dir), words, manifest, manifestSha256, sha256 };
 }
 
 export interface RenderOptions {
@@ -252,6 +264,12 @@ export interface Rendered {
   /** Assignment lines only. The sha256 covers exactly these lines. */
   bodyLines: string[];
   sha256: string;
+  /**
+   * The value of the "# pulse-overlay:" header line: "none", or the overlay
+   * directory and its sha256. With the body sha256 and the profile name, it is
+   * the identity that decides if the node .env is unchanged.
+   */
+  overlayLine: string;
   /** The complete file: header, then the body. */
   text: string;
   dockerArgs: DockerArg[];
@@ -331,9 +349,7 @@ export function renderEnv(profile: Profile, node: NodeConfig, opts: RenderOption
   const sha256 = bodySha(bodyLines);
   const map = Object.fromEntries(entries);
   const now = (opts.now ?? new Date()).toISOString().replace(/\.\d+Z$/, 'Z');
-  const overlayLine = opts.overlay
-    ? `${opts.overlay.dir}${opts.overlay.manifestSha256 ? ` manifest-sha256=${opts.overlay.manifestSha256.slice(0, 16)}` : ''}`
-    : 'none';
+  const overlayLine = opts.overlay ? `${opts.overlay.dir} overlay-sha256=${opts.overlay.sha256}` : 'none';
   const header = [
     '# Rendered by `pulse model up`. The next `pulse model up` on this node replaces this file.',
     `# Edit the profile (runtime/qwen38/profiles/${profile.name}.env in the Pulse repo), not this file.`,
@@ -354,6 +370,7 @@ export function renderEnv(profile: Profile, node: NodeConfig, opts: RenderOption
     map,
     bodyLines,
     sha256,
+    overlayLine,
     text,
     dockerArgs: merged.args,
     mounts: merged.args.filter((a): a is MountArg => a.kind === 'mount'),
