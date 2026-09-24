@@ -21,7 +21,7 @@ Pulse is not an inference engine and does not replace llama.cpp. It is two thing
 2. A **tuning profile plus launcher** that starts llama.cpp with the configuration
    measured to be best on this hardware, instead of making you rediscover it.
 
-The negative results in [`bench/RESULTS.md`](bench/RESULTS.md) are the more useful
+The negative results in [`bench/RESULTS.md`](../bench/RESULTS.md) are the more useful
 half. Several widely-assumed optimisations measurably do nothing here.
 
 ---
