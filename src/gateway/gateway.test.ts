@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { chmodSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
-import { Gateway } from './server.js';
+import { Gateway, privateAppendStream } from './server.js';
 import { defaultConfig, loadConfig, parseEndpointList } from './config.js';
 import type { GatewayConfig } from './config.js';
 import { sseData } from './sse.js';
@@ -187,6 +187,24 @@ test('the trace file is made private also when it already exists', async () => {
     assert.equal(statSync(trace).mode & 0o777, 0o600);
     assert.equal(readFileSync(trace, 'utf8').trim().split('\n').length, 1);
   } finally { rmSync(trace, { force: true }); await backend.close(); }
+});
+
+test('the private append stream sets the mode before the first write', async () => {
+  const file = `${process.env.TMPDIR ?? '/tmp'}/pulse-gateway-private-${process.pid}.jsonl`;
+  writeFileSync(file, 'old\n', { mode: 0o644 });
+  chmodSync(file, 0o644);
+  try {
+    const stream = privateAppendStream(file);
+    // The stream writes only after the open event, so the mode at that event
+    // is the mode of the first row.
+    const modeAtOpen = await new Promise<number>((resolve, reject) => {
+      stream.once('open', () => resolve(statSync(file).mode & 0o777));
+      stream.once('error', reject);
+    });
+    await new Promise<void>((resolve) => stream.end('new\n', () => resolve()));
+    assert.equal(modeAtOpen, 0o600);
+    assert.equal(readFileSync(file, 'utf8'), 'old\nnew\n');
+  } finally { rmSync(file, { force: true }); }
 });
 
 test('unsupported input returns 400 before any backend call', async () => {

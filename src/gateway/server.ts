@@ -10,7 +10,7 @@
 
 import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createWriteStream, fchmod, readFileSync } from 'node:fs';
+import { close, createWriteStream, fchmod, open, readFileSync, write, writev } from 'node:fs';
 import type { WriteStream } from 'node:fs';
 import type { GatewayConfig } from './config.js';
 import { Endpoint, HealthChecker, ModelRoute, RetryableBackendError, postChat, closeAgents } from './backends.js';
@@ -348,12 +348,7 @@ export class Gateway {
     if (!this.config.traceFile || this.traceFailed) return;
     if (!this.traceStream) {
       const path = this.config.traceFile;
-      const stream = createWriteStream(path, { flags: 'a', mode: 0o600 });
-      // The mode of open(2) applies only to a new file. An existing file
-      // gets the private mode when the stream opens it.
-      stream.on('open', (fd: number) => fchmod(fd, 0o600, (error) => {
-        if (error) log('warn', 'could not make the trace file private', { error: String(error) });
-      }));
+      const stream = privateAppendStream(path);
       stream.on('error', (error) => {
         log('warn', 'could not write the trace file; tracing stops', { error: String(error) });
         this.traceFailed = true;
@@ -649,6 +644,26 @@ export class Gateway {
     }
     m.toolCalls += response.output.filter((item: Obj) => item.type === 'function_call' || item.type === 'custom_tool_call').length;
   }
+}
+
+/**
+ * An append stream to a file that only the owner can read. The mode of
+ * open(2) applies only to a new file, so the stream also sets the mode of an
+ * existing file. The stream writes nothing before its open step is complete,
+ * and the open step includes the mode change, so no row goes into a file
+ * that others can read.
+ */
+export function privateAppendStream(path: string): WriteStream {
+  const openPrivate = (
+    file: string, flags: string, mode: number, callback: (error: NodeJS.ErrnoException | null, fd?: number) => void,
+  ) => open(file, flags, mode, (error, fd) => {
+    if (error) return callback(error);
+    fchmod(fd, 0o600, (chmodError) => {
+      if (!chmodError) return callback(null, fd);
+      close(fd, () => callback(chmodError));
+    });
+  });
+  return createWriteStream(path, { flags: 'a', mode: 0o600, fs: { open: openPrivate, write, writev, close } });
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
