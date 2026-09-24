@@ -151,12 +151,28 @@ Codex sends the Lark grammar of `apply_patch` in the tool `format`. A
 function tool cannot carry a grammar, so the gateway appends it to the
 description (`The input string must follow this lark grammar: ...`).
 
-`tool_choice` maps as follows: `auto`, `none` and `required` pass through. A
-named `function` or `custom` tool becomes `{"type": "function", "function":
+`tool_choice` maps as follows: `auto` and `none` pass through. A named
+`function` or `custom` tool becomes `{"type": "function", "function":
 {"name": ...}}`, with `<namespace>__<name>` for a namespaced tool. A name that
 is not in `tools` gives HTTP 400. `parallel_tool_calls` passes through. Both
 go to vLLM only when the request has tools, because vLLM rejects
 `tool_choice` without tools.
+
+A forced `tool_choice` (`required` or a named tool) needs a different path on
+spark1. vLLM accepts it, but does not apply it: the answer is plain text, and
+the finish reason is `tool_calls` or `stop`. The structured output of
+`response_format` works. So for the `qwen38` profile the gateway sends no
+`tool_choice`. It sends a JSON schema of the allowed calls in
+`response_format` instead: an array of `{"name": ..., "parameters": {...}}`
+objects, with one item at most for a named tool or `parallel_tool_calls:
+false`. The tools stay in the prompt, and the schema applies after the
+reasoning block. A system message at the end of the prompt tells the model
+that the reply must be a tool call, so that its reasoning selects the tool.
+At the end, the message does not change the cached prefix. The gateway turns the JSON answer into call items. An answer
+that is not a valid call gives `response.failed`, and the client can retry.
+`PULSE_GATEWAY_FORCED_TOOL_CHOICE=native` sends the `tool_choice` to the
+backend unchanged. The `llamacpp` profile uses `native` by default. Codex
+sends `auto`, so this path is for other Responses clients.
 
 vLLM runs with `--enable-auto-tool-choice --tool-call-parser qwen3_xml`. The
 parser returns tool calls as OpenAI `tool_calls` deltas. The gateway joins the
@@ -166,7 +182,12 @@ deltas and then:
 - unwraps `{"input": "..."}` of a custom tool to a `custom_tool_call` with the
   raw `input` text (if the model skipped the JSON wrapper, the raw arguments
   become the input),
-- drops a tool call that the token limit cut off, because Codex would run it.
+- drops a tool call that the token limit cut off, because Codex would run it,
+- adds the `*** Begin Patch` and `*** End Patch` lines to an `apply_patch`
+  input that starts at its first hunk header (`*** Add File: a.py`) and does
+  not have them. Codex refuses such a patch, and the model needs one more turn
+  to send it again. The gateway changes nothing else in the input, and it
+  writes a `repaired tool call` log line for each repair.
 
 ### History
 
@@ -356,7 +377,9 @@ curl -s http://127.0.0.1:8800/health | jq
 - `requests`: total, in_flight, completed, incomplete, failed, cancelled,
   client_errors, retries (backend attempts repeated before the first output)
 - `tokens`: input, cached_input, output, reasoning (from backend usage)
-- `tool_calls`
+- `tool_calls`, `tool_call_repairs` (patch envelope repairs),
+  `forced_tool_choice` (requests that went to the backend with a JSON schema
+  of the calls)
 - `warmup`: triggers, requests, completed, aborted, errors, skipped, prompt
   and cached tokens of the warm requests, and the last warm result
 - `backends[]`: per endpoint health, requests, errors, failovers, in_flight,
@@ -423,6 +446,7 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_MODEL_CATALOG` | none | Codex catalog file; `/v1/models` returns its matching entries |
 | `PULSE_GATEWAY_EMIT_REASONING` | `1` | `0` hides reasoning items |
 | `PULSE_GATEWAY_REPLAY_REASONING` | `1` | `0` does not send earlier reasoning back to the model |
+| `PULSE_GATEWAY_FORCED_TOOL_CHOICE` | profile default | `grammar` forces `required` and named tool choices with a JSON schema, `native` sends them to the backend unchanged |
 | `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload, or the reason the gateway refused it, to this JSONL file (the gateway sets mode 0600, also on an existing file; for debugging, it holds full prompts) |
 | `PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS` | `12000` | tool output cap, 0 disables it |
 | `PULSE_GATEWAY_MAX_BODY_BYTES` | 64 MiB | request body limit |

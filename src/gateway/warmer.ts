@@ -118,9 +118,14 @@ export function variantKey(payload: Obj): string {
   return JSON.stringify([payload.chat_template_kwargs ?? null, payload.reasoning_effort ?? null]);
 }
 
-/** The payload of a warm request: prefill only, one output token. */
+/**
+ * The payload of a warm request: prefill only, one output token. A JSON
+ * schema of a forced tool_choice does not change the prefill, so it goes.
+ */
 export function warmPayload(payload: Obj): Obj {
-  const { max_tokens: _m, max_completion_tokens: _c, stream: _s, stream_options: _o, ...rest } = payload;
+  const {
+    max_tokens: _m, max_completion_tokens: _c, stream: _s, stream_options: _o, response_format: _f, ...rest
+  } = payload;
   return { ...rest, max_tokens: 1, stream: true, stream_options: { include_usage: true } };
 }
 

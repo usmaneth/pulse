@@ -808,3 +808,53 @@ test('config: retry window, keepalive and stream start come from the environment
   const defaults = defaultConfig();
   assert.deepEqual([defaults.retryWindowMs, defaults.keepaliveMs, defaults.streamStartMs], [180_000, 10_000, 3_000]);
 });
+
+test('forced tool_choice: the backend gets a JSON schema and the client gets the call; a patch repair is counted', async () => {
+  const backend = await mockBackend((body, _q, res) => {
+    const forced = Boolean(body.response_format);
+    const content = forced
+      ? '[{"name": "calculator", "parameters": {"expression": "7*8"}}]'
+      : '';
+    sse(res, forced ? [
+      { choices: [{ index: 0, delta: { content }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    ] : [
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'p1', function: { name: 'apply_patch', arguments: JSON.stringify({ input: '*** Add File: a.txt\n+hi\n' }) } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+    ]);
+  });
+  const lines: Obj[] = [];
+  setLogSink((_level, line) => lines.push(JSON.parse(line)));
+  setLogLevel('info');
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }]);
+  try {
+    const tools = [
+      { type: 'function', name: 'calculator', parameters: { type: 'object', properties: { expression: { type: 'string' } } } },
+      { type: 'custom', name: 'apply_patch' },
+    ];
+    const forced = await (await post(base, { model: 'qwen3.8-flash-next', input: '7*8?', tools, tool_choice: 'required' })).json() as Obj;
+    assert.equal(backend.requests[0].tool_choice, undefined);
+    assert.equal(backend.requests[0].response_format.json_schema.name, 'tool_calls');
+    assert.equal(forced.status, 'completed');
+    assert.deepEqual([forced.output[0].type, forced.output[0].name, forced.output[0].arguments], ['function_call', 'calculator', '{"expression":"7*8"}']);
+
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'add a.txt', tools, stream: true }));
+    const done = evs.find((e) => e.type === 'response.custom_tool_call_input.done')!;
+    assert.equal(done.input, '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n');
+    const metrics = await (await fetch(`${base}/metrics`)).json() as Obj;
+    assert.equal(metrics.forced_tool_choice, 1);
+    assert.equal(metrics.tool_call_repairs, 1);
+    const repair = lines.find((l) => l.msg === 'repaired tool call')!;
+    assert.deepEqual([repair.name, repair.added], ['apply_patch', ['begin', 'end']]);
+  } finally {
+    setLogSink(null);
+    setLogLevel('error');
+    await gateway.stop(); await backend.close();
+  }
+});
+
+test('config: forced tool_choice mode comes from the environment and is checked', () => {
+  assert.equal(loadConfig({}, []).forcedToolChoice, undefined);
+  assert.equal(loadConfig({ PULSE_GATEWAY_FORCED_TOOL_CHOICE: 'native' }, []).forcedToolChoice, 'native');
+  assert.throws(() => loadConfig({ PULSE_GATEWAY_FORCED_TOOL_CHOICE: 'always' }, []), /forcedToolChoice must be/);
+});

@@ -7,7 +7,7 @@
 // See docs/QWEN38.md and config/qwen38-gateway.json.
 
 import { readFileSync } from 'node:fs';
-import type { ProfileName } from './translate.js';
+import type { ForcedToolChoiceMode, ProfileName } from './translate.js';
 import { defaultWarmupConfig } from './warmer.js';
 import type { WarmupConfig } from './warmer.js';
 
@@ -40,6 +40,11 @@ export interface GatewayConfig {
   emitReasoning: boolean;
   /** Send the text of earlier reasoning items back to the model. */
   replayReasoning: boolean;
+  /**
+   * How a forced tool_choice goes to the backend: `native` or `grammar` (see
+   * TranslateOptions.forcedToolChoice). Not set: the default of the profile.
+   */
+  forcedToolChoice?: ForcedToolChoiceMode;
   /** Append each request and its translated payload to this JSONL file. */
   traceFile?: string;
   /** Cap for one tool output in characters. 0 disables the cap. */
@@ -169,6 +174,9 @@ export function validateConfig(config: GatewayConfig): GatewayConfig {
       throw new Error(`model ${model.id}: all endpoints are disabled`);
     }
   }
+  if (config.forcedToolChoice !== undefined && config.forcedToolChoice !== 'native' && config.forcedToolChoice !== 'grammar') {
+    throw new Error(`forcedToolChoice must be native or grammar, not ${String(config.forcedToolChoice)}`);
+  }
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) {
     throw new Error(`invalid port: ${config.port}`);
   }
@@ -207,6 +215,7 @@ export function loadConfig(
 
   if (env.PULSE_GATEWAY_EMIT_REASONING) config.emitReasoning = env.PULSE_GATEWAY_EMIT_REASONING !== '0';
   if (env.PULSE_GATEWAY_REPLAY_REASONING) config.replayReasoning = env.PULSE_GATEWAY_REPLAY_REASONING !== '0';
+  if (env.PULSE_GATEWAY_FORCED_TOOL_CHOICE) config.forcedToolChoice = env.PULSE_GATEWAY_FORCED_TOOL_CHOICE as ForcedToolChoiceMode;
   if (env.PULSE_GATEWAY_TRACE_FILE) config.traceFile = env.PULSE_GATEWAY_TRACE_FILE;
   config.maxToolOutputChars = num(env, 'PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS') ?? config.maxToolOutputChars;
   config.maxBodyBytes = num(env, 'PULSE_GATEWAY_MAX_BODY_BYTES') ?? config.maxBodyBytes;

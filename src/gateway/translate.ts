@@ -29,7 +29,16 @@ export interface TranslateOptions {
   maxToolOutputChars: number;
   /** Send the text of earlier reasoning items back to the model. Default true. */
   replayReasoning?: boolean;
+  /**
+   * How a forced tool_choice (`required` or a named tool) goes to the backend.
+   * `native` sends the tool_choice. `grammar` sends a JSON schema of the
+   * allowed calls in `response_format` and turns the answer into tool calls.
+   * The default is `grammar` for qwen38 and `native` for llamacpp.
+   */
+  forcedToolChoice?: ForcedToolChoiceMode;
 }
+
+export type ForcedToolChoiceMode = 'native' | 'grammar';
 
 /**
  * Tool-name bookkeeping for one request. The backend sees only flat function
@@ -40,6 +49,12 @@ export interface ToolMap {
   custom: Set<string>;
   /** Flat backend name -> [namespace, tool name]. */
   namespaced: Map<string, [string, string]>;
+  /**
+   * True when the request forces a tool call with a JSON schema (see
+   * TranslateOptions.forcedToolChoice). The backend then writes the calls as
+   * JSON text, and the response translator turns that text into calls.
+   */
+  forced?: boolean;
 }
 
 export interface ChatRequest {
@@ -193,6 +208,37 @@ export function mapToolChoice(choice: unknown, available: Set<string>): unknown 
   const name = c.namespace ? `${c.namespace}${NAMESPACE_SEPARATOR}${c.name}` : c.name;
   if (!available.has(name)) throw new RequestError(`tool_choice names a tool that is not in tools: ${name}`);
   return { type: 'function', function: { name } };
+}
+
+/**
+ * The JSON schema of the calls that a forced tool_choice allows: an array of
+ * `{"name": ..., "parameters": {...}}` objects, the same shape that vLLM uses
+ * for tool_choice `required`. A named tool_choice allows one call to that
+ * tool. `single` (parallel_tool_calls false) allows one call.
+ */
+export function forcedCallSchema(tools: Obj[], choice: unknown, single: boolean): Obj {
+  const named = choice && typeof choice === 'object' ? (choice as Obj).function?.name : undefined;
+  const allowed = named ? tools.filter((t) => t.function.name === named) : tools;
+  const variants = allowed.map((t) => ({
+    type: 'object',
+    properties: {
+      name: { type: 'string', enum: [t.function.name] },
+      parameters: t.function.parameters ?? { type: 'object', properties: {} },
+    },
+    required: ['name', 'parameters'],
+    additionalProperties: false,
+  }));
+  const schema: Obj = { type: 'array', minItems: 1, items: variants.length === 1 ? variants[0] : { anyOf: variants } };
+  if (named || single) schema.maxItems = 1;
+  return schema;
+}
+
+/** The instruction for a forced tool_choice, at the end of the prompt. */
+export function forcedToolNote(choice: unknown): string {
+  const named = choice && typeof choice === 'object' ? (choice as Obj).function?.name : undefined;
+  return named
+    ? `This reply must be a call to the tool ${named}. Do not reply with text.`
+    : 'This reply must be a tool call. Do not reply with text. Use the tool that fits the request best.';
 }
 
 /** Apply the reasoning-effort rules for one profile to a chat payload. */
@@ -384,10 +430,29 @@ export function responsesToChat(request: unknown, options: TranslateOptions): Ch
   const { tools, map } = flattenTools(body.tools);
   if (tools.length) {
     payload.tools = tools;
-    if (body.tool_choice != null) {
-      payload.tool_choice = mapToolChoice(body.tool_choice, new Set(tools.map((t) => t.function.name)));
-    }
     if (typeof body.parallel_tool_calls === 'boolean') payload.parallel_tool_calls = body.parallel_tool_calls;
+    if (body.tool_choice != null) {
+      const choice = mapToolChoice(body.tool_choice, new Set(tools.map((t) => t.function.name)));
+      const mode = options.forcedToolChoice ?? (options.profile === 'qwen38' ? 'grammar' : 'native');
+      if (mode === 'grammar' && choice !== 'auto' && choice !== 'none') {
+        // vLLM on spark1 accepts a forced tool_choice but does not apply it:
+        // the answer is plain text with finish_reason tool_calls. The
+        // structured output of response_format works. So the gateway forces
+        // the calls with a JSON schema. The tools stay in the prompt, and
+        // the grammar starts after the reasoning block. A note at the end of
+        // the prompt tells the model about the constraint, so that its
+        // reasoning selects the tool. At the end, the note does not change
+        // the cached prefix.
+        payload.messages.push({ role: 'system', content: forcedToolNote(choice) });
+        payload.response_format = {
+          type: 'json_schema',
+          json_schema: { name: 'tool_calls', schema: forcedCallSchema(tools, choice, body.parallel_tool_calls === false) },
+        };
+        map.forced = true;
+      } else {
+        payload.tool_choice = choice;
+      }
+    }
   }
   if (typeof body.max_output_tokens === 'number') payload.max_tokens = body.max_output_tokens;
   for (const key of ['temperature', 'top_p']) {
@@ -473,6 +538,47 @@ export function customToolInput(args: string): string {
   return args;
 }
 
+/** The Codex tool that edits files with a patch. */
+export const APPLY_PATCH_TOOL = 'apply_patch';
+const PATCH_BEGIN = '*** Begin Patch';
+const PATCH_END = '*** End Patch';
+const PATCH_HUNK_HEADER = /^\*\*\* (Add|Update|Delete) File: \S/;
+
+/**
+ * Add the envelope lines that an apply_patch input does not have. Qwen3.8
+ * sometimes starts a patch at its first hunk header (`*** Add File: a.py`)
+ * and leaves out `*** Begin Patch`. Codex then refuses the patch, and the
+ * model needs one more turn to send it again. The repair adds a line only
+ * when the input starts with `*** Begin Patch` or a hunk header and has at
+ * least one hunk header, so the intent is clear. Other text does not change. `added` names the lines that
+ * the repair added.
+ */
+export function repairPatchEnvelope(input: string): { input: string; added: Array<'begin' | 'end'> } {
+  const body = input.trim();
+  const lines = body.split('\n');
+  const added: Array<'begin' | 'end'> = [];
+  // A patch without any hunk has nothing to apply. Codex reports that better.
+  if (!lines.some((line) => PATCH_HUNK_HEADER.test(line))) return { input, added };
+  if (lines[0].trimEnd() !== PATCH_BEGIN) {
+    if (!PATCH_HUNK_HEADER.test(lines[0])) return { input, added };
+    lines.unshift(PATCH_BEGIN);
+    added.push('begin');
+  }
+  if (lines.at(-1)!.trimEnd() !== PATCH_END) {
+    lines.push(PATCH_END);
+    added.push('end');
+  }
+  return added.length ? { input: lines.join('\n') + '\n', added } : { input, added };
+}
+
+/** One change that the response translator made to a tool call of the model. */
+export interface CallRepair {
+  call_id: string;
+  name: string;
+  /** What changed, for example `begin` and `end` for patch envelope lines. */
+  added: string[];
+}
+
 interface PendingCall {
   id?: string;
   name: string;
@@ -504,6 +610,10 @@ interface PendingCall {
  *   [function call: function_call_arguments.done, output_item.done],
  *   [custom call: custom_tool_call_input.delta, .done, output_item.done],
  *   response.completed | response.incomplete | response.failed
+ *
+ * For a forced tool_choice (ToolMap.forced) the content text is the JSON of
+ * the calls. It is not sent as text. After the finish reason it becomes call
+ * items, and each call then gets its added, delta and done events.
  */
 export class ChatStreamTranslator {
   readonly response: Obj;
@@ -513,6 +623,10 @@ export class ChatStreamTranslator {
   private readonly calls = new Map<number, PendingCall>();
   private finish: string | null = null;
   private sawVisibleOutput = false;
+  /** Content text of a forced tool_choice: the JSON of the calls. */
+  private forcedText = '';
+  /** Tool calls that the translator repaired, for the gateway log. */
+  readonly repairs: CallRepair[] = [];
 
   constructor(model: string, private readonly tools: ToolMap, private readonly emitReasoning = true) {
     this.response = {
@@ -569,6 +683,8 @@ export class ChatStreamTranslator {
     this.calls.clear();
     this.finish = null;
     this.sawVisibleOutput = false;
+    this.forcedText = '';
+    this.repairs.length = 0;
   }
 
   /** Feed one parsed chat-completions chunk. Returns the events to send. */
@@ -588,7 +704,12 @@ export class ChatStreamTranslator {
       this.sawVisibleOutput = true;
       if (this.emitReasoning) events.push(...this.reasoningDelta(thought));
     }
-    if (typeof delta.content === 'string' && delta.content) {
+    if (this.tools.forced && typeof delta.content === 'string' && delta.content) {
+      // The JSON text of the forced calls is not an answer. It becomes
+      // tool calls in finishStream().
+      if (delta.content.trim()) events.push(...this.closeReasoning());
+      this.forcedText += delta.content;
+    } else if (typeof delta.content === 'string' && delta.content) {
       // After the tool calls start, the tool parser can pass on white space
       // between calls. It is not part of the answer.
       if (!(this.calls.size && !delta.content.trim())) {
@@ -732,6 +853,12 @@ export class ChatStreamTranslator {
    */
   finishStream(): ResponseEvent[] {
     if (!this.finish) return this.fail('backend stream ended before a finish reason');
+    const events: ResponseEvent[] = [];
+    if (this.tools.forced && this.finish !== 'length') {
+      events.push(...this.closeReasoning());
+      const error = this.openForcedCalls(events);
+      if (error) return [...events, ...this.fail(error)];
+    }
     if (!this.sawVisibleOutput && this.finish !== 'length') {
       // vLLM can generate tokens and stream none of them (seen live: 156
       // output tokens and no delta). A completed response without output
@@ -741,7 +868,7 @@ export class ChatStreamTranslator {
       return this.fail(`the backend finished (${this.finish}) without any text, reasoning or tool call` +
         (tokens ? ` after ${tokens} output tokens` : ''));
     }
-    const events: ResponseEvent[] = [...this.closeReasoning()];
+    events.push(...this.closeReasoning());
     const truncated = this.finish === 'length';
     events.push(...this.closeMessage(truncated ? 'incomplete' : 'completed'));
     const slots = [...this.calls.keys()].sort((a, b) => a - b).map((slot) => this.calls.get(slot)!);
@@ -764,6 +891,37 @@ export class ChatStreamTranslator {
     return events;
   }
 
+  /**
+   * Turn the JSON text of a forced tool_choice into call items. Returns an
+   * error text when the text holds no valid call, because a forced request
+   * that ends without a call breaks the contract of tool_choice.
+   */
+  private openForcedCalls(events: ResponseEvent[]): string | null {
+    const text = this.forcedText.trim();
+    if (!text) {
+      return this.calls.size ? null : 'the backend returned no tool call for the forced tool_choice';
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return `the backend returned no valid JSON for the forced tool_choice: ${text.slice(0, 200)}`;
+    }
+    const list = Array.isArray(value) ? value : [value];
+    let slot = this.calls.size ? Math.max(...this.calls.keys()) + 1 : 0;
+    for (const entry of list) {
+      if (!entry || typeof entry !== 'object' || typeof (entry as Obj).name !== 'string' || !(entry as Obj).name) {
+        return `the backend returned a forced tool call without a name: ${text.slice(0, 200)}`;
+      }
+      const e = entry as Obj;
+      const params = e.parameters ?? e.arguments ?? {};
+      const call: PendingCall = { name: e.name, args: typeof params === 'string' ? params : JSON.stringify(params) };
+      this.calls.set(slot++, call);
+      events.push(...this.streamCall(call, ''));
+    }
+    return this.calls.size ? null : 'the backend returned no tool call for the forced tool_choice';
+  }
+
   private closeCall(call: PendingCall): ResponseEvent[] {
     const item = call.item!;
     const events: ResponseEvent[] = [];
@@ -781,7 +939,14 @@ export class ChatStreamTranslator {
   /** Send the unwrapped input of a custom tool call and close it. */
   private closeCustomCall(call: PendingCall): ResponseEvent[] {
     const item = call.item!;
-    const input = customToolInput(call.args || '{}');
+    let input = customToolInput(call.args || '{}');
+    if (item.name === APPLY_PATCH_TOOL) {
+      const repair = repairPatchEnvelope(input);
+      if (repair.added.length) {
+        input = repair.input;
+        this.repairs.push({ call_id: item.call_id, name: item.name, added: repair.added });
+      }
+    }
     item.input = input;
     item.status = 'completed';
     return [

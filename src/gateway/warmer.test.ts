@@ -134,6 +134,8 @@ test('warmPayload asks for one token and keeps the prompt fields', () => {
   assert.deepEqual(warm.tools, payload.tools);
   assert.deepEqual(warm.chat_template_kwargs, payload.chat_template_kwargs);
   assert.notEqual(variantKey({ chat_template_kwargs: { enable_thinking: false } }), variantKey({ reasoning_effort: 'high' }));
+  // The JSON schema of a forced tool_choice does not change the prefill.
+  assert.equal(warmPayload({ ...payload, response_format: { type: 'json_schema' } }).response_format, undefined);
 });
 
 test('after a backend restart the warmer sends the prefix and the last session, each twice', async () => {

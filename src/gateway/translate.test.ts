@@ -4,8 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, arrangeSystem, flattenTools, grammarHint, mapToolChoice,
-  mergeAssistantTurns, normalizeToolOutput, responsesToChat,
+  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, arrangeSystem, flattenTools, forcedCallSchema, grammarHint,
+  mapToolChoice, mergeAssistantTurns, normalizeToolOutput, repairPatchEnvelope, responsesToChat,
 } from './translate.js';
 import type { Obj, ResponseEvent } from './translate.js';
 
@@ -631,4 +631,185 @@ test('stream: a failed response carries the call arguments that already went out
   // A stream without a finish reason fails the same way.
   assert.equal(t.finishStream().at(-1)!.type, 'response.failed');
   assert.equal(t.response.output[0].arguments, '{"command":"ls"');
+});
+
+// ------------------------------------------------------- patch envelope
+
+test('patch envelope: a patch that starts at its hunk header gets Begin and End lines', () => {
+  const bare = '*** Add File: primes.py\n+print(2)\n';
+  assert.deepEqual(repairPatchEnvelope(bare), {
+    input: '*** Begin Patch\n*** Add File: primes.py\n+print(2)\n*** End Patch\n', added: ['begin', 'end'],
+  });
+  const noBegin = '\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch';
+  assert.deepEqual(repairPatchEnvelope(noBegin), {
+    input: '*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch\n', added: ['begin'],
+  });
+  const noEnd = '*** Begin Patch\n*** Delete File: old.txt';
+  assert.deepEqual(repairPatchEnvelope(noEnd), {
+    input: '*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\n', added: ['end'],
+  });
+});
+
+test('patch envelope: a complete patch and other text stay byte for byte the same', () => {
+  for (const input of [
+    '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch',
+    '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n',
+    'echo hello',
+    '',
+    '*** Add File:',
+    '*** Begin Patch',
+    '*** Begin Patch\n+stray line',
+    '--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n',
+  ]) {
+    assert.deepEqual(repairPatchEnvelope(input), { input, added: [] });
+  }
+});
+
+test('stream: an apply_patch call without Begin Patch is repaired and recorded', () => {
+  const bare = '*** Add File: primes.py\n+print(2)\n';
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'call_b', function: { name: 'apply_patch', arguments: JSON.stringify({ input: bare }) } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  const fixed = '*** Begin Patch\n*** Add File: primes.py\n+print(2)\n*** End Patch\n';
+  assert.equal(t.response.output[0].input, fixed);
+  assert.equal((events.find((e) => e.type === 'response.custom_tool_call_input.done') as Obj).input, fixed);
+  assert.equal((events.find((e) => e.type === 'response.custom_tool_call_input.delta') as Obj).delta, fixed);
+  assert.deepEqual(t.repairs, [{ call_id: 'call_b', name: 'apply_patch', added: ['begin', 'end'] }]);
+});
+
+test('stream: only apply_patch gets the envelope repair', () => {
+  const tools = [{ type: 'custom', name: 'notes' }];
+  const input = '*** Add File: primes.py\n+print(2)\n';
+  const { t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'call_n', function: { name: 'notes', arguments: JSON.stringify({ input }) } }] }),
+    chunk({}, 'tool_calls'),
+  ], tools);
+  assert.equal(t.response.output[0].input, input);
+  assert.deepEqual(t.repairs, []);
+});
+
+// ------------------------------------------------------ forced tool_choice
+
+const FORCE_TOOLS = [
+  { type: 'function', name: 'calculator', description: 'Math.', parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
+  { type: 'function', name: 'web_search', description: 'Search.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
+  { type: 'custom', name: 'apply_patch', description: 'Patch.' },
+];
+
+test('forced tool_choice: qwen38 sends a JSON schema of the calls, not the tool_choice', () => {
+  const chat = responsesToChat({ model: 'm', input: 'What is 7 times 8?', tools: FORCE_TOOLS, tool_choice: 'required' }, qwen);
+  const p = chat.payload;
+  assert.equal(p.tool_choice, undefined);
+  assert.equal(p.tools.length, 3);
+  assert.equal(chat.tools.forced, true);
+  assert.equal(p.response_format.type, 'json_schema');
+  assert.equal(p.response_format.json_schema.name, 'tool_calls');
+  const schema = p.response_format.json_schema.schema;
+  assert.equal(schema.type, 'array');
+  assert.equal(schema.minItems, 1);
+  assert.equal(schema.maxItems, undefined);
+  assert.deepEqual(schema.items.anyOf.map((v: Obj) => v.properties.name.enum[0]), ['calculator', 'web_search', 'apply_patch']);
+  assert.deepEqual(schema.items.anyOf[0].properties.parameters, FORCE_TOOLS[0].parameters);
+  assert.deepEqual(schema.items.anyOf[2].properties.parameters.required, ['input']);
+  // The note goes at the end, so the prompt prefix is the same as without a forced choice.
+  const plain = responsesToChat({ model: 'm', input: 'What is 7 times 8?', tools: FORCE_TOOLS, tool_choice: 'auto' }, qwen).payload;
+  assert.deepEqual(p.messages.slice(0, -1), plain.messages);
+  assert.deepEqual(p.messages.at(-1), { role: 'system', content: 'This reply must be a tool call. Do not reply with text. Use the tool that fits the request best.' });
+});
+
+test('forced tool_choice: a named tool allows one call to that tool; parallel_tool_calls false allows one call', () => {
+  const named = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: { type: 'function', name: 'web_search' } }, qwen).payload;
+  const schema = named.response_format.json_schema.schema;
+  assert.equal(schema.maxItems, 1);
+  assert.deepEqual(schema.items.properties.name.enum, ['web_search']);
+  assert.equal(named.messages.at(-1).content, 'This reply must be a call to the tool web_search. Do not reply with text.');
+  const single = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required', parallel_tool_calls: false }, qwen).payload;
+  assert.equal(single.response_format.json_schema.schema.maxItems, 1);
+  assert.equal(single.parallel_tool_calls, false);
+  const direct = forcedCallSchema(flattenTools(FORCE_TOOLS).tools, { type: 'function', function: { name: 'calculator' } }, false);
+  assert.deepEqual(direct.items.properties.name.enum, ['calculator']);
+});
+
+test('forced tool_choice: auto and none, native mode and llamacpp keep the tool_choice field', () => {
+  for (const choice of ['auto', 'none']) {
+    const chat = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: choice }, qwen);
+    assert.equal(chat.payload.tool_choice, choice);
+    assert.equal(chat.payload.response_format, undefined);
+    assert.equal(chat.tools.forced, undefined);
+  }
+  const native = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required' }, { ...qwen, forcedToolChoice: 'native' });
+  assert.equal(native.payload.tool_choice, 'required');
+  assert.equal(native.payload.response_format, undefined);
+  const bonsai = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required' }, llama);
+  assert.equal(bonsai.payload.tool_choice, 'required');
+  assert.equal(bonsai.tools.forced, undefined);
+});
+
+function runForced(chunks: Obj[], tools: unknown = FORCE_TOOLS) {
+  const { map } = flattenTools(tools);
+  map.forced = true;
+  const t = new ChatStreamTranslator('qwen3.8-flash-next', map);
+  const events = [...t.start()];
+  for (const c of chunks) events.push(...t.push(c));
+  events.push(...t.finishStream());
+  return { events, t };
+}
+
+test('forced stream: the JSON answer becomes function calls after the reasoning, with no message item', () => {
+  const json = '[\n  {"name": "calculator", "parameters": {"expression": "7 * 8"}},\n  {"name": "web_search", "parameters": {"query": "56"}}\n]';
+  const { events, t } = runForced([
+    chunk({ reasoning_content: 'I know it is 56.' }),
+    chunk({ content: json.slice(0, 12) }),
+    chunk({ content: json.slice(12) }),
+    chunk({}, 'stop'),
+  ]);
+  assert.equal(t.response.status, 'completed');
+  assert.deepEqual(t.response.output.map((i: Obj) => i.type), ['reasoning', 'function_call', 'function_call']);
+  assert.deepEqual(t.response.output.slice(1).map((i: Obj) => [i.name, i.arguments, i.status]), [
+    ['calculator', '{"expression":"7 * 8"}', 'completed'],
+    ['web_search', '{"query":"56"}', 'completed'],
+  ]);
+  assert(!types(events).some((e) => e.startsWith('response.output_text')));
+  // The reasoning item closes before the first call item opens.
+  const reasoningDone = events.findIndex((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'reasoning');
+  const callAdded = events.findIndex((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call');
+  assert(reasoningDone >= 0 && reasoningDone < callAdded);
+  events.forEach((e, i) => assert.equal(e.sequence_number, i));
+  assert.equal(new Set(t.response.output.slice(1).map((i: Obj) => i.call_id)).size, 2);
+});
+
+test('forced stream: a forced custom tool call is unwrapped and its patch repaired', () => {
+  const json = JSON.stringify([{ name: 'apply_patch', parameters: { input: '*** Add File: a.txt\n+hi' } }]);
+  const { t } = runForced([chunk({ content: json }), chunk({}, 'stop')]);
+  const call = t.response.output[0];
+  assert.equal(call.type, 'custom_tool_call');
+  assert.equal(call.input, '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n');
+  assert.equal(t.repairs.length, 1);
+});
+
+test('forced stream: text that is not a valid call fails the response, so the client can retry', () => {
+  for (const [content, pattern] of [
+    ['7 times 8 is **56**.', /no valid JSON/],
+    ['[{"parameters": {}}]', /without a name/],
+    ['', /no tool call/],
+  ] as const) {
+    const chunks = content ? [chunk({ content }), chunk({}, 'stop')] : [chunk({ reasoning_content: 'hm' }), chunk({}, 'stop')];
+    const { events, t } = runForced(chunks);
+    assert.equal(t.response.status, 'failed');
+    assert.match(t.response.error.message, pattern);
+    assert.equal(events.at(-1)!.type, 'response.failed');
+  }
+});
+
+test('forced stream: a native tool call delta still works, and a cut answer is incomplete without calls', () => {
+  const native = runForced([
+    chunk({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'calculator', arguments: '{"expression":"1"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]).t;
+  assert.equal(native.response.status, 'completed');
+  assert.equal(native.response.output[0].arguments, '{"expression":"1"}');
+  const cut = runForced([chunk({ content: '[{"name": "calcu' }), chunk({}, 'length')]).t;
+  assert.equal(cut.response.status, 'incomplete');
+  assert.equal(cut.response.output.length, 0);
 });

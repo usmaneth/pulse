@@ -256,6 +256,8 @@ export class Gateway {
         reasoning: m.reasoningTokens,
       },
       tool_calls: m.toolCalls,
+      tool_call_repairs: m.toolCallRepairs,
+      forced_tool_choice: m.forcedToolChoice,
       warmup: this.warmer.snapshot(),
       backends: this.routes.flatMap((route) => route.endpoints.map((e) => ({
         model: route.config.id,
@@ -427,6 +429,7 @@ export class Gateway {
         upstreamModel: route.upstreamModel,
         maxToolOutputChars: this.config.maxToolOutputChars,
         replayReasoning: this.config.replayReasoning,
+        forcedToolChoice: this.config.forcedToolChoice,
       });
     } catch (error) {
       return reject(error instanceof RequestError ? new HttpError(400, error.message) : error, request);
@@ -437,6 +440,7 @@ export class Gateway {
       this.trace(`{"request_id":${JSON.stringify(requestId)},"request":${JSON.stringify(request)},"payload":${payload}}`);
     }
     this.warmer.observe(route, chat.payload, request.prompt_cache_key);
+    if (chat.tools.forced) m.forcedToolChoice++;
 
     const streaming = request.stream === true;
     const controller = new AbortController();
@@ -583,6 +587,10 @@ export class Gateway {
       }
 
       const final = translator.finishStream();
+      for (const repair of translator.repairs) {
+        m.toolCallRepairs++;
+        log('info', 'repaired tool call', { request_id: requestId, ...repair });
+      }
       for (const item of translator.response.output) {
         // Codex answers such a call with a parse error. The warning shows how
         // often the backend sends one.

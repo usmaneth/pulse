@@ -62,4 +62,8 @@ export class GatewayMetrics {
   outputTokens = 0;
   reasoningTokens = 0;
   toolCalls = 0;
+  /** Tool calls that the gateway repaired, for example a patch without its envelope. */
+  toolCallRepairs = 0;
+  /** Requests with a forced tool_choice that went to the backend as a JSON schema. */
+  forcedToolChoice = 0;
 }
