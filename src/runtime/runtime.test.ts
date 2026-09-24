@@ -79,8 +79,9 @@ function withSortedDocker(map: Record<string, string>): Record<string, string> {
 const SNAP = '/root/.cache/huggingface/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/925d7be6c14c6c9442ef83e8f05b5a3c39304f69';
 const PKG = '/usr/local/lib/python3.12/dist-packages/vllm';
 
-// The effective key map of /models/usman/qwen38-flash/.env on spark1
-// (= profiles/spark1-best.env), from `env -i bash -c 'set -a; source .env; env'`.
+// The effective key map of the recipe .env on spark1, from
+// `env -i bash -c 'set -a; source .env; env'`. It equals profiles/spark1-best.env
+// of the recipe at spark-tuning c840e30 (MTP K=6).
 const SPARK1_BEST: Record<string, string> = {
   ABLIT: '0',
   BIND: '127.0.0.1',
@@ -114,26 +115,28 @@ const SPARK1_BEST: Record<string, string> = {
   MTP_DRAFT_VOCAB: 'files/draft_vocab_en_code_47k.txt',
   MTP_INDEX_SHARE: '1',
   MTP_K_SCHEDULE: '',
-  MTP_NUM_SPECULATIVE_TOKENS: '3',
+  MTP_NUM_SPECULATIVE_TOKENS: '6',
   PORT: '8888',
   SERVED_MODEL_NAME: 'qwen3.8-flash-next',
   YARN: '1',
   YARN_MAX_MODEL_LEN: '524288',
 };
 
-// The effective key map of /models/usman/qwen38-flash/.env.datagen on spark2.
+// The effective key map of the recipe .env.datagen on spark2. It keeps MTP K=3.
 const SPARK2_DATAGEN: Record<string, string> = {
   ...Object.fromEntries(Object.entries(SPARK1_BEST).filter(([k]) => !['MTP_DISABLE_BLOCK_DROP', 'MTP_INDEX_SHARE'].includes(k))),
   EXTRA_DOCKER_ARGS: '-e VLLM_USE_V2_MODEL_RUNNER=1 -v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache',
   HF_HOME: '/home/usman/.cache/huggingface',
   MAX_NUM_BATCHED_TOKENS: '2048',
   MAX_NUM_SEQS: '8',
+  MTP_NUM_SPECULATIVE_TOKENS: '3',
   REQUIRE_IDLE_GPU: 'false',
   YARN: '0',
 };
 
-// The effective key map of /models/usman/qwen38-flash/.env.capture on spark1, plus
+// The effective key map of the recipe .env.capture on spark1, plus
 // MEMWATCH_RELIEF: the recipe added the watchdog relief after that file was written.
+// It keeps MTP K=3.
 const SPARK1_CAPTURE: Record<string, string> = {
   ...Object.fromEntries(Object.entries(SPARK1_BEST).filter(([k]) => k !== 'MTP_DISABLE_BLOCK_DROP')),
   EXTRA_DOCKER_ARGS: [
@@ -144,6 +147,7 @@ const SPARK1_CAPTURE: Record<string, string> = {
     `-v /models/usman/qwen38-flash/files/ours/ar_speculator_capture.py:${PKG}/v1/worker/gpu/spec_decode/autoregressive/speculator.py:ro`,
   ].join(' '),
   MAX_NUM_BATCHED_TOKENS: '2048',
+  MTP_NUM_SPECULATIVE_TOKENS: '3',
 };
 
 // ---------------------------------------------------------------- env files
@@ -221,7 +225,7 @@ test('profiles: the shipped profiles load, and tp2 is experimental and render-on
   assert.equal(loadProfile(PROFILES, 'best').proofs.length, 3);
 });
 
-test('render: best on spark1 equals the effective spark1 .env (spark1-best.env)', () => {
+test('render: best on spark1 equals the effective spark1 .env (recipe spark1-best.env, K=6)', () => {
   const r = render('best', 'spark1');
   assert.deepEqual(withSortedDocker(r.map), withSortedDocker(SPARK1_BEST));
   assert.equal(r.expectedMaxModelLen, 524288);

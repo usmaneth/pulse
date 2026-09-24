@@ -125,7 +125,7 @@ The shipped profiles:
 
 | Profile | Use |
 |---|---|
-| `best` | The best single-Spark profile: FP8 draft head, block-drop backport, MTP index share, the r2 MTP shard, 524288 context. |
+| `best` | The best single-Spark profile: MTP K=6, FP8 draft head, block-drop backport, MTP index share, the r2 MTP shard, 524288 context. K=6 needs the recipe at spark-tuning c840e30 or later. |
 | `datagen` | Data generation: 8 sequences, 262144 context, the stock MTP head. |
 | `capture` | MTP hidden-state capture. Each request needs a unique `cache_salt` and `X-Request-Id: cap-<row>`. |
 | `tp2` | Draft only. Two nodes with tensor parallel size 2. It is render-only (see below). |
