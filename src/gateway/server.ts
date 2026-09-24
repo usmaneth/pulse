@@ -9,7 +9,9 @@
 //   GET  /metrics        JSON counters and per-backend latency
 //
 // When a backend becomes healthy again, the warmer (warmer.ts) sends it the
-// recent prompt prefixes as prefill-only requests.
+// recent prompt prefixes as prefill-only requests. After each turn, the turn
+// warmer (turnwarm.ts, off by default) makes the last block boundary of the
+// turn reusable for the next turn.
 
 import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -21,6 +23,7 @@ import type { BackendStream } from './backends.js';
 import { GatewayMetrics } from './metrics.js';
 import { log } from './log.js';
 import { sseData } from './sse.js';
+import { TurnWarmer } from './turnwarm.js';
 import { Warmer } from './warmer.js';
 import {
   BackendStreamError, ChatStreamTranslator, RequestError, isJsonObjectText, newId, responsesToChat, sseFrame,
@@ -74,6 +77,7 @@ export class Gateway {
   readonly metrics = new GatewayMetrics();
   readonly routes: ModelRoute[];
   readonly warmer: Warmer;
+  readonly turnWarmer: TurnWarmer;
   private readonly health: HealthChecker;
   private server: http.Server | null = null;
   private readonly inflight = new Set<AbortController>();
@@ -85,6 +89,7 @@ export class Gateway {
   constructor(readonly config: GatewayConfig) {
     this.routes = config.models.map((m) => new ModelRoute(m));
     this.warmer = new Warmer(config.warmup, config, () => this.inflight.size);
+    this.turnWarmer = new TurnWarmer(config.turnWarm, config, () => this.inflight.size, this.warmer);
     for (const route of this.routes) {
       for (const endpoint of route.endpoints) {
         endpoint.onHealthy = (e, previous) => this.warmer.onHealthy(route, e, previous);
@@ -140,6 +145,7 @@ export class Gateway {
   async stop(): Promise<void> {
     this.draining = true;
     this.health.stop();
+    this.turnWarmer.stop();
     const warmerStopped = this.warmer.stop();
     const closed = new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     this.server?.closeIdleConnections();
@@ -259,6 +265,7 @@ export class Gateway {
       tool_call_repairs: m.toolCallRepairs,
       forced_tool_choice: m.forcedToolChoice,
       warmup: this.warmer.snapshot(),
+      turn_warm: this.turnWarmer.snapshot(),
       backends: this.routes.flatMap((route) => route.endpoints.map((e) => ({
         model: route.config.id,
         name: e.name,
@@ -440,6 +447,7 @@ export class Gateway {
       this.trace(`{"request_id":${JSON.stringify(requestId)},"request":${JSON.stringify(request)},"payload":${payload}}`);
     }
     this.warmer.observe(route, chat.payload, request.prompt_cache_key);
+    this.turnWarmer.onRequest(request.prompt_cache_key);
     if (chat.tools.forced) m.forcedToolChoice++;
 
     const streaming = request.stream === true;
@@ -452,7 +460,8 @@ export class Gateway {
     this.inflight.add(controller);
     m.inFlight++;
     // A real request goes first. The server keeps the blocks that the warm
-    // request completed, so this request still gets them.
+    // request completed, so this request still gets them. This also aborts
+    // a turn warm request.
     this.warmer.yieldToRealRequest();
 
     const translator = new ChatStreamTranslator(String(request.model), chat.tools, this.config.emitReasoning);
@@ -644,6 +653,10 @@ export class Gateway {
       release();
       if (endpoint) endpoint.stats.total.add(performance.now() - started);
       this.record(outcome, translator.response);
+      if ((outcome === 'completed' || outcome === 'incomplete') && endpoint) {
+        // Codex runs the tool now, and the GPU is idle.
+        this.turnWarmer.afterResponse(route, endpoint, chat.payload, request.prompt_cache_key, translator.response.usage);
+      }
       log(outcome === 'failed' ? 'warn' : 'info', 'response', {
         request_id: requestId,
         response_id: translator.response.id,

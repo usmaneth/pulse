@@ -21,6 +21,8 @@ The gateway is stateless. Codex sends the full history on every turn
 | `src/gateway/backends.ts` | endpoints, health checks, failover order, backend HTTP client |
 | `src/gateway/server.ts` | HTTP server: `/v1/responses`, `/v1/models`, `/health`, `/metrics` |
 | `src/gateway/config.ts` | configuration from file and environment |
+| `src/gateway/warmer.ts` | cache warmup after a backend restart |
+| `src/gateway/turnwarm.ts` | turn warmer: makes the last block boundary of each turn reusable |
 | `src/gateway/index.ts` | entry point, graceful shutdown |
 | `config/qwen38-gateway.json` | production configuration |
 | `deploy/systemd/pulse-qwen38.service` | systemd user unit |
@@ -382,6 +384,10 @@ curl -s http://127.0.0.1:8800/health | jq
   of the calls)
 - `warmup`: triggers, requests, completed, aborted, errors, skipped, prompt
   and cached tokens of the warm requests, and the last warm result
+- `turn_warm`: the turn warmer (see Turn warmer): enabled, block_tokens,
+  triggers, requests, completed, aborted, timeouts, errors, skipped (by
+  reason), queued, warmed_tokens, gain_tokens, prompt and cached tokens of the
+  warm requests, time_ms, block_mismatch, next_turn, and the last warm result
 - `backends[]`: per endpoint health, requests, errors, failovers, in_flight,
   and latency windows (count, mean, p50, p95, recent maximum) for the
   response headers, the first token and the full request
@@ -429,6 +435,90 @@ change also at shutdown.
 curl -s http://127.0.0.1:8800/metrics | jq .warmup
 ```
 
+## Turn warmer
+
+The turn warmer is off by default. Set `PULSE_GATEWAY_TURN_WARM=1` to turn it
+on.
+
+The problem: the vLLM prefix cache of this hybrid model can reuse a Mamba
+state only at a block boundary where a scheduler step ended. The last prefill
+chunk of a prompt ends at the end of the prompt, so a block boundary that this
+chunk crosses is not reusable by the next request. A boundary that the decode
+crosses is reusable. Most Codex turns come after a tool output, and the
+prefill of that tool output usually crosses a boundary. The next turn then
+prefills again from the older boundary: up to one block, about 0.85 s at 1728
+tokens (about 0.49 ms per uncached token on spark1).
+
+The fix: after each completed response, streaming or not, Codex runs the tool
+and the GPU is idle. The gateway then sends one prefill-only request that ends
+exactly on the last boundary of the turn. A prefill that ends on a boundary
+keeps the state at that boundary, so the next turn prefills only the new tool
+output.
+
+With the usage of the response (prompt tokens P, cached tokens C, output
+tokens D) and the block size, the target is B = floor(P / block) x block. The
+gateway skips the turn in these cases (the `skipped` reason in brackets):
+
+- B <= C: the prefill crossed no boundary, or B = P: the prefill ended on the
+  boundary (`no_boundary`).
+- The decode crossed a boundary after B, so that later boundary is reusable
+  (`decode_crossed`). The last output token is not fed back, so the decode
+  covers the positions up to P + D - 1.
+- B - C is less than `PULSE_GATEWAY_TURN_WARM_MIN_GAIN_TOKENS` (`small_gain`).
+- The response has no usage (`no_usage`), or the endpoint is unhealthy
+  (`unhealthy`).
+
+The warm request:
+
+1. The gateway sends the same chat payload to vLLM `/tokenize` (messages,
+   tools, template arguments with the effort, generation prompt on).
+2. When the token count is not P, the render does not match the prompt, and
+   the gateway skips the turn (`count_mismatch`, with an `info` log line).
+3. The gateway sends the first B tokens to `/v1/completions` with
+   `max_tokens` 1. The log line `turn warm` shows the prompt and cached tokens
+   of the turn, the target, the prompt and cached tokens of the warm request,
+   and the time.
+
+Timing and safety:
+
+- The warm request goes only when the gateway has no real request in flight
+  and the startup warmer does not warm the endpoint. One warm request goes at
+  a time. The most recent turn goes first.
+- A real request aborts the warm request in flight (the same abort as the
+  startup warmer). A new request of the same session removes its queued warm
+  (`superseded`). When a request of another session aborts the warm, the warm
+  goes again when the gateway is idle, 3 times at most.
+- `PULSE_GATEWAY_TURN_WARM_TIMEOUT_MS` limits each warm request. A queued warm
+  that cannot start in 5 minutes goes (`expired`). The queue keeps 8 sessions
+  (`queue_full`).
+- The warm request does not delay a real request. vLLM can still finish the
+  step of the warm request that runs when the real request arrives.
+
+The block is the prefix-cache block of the server, from the vLLM log line
+`Setting attention block size to N tokens to ensure that attention page size
+is >= mamba page size`: 1728 at MTP K=6, 1680 at MTP K=4. Set it with
+`PULSE_GATEWAY_PREFIX_BLOCK_TOKENS`. The `block_size` of the vLLM
+`cache_config_info` metric is not this block. The cached token counts of real
+responses are multiples of the block. When one is not, the gateway logs a
+warning once and counts `block_mismatch`.
+
+The `next_turn` counters show if the next turn of the session found the
+boundary: `after_warm` (the warm completed), `without_warm` (the warm was
+skipped or aborted) and `after_decode` (the decode crossed the boundary). Each
+has `hit` and `miss`. A turn with a prompt that is not longer than the
+boundary is not counted.
+
+Cost: the warm request prefills B - C tokens on an idle GPU. vLLM limits a
+cache hit to the prompt length minus one token, so the warm request also
+prefills one block when B is already reusable. If a later vLLM keeps the
+boundaries that a prefill crosses (vLLM #57616 is a fix of this type),
+`next_turn.without_warm.hit` goes up. The turn warmer is then not necessary,
+and you can turn it off.
+
+```
+curl -s http://127.0.0.1:8800/metrics | jq .turn_warm
+```
+
 ## Configuration
 
 The unit reads `config/qwen38-gateway.json`. Environment variables override
@@ -464,6 +554,10 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_WARMUP_SESSIONS` | `1` | recent sessions to warm after a restart, 0 warms the prefixes only |
 | `PULSE_GATEWAY_WARMUP_SESSION_MAX_AGE_MS` | `1800000` | do not warm a session older than this |
 | `PULSE_GATEWAY_WARMUP_STATE_FILE` | none | keep the warm prefixes in this file (mode 0600; it holds the system prompt) |
+| `PULSE_GATEWAY_TURN_WARM` | `0` | `1` turns the turn warmer on (see Turn warmer) |
+| `PULSE_GATEWAY_PREFIX_BLOCK_TOKENS` | `1728` | prefix-cache block of the server: 1728 at MTP K=6, 1680 at K=4 |
+| `PULSE_GATEWAY_TURN_WARM_MIN_GAIN_TOKENS` | `256` | skip a turn when the warm saves fewer tokens than this |
+| `PULSE_GATEWAY_TURN_WARM_TIMEOUT_MS` | `30000` | limit for one turn warm request |
 | `PULSE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The idle and headers limits are long on purpose. vLLM sends no byte while it

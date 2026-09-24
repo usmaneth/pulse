@@ -8,6 +8,8 @@
 
 import { readFileSync } from 'node:fs';
 import type { ForcedToolChoiceMode, ProfileName } from './translate.js';
+import { defaultTurnWarmConfig } from './turnwarm.js';
+import type { TurnWarmConfig } from './turnwarm.js';
 import { defaultWarmupConfig } from './warmer.js';
 import type { WarmupConfig } from './warmer.js';
 
@@ -87,6 +89,8 @@ export interface GatewayConfig {
   shutdownGraceMs: number;
   /** Prefill of the recent prompt prefixes when a backend becomes healthy. */
   warmup: WarmupConfig;
+  /** Prefill that makes the last block boundary of each turn reusable. */
+  turnWarm: TurnWarmConfig;
 }
 
 export const DEFAULT_QWEN_MODEL = 'qwen3.8-flash-next';
@@ -120,6 +124,7 @@ export function defaultConfig(): GatewayConfig {
     healthTimeoutMs: 3_000,
     shutdownGraceMs: 30_000,
     warmup: defaultWarmupConfig(),
+    turnWarm: defaultTurnWarmConfig(),
   };
 }
 
@@ -177,6 +182,9 @@ export function validateConfig(config: GatewayConfig): GatewayConfig {
   if (config.forcedToolChoice !== undefined && config.forcedToolChoice !== 'native' && config.forcedToolChoice !== 'grammar') {
     throw new Error(`forcedToolChoice must be native or grammar, not ${String(config.forcedToolChoice)}`);
   }
+  if (!Number.isInteger(config.turnWarm.blockTokens) || config.turnWarm.blockTokens <= 0) {
+    throw new Error(`the prefix block must be a positive integer, not ${String(config.turnWarm.blockTokens)}`);
+  }
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) {
     throw new Error(`invalid port: ${config.port}`);
   }
@@ -193,8 +201,10 @@ export function loadConfig(
   if (file) {
     const fromFile = JSON.parse(readFileSync(file, 'utf8')) as Partial<GatewayConfig>;
     const warmup = { ...config.warmup, ...fromFile.warmup };
+    const turnWarm = { ...config.turnWarm, ...fromFile.turnWarm };
     Object.assign(config, fromFile);
     config.warmup = warmup;
+    config.turnWarm = turnWarm;
   }
 
   if (env.PULSE_GATEWAY_HOST) config.host = env.PULSE_GATEWAY_HOST;
@@ -233,5 +243,9 @@ export function loadConfig(
   config.warmup.sessions = num(env, 'PULSE_GATEWAY_WARMUP_SESSIONS') ?? config.warmup.sessions;
   config.warmup.sessionMaxAgeMs = num(env, 'PULSE_GATEWAY_WARMUP_SESSION_MAX_AGE_MS') ?? config.warmup.sessionMaxAgeMs;
   if (env.PULSE_GATEWAY_WARMUP_STATE_FILE) config.warmup.stateFile = env.PULSE_GATEWAY_WARMUP_STATE_FILE;
+  if (env.PULSE_GATEWAY_TURN_WARM) config.turnWarm.enabled = env.PULSE_GATEWAY_TURN_WARM !== '0';
+  config.turnWarm.blockTokens = num(env, 'PULSE_GATEWAY_PREFIX_BLOCK_TOKENS') ?? config.turnWarm.blockTokens;
+  config.turnWarm.minGainTokens = num(env, 'PULSE_GATEWAY_TURN_WARM_MIN_GAIN_TOKENS') ?? config.turnWarm.minGainTokens;
+  config.turnWarm.timeoutMs = num(env, 'PULSE_GATEWAY_TURN_WARM_TIMEOUT_MS') ?? config.turnWarm.timeoutMs;
   return validateConfig(config);
 }

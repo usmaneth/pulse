@@ -111,7 +111,26 @@ export function postChat(
   timeouts: RequestTimeouts,
   signal: AbortSignal,
 ): Promise<BackendStream> {
-  const url = new URL(`${endpoint.config.baseUrl}/chat/completions`);
+  return postJson(new URL(`${endpoint.config.baseUrl}/chat/completions`), payload, timeouts, signal);
+}
+
+/**
+ * The URL of a server route that is not under /v1, for example vLLM
+ * `/tokenize`. The base URL of an endpoint ends in /v1, and the route is
+ * next to that /v1.
+ */
+export function serverUrl(endpoint: Endpoint, route: string): URL {
+  const base = endpoint.config.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
+  return new URL(`${base}${route}`);
+}
+
+/** POST a JSON body to a backend URL. The rules of postChat apply. */
+export function postJson(
+  url: URL,
+  payload: Obj | string,
+  timeouts: RequestTimeouts,
+  signal: AbortSignal,
+): Promise<BackendStream> {
   const body = Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload));
   const client = url.protocol === 'https:' ? https : http;
   const started = performance.now();

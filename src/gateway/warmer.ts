@@ -201,6 +201,22 @@ export class Warmer {
   }
 
   /**
+   * Add the controller of another warm request (for example of the turn
+   * warmer), so that a real request and the shutdown abort it too. Call the
+   * returned function when the request ends.
+   */
+  track(controller: AbortController): () => void {
+    this.current.add(controller);
+    if (this.stopped) controller.abort(new Error('the gateway is shutting down'));
+    return () => { this.current.delete(controller); };
+  }
+
+  /** True while the warmer warms this endpoint after a restart. */
+  isWarming(endpoint: Endpoint): boolean {
+    return this.running.has(endpoint);
+  }
+
+  /**
    * Called when an endpoint becomes healthy. `previous` is false after a
    * failure and null at the first health check of the process.
    *
