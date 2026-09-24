@@ -185,6 +185,9 @@ export function validateConfig(config: GatewayConfig): GatewayConfig {
   if (!Number.isInteger(config.turnWarm.blockTokens) || config.turnWarm.blockTokens <= 0) {
     throw new Error(`the prefix block must be a positive integer, not ${String(config.turnWarm.blockTokens)}`);
   }
+  if (!Number.isInteger(config.turnWarm.stepBlocks) || config.turnWarm.stepBlocks <= 0) {
+    throw new Error(`the turn warm step must be a positive integer of blocks, not ${String(config.turnWarm.stepBlocks)}`);
+  }
   if (!Number.isInteger(config.port) || config.port < 0 || config.port > 65535) {
     throw new Error(`invalid port: ${config.port}`);
   }
@@ -247,5 +250,6 @@ export function loadConfig(
   config.turnWarm.blockTokens = num(env, 'PULSE_GATEWAY_PREFIX_BLOCK_TOKENS') ?? config.turnWarm.blockTokens;
   config.turnWarm.minGainTokens = num(env, 'PULSE_GATEWAY_TURN_WARM_MIN_GAIN_TOKENS') ?? config.turnWarm.minGainTokens;
   config.turnWarm.timeoutMs = num(env, 'PULSE_GATEWAY_TURN_WARM_TIMEOUT_MS') ?? config.turnWarm.timeoutMs;
+  config.turnWarm.stepBlocks = num(env, 'PULSE_GATEWAY_TURN_WARM_STEP_BLOCKS') ?? config.turnWarm.stepBlocks;
   return validateConfig(config);
 }

@@ -1,7 +1,7 @@
 // Turn warmer. After a response, while Codex runs the tool and the GPU is
-// idle, the gateway sends one prefill-only request that ends exactly on the
-// last prefix-cache block boundary of that turn. The next turn of the session
-// then gets the cache hit at that boundary.
+// idle, the gateway sends prefill-only requests that end exactly on the
+// prefix-cache block boundaries that the prefill of that turn crossed. The
+// next turn of the session then gets the cache hit at the last boundary.
 //
 // Why: with the Mamba "align" prefix cache of vLLM (TTFT.md, finding F4), a
 // block boundary is reusable only when a scheduler step ended on it. The
@@ -10,28 +10,53 @@
 // is reusable. Most Codex turns come after a tool output, and the prefill of
 // that output usually crosses a boundary. Without the warm, the next turn
 // prefills again from the older boundary: up to one block, about 0.85 s at
-// 1728 tokens (finding F1: about 0.49 ms per uncached token).
+// 1728 tokens (finding F1: about 0.49 ms per uncached token), and more when
+// the output crossed more than one boundary.
 //
 // Rules:
 // - With the usage of the response (prompt P, cached C, completion D) and the
 //   block size, the target is B = floor(P / block) * block. The warmer skips
 //   the turn when B <= C or B = P (no boundary crossed in the prefill), when
-//   the decode crossed a later boundary (that one is reusable), or when B - C
-//   is less than the minimum gain.
-// - The warm request renders the same chat payload with vLLM /tokenize. When
-//   the token count is not P, the render is not the same, and the warmer
-//   skips the turn. Else it sends the first B tokens to /v1/completions with
-//   max_tokens 1. That prefill ends on B, so vLLM keeps the state at B.
-// - The warmer sends one warm request at a time, only when the gateway has no
-//   real request in flight and the startup warmer does not warm the endpoint.
-//   A real request aborts the warm request (Warmer.yieldToRealRequest). A new
-//   request of the same session makes its queued warm obsolete. A time limit
-//   applies to each warm request.
-// - vLLM limits a cache hit to the prompt length minus one token. So the warm
-//   request of B tokens gets at most the boundary before B from the cache, and
-//   it prefills at least one block. If a later vLLM keeps these boundaries, the
+//   the decode crossed a later boundary (that one is reusable), or when the
+//   gain is less than the minimum.
+// - A boundary that a prefill crosses for the second time is reusable. The
+//   A/B chains without the warm agree with this rule for each turn: turn k
+//   hits the last boundary that turns k-1 and k-2 both crossed. So when the
+//   prompt continues the prompt P' of the previous turn, the boundaries up to
+//   floor(P' / block) * block are reusable after this turn, and the warm
+//   starts at the later of C and that boundary. When it is B, the warmer
+//   skips the turn (`crossed_before`).
+// - The warm renders the same chat payload with vLLM /tokenize. When the token
+//   count is not P, the render is not the same, and the warmer skips the turn.
+//   Else it prefills to B in stages. Each stage is one /v1/completions request
+//   with max_tokens 1 and a prompt of the first X tokens, where X is the next
+//   boundary (see stepBlocks), and B last. A stage ends on X, so vLLM keeps
+//   the state at X, and the next stage gets the cache hit at X.
+// - Stages bound the time that a real request can wait. vLLM does not stop a
+//   scheduler step that it started, so an abort of the client does not give
+//   the GPU back sooner: a real request that arrives during a warm step waits
+//   for the end of that step. In the first A/B a warm of two blocks in one
+//   step added 1.8 s to a request with another prefix that arrived 0.3 s
+//   after the warm started. With stages of one block, the wait is at most one
+//   block (about 1 s on spark1). The aborted warms of that A/B still gave the
+//   next turn of the session the hit at B, so vLLM completes the step and
+//   keeps the state. Thus a real request does not abort a stage, and the
+//   warmer starts no new stage while a real request is in flight.
+// - The /tokenize request is CPU work in the API server, and a real request
+//   aborts it (Warmer.yieldToRealRequest).
+// - The warmer runs one warm at a time, only when the gateway has no real
+//   request in flight and the startup warmer does not warm the endpoint. A
+//   new request of the same session makes its warm obsolete. A time limit
+//   applies to each request of a warm.
+// - vLLM limits a cache hit to the prompt length minus one token. So a stage
+//   of X tokens gets at most the boundary before X from the cache, and it
+//   prefills at least one block. If a later vLLM keeps these boundaries, the
 //   `next_turn.without_warm.hit` counter shows it, and the warmer is then not
 //   necessary.
+// - The prefill of a real request that took more than one scheduler step
+//   (more than max-num-batched-tokens) ended steps on boundaries that are
+//   reusable already. The stages prefill these blocks again. The GPU is idle
+//   at that time, but the warm takes longer to reach B.
 
 import { postJson, serverUrl } from './backends.js';
 import type { BackendStream, Endpoint, ModelRoute } from './backends.js';
@@ -52,14 +77,19 @@ export interface TurnWarmConfig {
   blockTokens: number;
   /** Skip a turn when the warm saves the next turn fewer tokens than this. */
   minGainTokens: number;
-  /** Time limit for one warm request (tokenize and prefill). */
+  /** Time limit for one request of a warm (the tokenize or one stage). */
   timeoutMs: number;
+  /**
+   * The blocks that one stage prefills. One block is one scheduler step of
+   * about 1 s, which is the longest time that a real request waits.
+   */
+  stepBlocks: number;
   /** Skip a payload when its /tokenize JSON text is longer than this. */
   maxPayloadChars: number;
 }
 
 export function defaultTurnWarmConfig(): TurnWarmConfig {
-  return { enabled: false, blockTokens: 1728, minGainTokens: 256, timeoutMs: 30_000, maxPayloadChars: 4_000_000 };
+  return { enabled: false, blockTokens: 1728, minGainTokens: 256, timeoutMs: 30_000, stepBlocks: 1, maxPayloadChars: 4_000_000 };
 }
 
 export interface TurnUsage {
@@ -68,18 +98,28 @@ export interface TurnUsage {
   completionTokens: number;
 }
 
-export type TurnWarmSkip = 'no_usage' | 'no_boundary' | 'decode_crossed' | 'small_gain';
+export type TurnWarmSkip = 'no_usage' | 'no_boundary' | 'decode_crossed' | 'crossed_before' | 'small_gain';
 
 export type TurnWarmPlan =
-  | { warm: true; target: number }
-  | { warm: false; reason: TurnWarmSkip; /** The boundary that the decode crossed. */ boundary?: number };
+  | { warm: true; target: number; /** The warm starts here: C, or a later boundary that is reusable already. */ from: number }
+  | { warm: false; reason: TurnWarmSkip; /** The boundary that the decode or an earlier prefill made reusable. */ boundary?: number };
 
 /**
  * The decision for one completed turn. The decode feeds each output token
  * except the last one back into the model, so the decode materializes the
  * states up to position P + D - 1.
+ *
+ * `previous` is the usage of the previous turn of the session. A boundary
+ * that a prefill crosses for the second time is reusable (TTFT.md, F4: B2
+ * after B hit the boundary; the A/B chains agree with this for each turn).
+ * The previous prefill crossed each boundary up to floor(P' / block) * block.
+ * When this prompt continues the previous one, these boundaries are reusable
+ * after this turn, and the warm starts after them. A longer prompt and a
+ * cached part that did not shrink show that the prompt continues the previous
+ * one (a new effort level or a compaction changes the prefix, and then C
+ * shrinks or P shrinks).
  */
-export function planTurnWarm(usage: TurnUsage, blockTokens: number, minGainTokens: number): TurnWarmPlan {
+export function planTurnWarm(usage: TurnUsage, blockTokens: number, minGainTokens: number, previous?: TurnUsage | null): TurnWarmPlan {
   const { promptTokens: p, cachedTokens: c, completionTokens: d } = usage;
   if (!(p > 0) || !(blockTokens > 0)) return { warm: false, reason: 'no_usage' };
   const target = Math.floor(p / blockTokens) * blockTokens;
@@ -87,8 +127,13 @@ export function planTurnWarm(usage: TurnUsage, blockTokens: number, minGainToken
   if (target <= c || target === p) return { warm: false, reason: 'no_boundary' };
   const decoded = d > 1 ? Math.floor((p + d - 1) / blockTokens) * blockTokens : target;
   if (decoded > target) return { warm: false, reason: 'decode_crossed', boundary: decoded };
-  if (target - c < minGainTokens) return { warm: false, reason: 'small_gain' };
-  return { warm: true, target };
+  let from = c;
+  if (previous && p > previous.promptTokens && c >= previous.cachedTokens) {
+    from = Math.max(c, Math.min(target, Math.floor(previous.promptTokens / blockTokens) * blockTokens));
+  }
+  if (from >= target) return { warm: false, reason: 'crossed_before', boundary: target };
+  if (target - from < minGainTokens) return { warm: false, reason: 'small_gain' };
+  return { warm: true, target, from };
 }
 
 /** Read the usage of a Responses object. */
@@ -102,17 +147,47 @@ export function turnUsage(usage: Obj | null | undefined): TurnUsage | null {
 }
 
 /**
- * The /tokenize body for a chat payload. vLLM gives `reasoning_effort` of a
- * chat request to the chat template as a template argument, and /tokenize has
- * no such field, so it goes into `chat_template_kwargs`.
+ * The /tokenize body for a chat payload. It does the two changes that vLLM
+ * does to a chat request and not to a /tokenize request:
+ * - vLLM gives `reasoning_effort` to the chat template as a template
+ *   argument. /tokenize has no such field, so it goes into
+ *   `chat_template_kwargs`.
+ * - The chat request renames the `reasoning_content` field of a message to
+ *   `reasoning` (ChatCompletionRequest._normalize_messages_before), and the
+ *   template renderer reads only `reasoning`. /tokenize does not rename it, so
+ *   without this change the render drops the replayed reasoning, the count is
+ *   less than P, and every turn after a reasoning turn is skipped.
  */
 export function tokenizeRequest(payload: Obj): Obj {
   const kwargs: Obj = { ...payload.chat_template_kwargs };
   if (payload.reasoning_effort != null) kwargs.reasoning_effort = payload.reasoning_effort;
-  const body: Obj = { model: payload.model, messages: payload.messages, add_generation_prompt: true };
+  const body: Obj = { model: payload.model, messages: renameReasoning(payload.messages), add_generation_prompt: true };
   if (Array.isArray(payload.tools) && payload.tools.length) body.tools = payload.tools;
   if (Object.keys(kwargs).length) body.chat_template_kwargs = kwargs;
   return body;
+}
+
+/** Copy the messages with `reasoning_content` renamed to `reasoning`, as vLLM does for a chat request. */
+function renameReasoning(messages: unknown): unknown {
+  if (!Array.isArray(messages) || !messages.some((m) => m?.reasoning_content != null)) return messages;
+  return messages.map((message) => {
+    if (message?.reasoning_content == null) return message;
+    const { reasoning_content: reasoning, ...rest } = message as Obj;
+    return rest.reasoning == null ? { ...rest, reasoning } : rest;
+  });
+}
+
+/**
+ * The ends of the stages of a warm from `from` (a reusable point) to
+ * `target` (a boundary): each boundary `stepBlocks` blocks after the previous
+ * one, and `target` last.
+ */
+export function warmStages(from: number, target: number, blockTokens: number, stepBlocks: number): number[] {
+  const step = Math.max(1, Math.floor(stepBlocks)) * blockTokens;
+  const stages: number[] = [];
+  for (let end = Math.floor(from / blockTokens) * blockTokens + step; end < target; end += step) stages.push(end);
+  if (target > from) stages.push(target);
+  return stages;
 }
 
 /** The /v1/completions body of a warm request: the first `target` tokens, one output token. */
@@ -124,7 +199,7 @@ export function turnWarmPayload(model: unknown, tokens: number[], target: number
 const MAX_JOBS = 8;
 /** Remember the request count and the last boundary of this many sessions. */
 const MAX_SESSIONS = 256;
-/** Try a warm again after this many aborts at most. */
+/** Stop a warm after it yielded to a real request this many times. */
 const MAX_ATTEMPTS = 3;
 /** Drop a queued warm that could not start in this time. */
 const JOB_MAX_AGE_MS = 5 * 60_000;
@@ -139,25 +214,46 @@ interface Job {
   promptTokens: number;
   cachedTokens: number;
   target: number;
+  /** The reusable point where the warm starts. */
+  from: number;
+  /** The rendered prompt, after the /tokenize request. */
+  tokens?: number[];
+  /** The last boundary that a stage reached (at first, the cached part C). */
+  reached: number;
+  stages: number;
+  /** Totals of the stages, for the log. */
+  warmPromptTokens: number;
+  warmCachedTokens: number;
+  elapsedMs: number;
+  tokenizeMs: number;
   /** The request count of the session when the job was made. */
   seq: number;
   at: number;
   attempts: number;
 }
 
-type Evidence = { boundary: number; kind: 'after_warm' | 'without_warm' | 'after_decode' };
+type Evidence = { boundary: number; kind: 'after_warm' | 'without_warm' | 'after_decode' | 'crossed_before' };
 
 interface Stats {
   triggers: number;
+  /** Stage requests sent. */
   requests: number;
+  /** Stage requests that completed. */
+  stages: number;
+  /** Warms that reached their target B. */
   completed: number;
+  /** /tokenize requests that a real request aborted. */
   aborted: number;
+  /** Warms that stopped between two stages for a real request. */
+  yielded: number;
+  /** Real requests that started while a stage was in flight (they wait at most for that stage). */
+  overlaps: number;
   timeouts: number;
   errors: number;
   skipped: Record<string, number>;
-  /** Tokens that the warm requests prefilled. */
+  /** Tokens that the stages prefilled. */
   warmedTokens: number;
-  /** Tokens that the next turns do not prefill again after a completed warm (B - C). */
+  /** Tokens between the start of each warm and the boundary that its stages reached. */
   gainTokens: number;
   promptTokens: number;
   cachedTokens: number;
@@ -168,17 +264,27 @@ interface Stats {
 
 type WarmerHooks = Pick<Warmer, 'track' | 'isWarming'>;
 
+type RunResult = 'done' | 'yielded' | 'skip' | 'error';
+
 export class TurnWarmer {
   readonly stats: Stats = {
-    triggers: 0, requests: 0, completed: 0, aborted: 0, timeouts: 0, errors: 0, skipped: {},
+    triggers: 0, requests: 0, stages: 0, completed: 0, aborted: 0, yielded: 0, overlaps: 0,
+    timeouts: 0, errors: 0, skipped: {},
     warmedTokens: 0, gainTokens: 0, promptTokens: 0, cachedTokens: 0, timeMs: 0, blockMismatch: 0,
-    nextTurn: { after_warm: { hit: 0, miss: 0 }, without_warm: { hit: 0, miss: 0 }, after_decode: { hit: 0, miss: 0 } },
+    nextTurn: {
+      after_warm: { hit: 0, miss: 0 }, without_warm: { hit: 0, miss: 0 },
+      after_decode: { hit: 0, miss: 0 }, crossed_before: { hit: 0, miss: 0 },
+    },
   };
   private readonly jobs = new Map<string, Job>();
   private readonly seq = new Map<string, number>();
   private readonly evidence = new Map<string, Evidence>();
+  /** The usage of the last turn of each session. */
+  private readonly previous = new Map<string, TurnUsage>();
   private pumping = false;
   private stopped = false;
+  /** The controller of the stage request in flight. */
+  private stage: AbortController | null = null;
   private last: Obj | null = null;
 
   constructor(
@@ -194,6 +300,7 @@ export class TurnWarmer {
     if (!this.config.enabled) return;
     const key = sessionOf(sessionKey);
     bump(this.seq, key, (this.seq.get(key) ?? 0) + 1);
+    if (this.stage) this.stats.overlaps++;
     if (this.jobs.delete(key)) this.skip('superseded');
   }
 
@@ -207,9 +314,12 @@ export class TurnWarmer {
     this.checkBlock(usage.cachedTokens);
     this.settle(key, usage);
 
-    const plan = planTurnWarm(usage, this.config.blockTokens, this.config.minGainTokens);
+    const plan = planTurnWarm(usage, this.config.blockTokens, this.config.minGainTokens, this.previous.get(key));
+    bump(this.previous, key, usage);
     if (!plan.warm) {
-      if (plan.boundary) bump(this.evidence, key, { boundary: plan.boundary, kind: 'after_decode' });
+      if (plan.boundary) {
+        bump(this.evidence, key, { boundary: plan.boundary, kind: plan.reason === 'crossed_before' ? 'crossed_before' : 'after_decode' });
+      }
       return this.skip(plan.reason);
     }
     if (endpoint.healthy === false) return this.skip('unhealthy');
@@ -218,6 +328,7 @@ export class TurnWarmer {
     this.jobs.set(key, {
       session: key, endpoint, payload,
       promptTokens: usage.promptTokens, cachedTokens: usage.cachedTokens, target: plan.target,
+      from: plan.from, reached: plan.from, stages: 0, warmPromptTokens: 0, warmCachedTokens: 0, elapsedMs: 0, tokenizeMs: 0,
       seq: this.seq.get(key) ?? 0, at: Date.now(), attempts: 0,
     });
     while (this.jobs.size > MAX_JOBS) {
@@ -233,10 +344,14 @@ export class TurnWarmer {
       enabled: this.config.enabled,
       block_tokens: this.config.blockTokens,
       min_gain_tokens: this.config.minGainTokens,
+      step_blocks: this.config.stepBlocks,
       triggers: s.triggers,
       requests: s.requests,
+      stages: s.stages,
       completed: s.completed,
       aborted: s.aborted,
+      yielded: s.yielded,
+      overlaps: s.overlaps,
       timeouts: s.timeouts,
       errors: s.errors,
       skipped: { ...s.skipped },
@@ -251,15 +366,17 @@ export class TurnWarmer {
         after_warm: { ...s.nextTurn.after_warm },
         without_warm: { ...s.nextTurn.without_warm },
         after_decode: { ...s.nextTurn.after_decode },
+        crossed_before: { ...s.nextTurn.crossed_before },
       },
       last: this.last,
     };
   }
 
-  /** Drop the queue. The Warmer aborts the warm request in flight. */
+  /** Drop the queue and abort the stage in flight. The Warmer aborts the /tokenize request in flight. */
   stop(): void {
     this.stopped = true;
     this.jobs.clear();
+    this.stage?.abort(new Error('the gateway is shutting down'));
   }
 
   /** Resolves when no warm is queued or in flight. For tests. */
@@ -320,27 +437,63 @@ export class TurnWarmer {
         }
         this.jobs.delete(job.session);
         const result = await this.run(job);
-        // A request of another session aborted the warm. Try again when the
-        // gateway is idle, unless the session sent a new request.
-        if (result === 'aborted' && !this.stopped && job.attempts < MAX_ATTEMPTS
-          && this.seq.get(job.session) === job.seq && !this.jobs.has(job.session)) {
-          this.jobs.set(job.session, job);
-        }
+        if (result !== 'yielded' || this.stopped) continue;
+        // A real request stopped the warm. When it came from the same
+        // session, its own response makes a new warm. Else the warm goes on
+        // from the last stage when the gateway is idle again.
+        if (this.seq.get(job.session) !== job.seq) this.skip('superseded');
+        else if (++job.attempts >= MAX_ATTEMPTS) this.skip('attempts');
+        else if (!this.jobs.has(job.session)) this.jobs.set(job.session, job);
       }
     } finally {
       this.pumping = false;
     }
   }
 
-  private async run(job: Job): Promise<'done' | 'aborted' | 'skip' | 'error'> {
+  private fields(job: Job): Obj {
+    return {
+      backend: job.endpoint.name, prompt_tokens: job.promptTokens, cached_tokens: job.cachedTokens,
+      from: job.from, target: job.target, reached: job.reached, stages: job.stages,
+    };
+  }
+
+  private async run(job: Job): Promise<RunResult> {
+    if (!job.tokens) {
+      const tokenized = await this.tokenize(job);
+      if (tokenized !== 'done') return tokenized;
+    }
+    const stages = warmStages(job.reached, job.target, this.config.blockTokens, this.config.stepBlocks);
+    for (const end of stages) {
+      // No new stage while a real request is in flight or after the session
+      // sent a new request. The stage in flight is not aborted (see the top
+      // of this file).
+      if (this.stopped || !this.ready(job.endpoint) || this.seq.get(job.session) !== job.seq) {
+        this.stats.yielded++;
+        log('info', 'turn warm yielded to a real request', { ...this.fields(job), elapsed_ms: Math.round(job.elapsedMs) });
+        return 'yielded';
+      }
+      const result = await this.prefill(job, end);
+      if (result !== 'done') return result;
+    }
+    const s = this.stats;
+    s.completed++;
+    const evidence = this.evidence.get(job.session);
+    if (evidence?.boundary === job.target) evidence.kind = 'after_warm';
+    const result = {
+      ...this.fields(job), warm_prompt_tokens: job.warmPromptTokens, warm_cached_tokens: job.warmCachedTokens,
+      tokenize_ms: Math.round(job.tokenizeMs), elapsed_ms: Math.round(job.elapsedMs),
+    };
+    this.last = { ...result, at: new Date().toISOString() };
+    log('info', 'turn warm', result);
+    return 'done';
+  }
+
+  /** Render the payload. A real request aborts this request. */
+  private async tokenize(job: Job): Promise<RunResult> {
     const controller = new AbortController();
     const untrack = this.warmer.track(controller);
     const timer = setTimeout(() => controller.abort(new TurnWarmTimeout(`turn warm exceeded ${this.config.timeoutMs} ms`)), this.config.timeoutMs);
-    const { endpoint, target } = job;
-    const fields = { backend: endpoint.name, prompt_tokens: job.promptTokens, cached_tokens: job.cachedTokens, target };
     const started = performance.now();
-    job.attempts++;
-    this.stats.requests++;
     try {
       const body = JSON.stringify(tokenizeRequest(job.payload));
       if (body.length > this.config.maxPayloadChars) {
@@ -348,18 +501,38 @@ export class TurnWarmer {
         return 'skip';
       }
       controller.signal.throwIfAborted();
-      const rendered = await readJson(await postJson(serverUrl(endpoint, '/tokenize'), body, this.timeouts, controller.signal));
+      const rendered = await readJson(await postJson(serverUrl(job.endpoint, '/tokenize'), body, this.timeouts, controller.signal));
       const tokens = rendered.tokens;
       if (!Array.isArray(tokens) || Number(rendered.count) !== job.promptTokens || tokens.length !== job.promptTokens) {
         this.skip('count_mismatch');
-        log('info', 'turn warm skipped; the render does not match the prompt', { ...fields, count: rendered.count ?? null });
+        log('info', 'turn warm skipped; the render does not match the prompt', { ...this.fields(job), count: rendered.count ?? null });
         return 'skip';
       }
-      const tokenizeMs = performance.now() - started;
-      controller.signal.throwIfAborted();
+      job.tokens = tokens as number[];
+      return 'done';
+    } catch (error) {
+      return this.failed(job, controller, error, performance.now() - started);
+    } finally {
+      const elapsed = performance.now() - started;
+      job.tokenizeMs += elapsed;
+      job.elapsedMs += elapsed;
+      this.stats.timeMs += elapsed;
+      clearTimeout(timer);
+      untrack();
+    }
+  }
+
+  /** One stage: prefill the first `end` tokens. Only the time limit and the shutdown abort it. */
+  private async prefill(job: Job, end: number): Promise<RunResult> {
+    const controller = new AbortController();
+    this.stage = controller;
+    const timer = setTimeout(() => controller.abort(new TurnWarmTimeout(`turn warm exceeded ${this.config.timeoutMs} ms`)), this.config.timeoutMs);
+    const started = performance.now();
+    this.stats.requests++;
+    try {
       const stream = await postJson(
-        new URL(`${endpoint.config.baseUrl}/completions`),
-        turnWarmPayload(job.payload.model, tokens as number[], target), this.timeouts, controller.signal,
+        new URL(`${job.endpoint.config.baseUrl}/completions`),
+        turnWarmPayload(job.payload.model, job.tokens!, end), this.timeouts, controller.signal,
       );
       if (stream.status < 200 || stream.status >= 300 || !stream.body) {
         throw new Error(`HTTP ${stream.status}: ${(stream.errorText ?? '').slice(0, 300)}`);
@@ -376,43 +549,44 @@ export class TurnWarmer {
       }
       const warmPrompt = Number(usage?.prompt_tokens ?? 0);
       const warmCached = Number(usage?.prompt_tokens_details?.cached_tokens ?? 0);
-      const elapsed = performance.now() - started;
       const s = this.stats;
-      s.completed++;
+      s.stages++;
       s.promptTokens += warmPrompt;
       s.cachedTokens += warmCached;
       s.warmedTokens += Math.max(0, warmPrompt - warmCached);
-      s.gainTokens += target - job.cachedTokens;
-      s.timeMs += elapsed;
-      const evidence = this.evidence.get(job.session);
-      if (evidence?.boundary === target) evidence.kind = 'after_warm';
-      const result = {
-        ...fields, warm_prompt_tokens: warmPrompt, warm_cached_tokens: warmCached,
-        tokenize_ms: Math.round(tokenizeMs), elapsed_ms: Math.round(elapsed),
-      };
-      this.last = { ...result, at: new Date().toISOString() };
-      log('info', 'turn warm', result);
+      s.gainTokens += Math.max(0, end - job.reached);
+      job.warmPromptTokens += warmPrompt;
+      if (job.stages === 0) job.warmCachedTokens = warmCached;
+      job.stages++;
+      job.reached = end;
       return 'done';
     } catch (error) {
-      const elapsed = Math.round(performance.now() - started);
-      if (controller.signal.aborted) {
-        const reason = controller.signal.reason;
-        if (reason instanceof TurnWarmTimeout) {
-          this.stats.timeouts++;
-          log('warn', 'turn warm timed out', { ...fields, elapsed_ms: elapsed });
-          return 'error';
-        }
-        this.stats.aborted++;
-        log('info', 'turn warm yielded to a real request', { ...fields, elapsed_ms: elapsed });
-        return 'aborted';
-      }
-      this.stats.errors++;
-      log('warn', 'turn warm failed', { ...fields, error: (error as Error).message, elapsed_ms: elapsed });
-      return 'error';
+      return this.failed(job, controller, error, performance.now() - started);
     } finally {
+      const elapsed = performance.now() - started;
+      job.elapsedMs += elapsed;
+      this.stats.timeMs += elapsed;
       clearTimeout(timer);
-      untrack();
+      if (this.stage === controller) this.stage = null;
     }
+  }
+
+  private failed(job: Job, controller: AbortController, error: unknown, elapsedMs: number): RunResult {
+    const fields = { ...this.fields(job), elapsed_ms: Math.round(elapsedMs) };
+    if (controller.signal.aborted) {
+      if (controller.signal.reason instanceof TurnWarmTimeout) {
+        this.stats.timeouts++;
+        log('warn', 'turn warm timed out', fields);
+        return 'error';
+      }
+      if (this.stopped) return 'error';
+      this.stats.aborted++;
+      log('info', 'turn warm yielded to a real request', fields);
+      return 'yielded';
+    }
+    this.stats.errors++;
+    log('warn', 'turn warm failed', { ...fields, error: (error as Error).message });
+    return 'error';
   }
 }
 
