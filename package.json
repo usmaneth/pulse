@@ -1,7 +1,7 @@
 {
   "name": "pulse",
-  "version": "1.0.0",
-  "description": "Speculative-decoding benchmark suite and tuning harness for NVIDIA DGX Spark (GB10), plus a Jev-routed proxy over llama.cpp",
+  "version": "0.1.0",
+  "description": "Local LLM serving and measurement tools for Codex CLI on NVIDIA DGX Spark (GB10): a Responses API gateway, a runtime manager, overlay generators, and benchmarks.",
   "type": "module",
   "main": "dist/server/index.js",
   "bin": {

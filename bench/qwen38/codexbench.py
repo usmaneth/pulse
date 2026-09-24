@@ -109,7 +109,7 @@ def main():
     ap.add_argument("--streams", type=int, nargs="+", default=[1])
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=600)
-    ap.add_argument("--out", default="/models/usman/qwen38-tune/results.jsonl")
+    ap.add_argument("--out", default="/mnt/models/qwen38-tune/results.jsonl")
     ap.add_argument("--only", nargs="*", default=None, help="prompt names to run")
     ap.add_argument("--xl", action="store_true", help="add the ~110k-token context case")
     a = ap.parse_args()

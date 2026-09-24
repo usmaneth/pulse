@@ -41,7 +41,7 @@ clean:
 
 .PHONY: all clean
 
-LLAMA_DIR ?= /home/usman/Bonsai-demo/llama.cpp
+LLAMA_DIR ?= ../llama.cpp
 LLAMA_LIB_DIR ?= $(LLAMA_DIR)/build-cuda/bin
 ENGINE_LINK = -L$(LLAMA_LIB_DIR) -Wl,-rpath,$(LLAMA_LIB_DIR) -lggml-base
 

@@ -28,7 +28,7 @@ export class DualSparkMeshRouter {
     {
       id: 'node-2',
       name: 'spark2 (worker)',
-      url: 'http://10.99.0.2:8008',
+      url: process.env.PULSE_MESH_NODE2_URL ?? 'http://127.0.0.1:8008',
       healthy: true,
       activeRequests: 0,
       totalRequests: 0,

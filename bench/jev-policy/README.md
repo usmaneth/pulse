@@ -34,7 +34,7 @@ python3 -m unittest discover -s bench/jev-policy -p 'test_*.py'
 python3 bench/jev-policy/policy.py --fixture bench/jev-policy/selection-fixture.json --output /tmp/jev-proposal.json --live
 ```
 
-The API command reads `/home/usman/.config/pulse/typesafe.env` as data.
+The API command reads `~/.config/pulse/typesafe.env` as data.
 It does not print the key or execute the environment file.
 The fixture contains synthetic capacity values. It does not authorize real GPU admission.
 The first live proposal took 291.96 milliseconds and abstained on speculation and cache.
@@ -117,7 +117,7 @@ The replay uses a synthetic fresh timestamp and cannot authorize a live request.
 The default dry run contains four tasks: two frozen tasks at 3K with K4 and K7.
 
 ```sh
-python3 bench/jev-policy/task_sweep.py --output /tmp/task-gate --proposal /home/usman/Documents/spark-orchestration/jev-task-frozen-proposal.json
+python3 bench/jev-policy/task_sweep.py --output /tmp/task-gate --proposal /path/to/jev-task-frozen-proposal.json
 ```
 
 The proposal only orders trials. The root froze this live API proposal before any task holdout output existed.

@@ -10,6 +10,7 @@ repo before now ran with cache_prompt=false, which measures the cold path only.
 Measures time-to-first-token for: cold, exact replay, and a realistic
 turn (same prefix + a short new user message).
 """
+import os
 import glob, json, statistics as st, sys, time, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8085"
@@ -27,9 +28,9 @@ def ntok(t):
     return len(post("/tokenize", {"content": t})[0]["tokens"])
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp') +
-                glob.glob('/home/usman/llama.cpp-upstream/common/*.cpp') +
-                glob.glob('/home/usman/llama.cpp-upstream/ggml/src/ggml-cuda/*.cu')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp')) +
+                glob.glob(os.path.expanduser('~/llama.cpp-upstream/common/*.cpp')) +
+                glob.glob(os.path.expanduser('~/llama.cpp-upstream/ggml/src/ggml-cuda/*.cu'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

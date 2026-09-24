@@ -13,7 +13,7 @@ import glob, json, os, random
 
 random.seed(0)
 HOME = os.path.expanduser("~")
-D = "/models/usman/distill"
+D = "/mnt/models/distill"
 
 
 def own_prompts():

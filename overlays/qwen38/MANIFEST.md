@@ -74,8 +74,8 @@ Options:
 | Option | Default | Purpose |
 |---|---|---|
 | `--image` | `vllm/vllm-openai:qwen38-flash-next` | Image to extract from. |
-| `--recipe` | `$QWEN38_RECIPE_DIR`, else `/models/usman/qwen38-flash` | Recipe checkout. `mtp-fp8-head` needs it for its reference file. |
-| `--capture-dir` | `$QWEN38_CAPTURE_DIR`, else `/models/usman/distill/cap` | Host directory that `capture` mounts on `/cap`. |
+| `--recipe` | `$QWEN38_RECIPE_DIR`, else `/mnt/models/qwen38-flash` | Recipe checkout. `mtp-fp8-head` needs it for its reference file. |
+| `--capture-dir` | `$QWEN38_CAPTURE_DIR`, else `/mnt/models/distill/cap` | Host directory that `capture` mounts on `/cap`. |
 | `--src` | none | An extracted vLLM package to use instead of the image. |
 | `--no-recipe-check` | off | Do not compare with the recipe copy of `patch_mtp_fp8_head.py`. |
 

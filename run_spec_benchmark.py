@@ -1,7 +1,12 @@
 import subprocess
 import re
 import json
+import os
 import sys
+
+# Ternary Bonsai 2 checkout: a sibling of this repo by default.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_BONSAI_DEFAULT = os.environ.get("PULSE_BONSAI_DIR", os.path.join(_REPO_ROOT, "..", "Bonsai-demo"))
 
 PROMPTS = {
     "python_interval_merging": """def merge_intervals(intervals):
@@ -25,9 +30,9 @@ Step 1: The first 20 even positive integers are 2, 4, 6, ..., 40.
 Step 2: This forms an arithmetic sequence with first term a = 2, common difference d = 2, and n = 20 terms."""
 }
 
-BIN = "/home/usman/Bonsai-demo/bin/cuda/llama-speculative-simple"
-MODEL = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf"
-DRAFTER_V2 = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf"
+BIN = os.path.join(_BONSAI_DEFAULT, "bin/cuda/llama-speculative-simple")
+MODEL = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf")
+DRAFTER_V2 = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf")
 
 def run_test(prompt_key, prompt_text, k_val, n_predict=150):
     cmd = [
@@ -87,7 +92,7 @@ for p_key, p_text in PROMPTS.items():
         print(f"Prompt: {p_key:<24} | K={k} | Accept: {res['acceptance_rate']:<7} ({res['n_accept']}/{res['n_drafted']}) | Tok/Step: {res['tokens_per_step']:<5} | Speed: {res['raw_speed_toks_sec']} t/s")
         results.append(res)
 
-with open("/home/usman/spark-splash/dspark_v2_bench_results.json", "w") as f:
+with open("dspark_v2_bench_results.json", "w") as f:
     json.dump(results, f, indent=2)
 
 print("\nBenchmark results saved to dspark_v2_bench_results.json")

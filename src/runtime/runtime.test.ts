@@ -28,7 +28,9 @@ import { main } from './cli.js';
 import { loadConfig } from '../gateway/config.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const NODES_FILE = path.join(ROOT, 'runtime', 'nodes.json');
+// Tests render against the tracked example file, not a real deployment's
+// runtime/nodes.json (gitignored; holds real hosts, IPs and paths).
+const NODES_FILE = path.join(ROOT, 'runtime', 'nodes.example.json');
 const PROFILES = path.join(ROOT, 'runtime', 'qwen38', 'profiles');
 const NOW = new Date('2026-09-23T10:15:00Z');
 
@@ -92,15 +94,15 @@ const SPARK1_BEST: Record<string, string> = {
     '-e VLLM_USE_V2_MODEL_RUNNER=1',
     '-e VLLM_MTP_DRAFT_HEAD_FP8=1',
     '-e TRITON_CACHE_DIR=/triton-cache',
-    '-v /models/usman/triton-cache:/triton-cache',
-    '-v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache',
-    `-v /models/usman/qwen38-flash/files/ours/speculative.py:${PKG}/config/speculative.py:ro`,
-    `-v /models/usman/qwen38-flash/files/ours/kv_cache_utils.py:${PKG}/v1/core/kv_cache_utils.py:ro`,
-    `-v /models/usman/qwen38-flash/files/ours/scheduler.py:${PKG}/v1/core/sched/scheduler.py:ro`,
-    `-v /models/usman/distill/shard34_r2.safetensors:${SNAP}/model-00034-of-00034.safetensors:ro`,
+    '-v /mnt/models/triton-cache:/triton-cache',
+    '-v /mnt/models/vllm-ple-cache:/mnt/models/vllm-ple-cache',
+    `-v /mnt/models/qwen38-flash/files/ours/speculative.py:${PKG}/config/speculative.py:ro`,
+    `-v /mnt/models/qwen38-flash/files/ours/kv_cache_utils.py:${PKG}/v1/core/kv_cache_utils.py:ro`,
+    `-v /mnt/models/qwen38-flash/files/ours/scheduler.py:${PKG}/v1/core/sched/scheduler.py:ro`,
+    `-v /mnt/models/distill/shard34_r2.safetensors:${SNAP}/model-00034-of-00034.safetensors:ro`,
   ].join(' '),
   EXTRA_VLLM_ARGS: '--kv-cache-memory-bytes 10737418240',
-  HF_HOME: '/models/usman/hf',
+  HF_HOME: '/mnt/models/hf',
   HOST_RESERVE_GIB: '32',
   HOST_SLACK_GIB: '4',
   IMAGE: 'vllm/vllm-openai:qwen38-flash-next',
@@ -125,8 +127,8 @@ const SPARK1_BEST: Record<string, string> = {
 // The effective key map of the recipe .env.datagen on spark2. It keeps MTP K=3.
 const SPARK2_DATAGEN: Record<string, string> = {
   ...Object.fromEntries(Object.entries(SPARK1_BEST).filter(([k]) => !['MTP_DISABLE_BLOCK_DROP', 'MTP_INDEX_SHARE'].includes(k))),
-  EXTRA_DOCKER_ARGS: '-e VLLM_USE_V2_MODEL_RUNNER=1 -v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache',
-  HF_HOME: '/home/usman/.cache/huggingface',
+  EXTRA_DOCKER_ARGS: '-e VLLM_USE_V2_MODEL_RUNNER=1 -v /mnt/models/vllm-ple-cache:/mnt/models/vllm-ple-cache',
+  HF_HOME: '/var/cache/pulse-hf',
   MAX_NUM_BATCHED_TOKENS: '2048',
   MAX_NUM_SEQS: '8',
   MTP_NUM_SPECULATIVE_TOKENS: '3',
@@ -142,9 +144,9 @@ const SPARK1_CAPTURE: Record<string, string> = {
   EXTRA_DOCKER_ARGS: [
     '-e VLLM_USE_V2_MODEL_RUNNER=1',
     '-e VLLM_MTP_CAPTURE_DIR=/cap',
-    '-v /models/usman/distill/cap:/cap',
-    '-v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache',
-    `-v /models/usman/qwen38-flash/files/ours/ar_speculator_capture.py:${PKG}/v1/worker/gpu/spec_decode/autoregressive/speculator.py:ro`,
+    '-v /mnt/models/distill/cap:/cap',
+    '-v /mnt/models/vllm-ple-cache:/mnt/models/vllm-ple-cache',
+    `-v /mnt/models/qwen38-flash/files/ours/ar_speculator_capture.py:${PKG}/v1/worker/gpu/spec_decode/autoregressive/speculator.py:ro`,
   ].join(' '),
   MAX_NUM_BATCHED_TOKENS: '2048',
   MTP_NUM_SPECULATIVE_TOKENS: '3',
@@ -229,7 +231,7 @@ test('render: best on spark1 equals the effective spark1 .env (recipe spark1-bes
   const r = render('best', 'spark1');
   assert.deepEqual(withSortedDocker(r.map), withSortedDocker(SPARK1_BEST));
   assert.equal(r.expectedMaxModelLen, 524288);
-  assert.deepEqual(r.mkdirs, ['/models/usman/triton-cache']);
+  assert.deepEqual(r.mkdirs, ['/mnt/models/triton-cache']);
 });
 
 test('render: datagen on spark2 equals the effective spark2 .env.datagen', () => {
@@ -241,7 +243,7 @@ test('render: datagen on spark2 equals the effective spark2 .env.datagen', () =>
 test('render: capture on spark1 equals the effective spark1 .env.capture', () => {
   const r = render('capture', 'spark1');
   assert.deepEqual(withSortedDocker(r.map), withSortedDocker(SPARK1_CAPTURE));
-  assert.deepEqual(r.mkdirs, ['/models/usman/distill/cap']);
+  assert.deepEqual(r.mkdirs, ['/mnt/models/distill/cap']);
 });
 
 test('render: bash reads every rendered profile back to the same key map', () => {
@@ -384,7 +386,7 @@ test('plan: up has the steps in order, and only preflight, wait-mem, wait-ready 
   assert.deepEqual(plan.steps.map((s) => s.id), ['preflight', 'mkdir', 'stop', 'wait-mem', 'write-env', 'start', 'wait-ready', 'verify', 'state']);
   assert.deepEqual(plan.steps.filter((s) => !s.mutates).map((s) => s.id), ['preflight', 'wait-mem', 'wait-ready', 'verify']);
   assert.deepEqual(plan.refusals, []);
-  assert.equal(plan.backupPath, '/models/usman/qwen38-flash/.env.pulse-bak-20260923T101500Z');
+  assert.equal(plan.backupPath, '/mnt/models/qwen38-flash/.env.pulse-bak-20260923T101500Z');
   const dg = planUp(render('datagen', 'spark2'), nodes(), planOpts);
   assert.ok(!dg.steps.some((s) => s.id === 'mkdir'), 'datagen has no directories to create');
 });
@@ -420,7 +422,7 @@ test('plan: preflight reads only; no step talks to the server before the start; 
   assert.match(start, /setsid env -i HOME="\$HOME"/);
   assert.match(start, /<\/dev\/null >\/dev\/null 2>&1 &/);
   const write = plan.steps.find((s) => s.id === 'write-env')!.script!;
-  assert.match(write, /cp -p \.env '\/models\/usman\/qwen38-flash\/\.env\.pulse-bak-20260923T101500Z'/);
+  assert.match(write, /cp -p \.env '\/mnt\/models\/qwen38-flash\/\.env\.pulse-bak-20260923T101500Z'/);
   assert.ok(write.indexOf('cp -p .env') < write.indexOf('mv -f "$tmp" .env'));
 });
 
@@ -538,7 +540,7 @@ test('fragment: loads through the gateway loadConfig; loopback spark2 stays disa
   assert.equal(config.models[0].profile, 'qwen38');
   assert.deepEqual(config.models[0].endpoints.map((e) => [e.name, e.baseUrl, e.enabled]), [
     ['spark1', 'http://127.0.0.1:8888/v1', true],
-    ['spark2', 'http://10.99.0.2:8888/v1', false],
+    ['spark2', 'http://203.0.113.2:8888/v1', false],
   ]);
   assert.deepEqual(warnings, []);
   assert.match(endpoints[1].reason, /loopback/);
@@ -548,7 +550,7 @@ test('fragment: loads through the gateway loadConfig; loopback spark2 stays disa
 
 test('fragment: a node that listens on its link address is enabled; an all-down set keeps the first node on', () => {
   const n = nodes();
-  const reach = buildFragment(n, { spark1: state('spark1', {}), spark2: state('spark2', { bind: '10.99.0.2' }) });
+  const reach = buildFragment(n, { spark1: state('spark1', {}), spark2: state('spark2', { bind: '203.0.113.2' }) });
   assert.deepEqual(reach.fragment.models![0].endpoints.map((e) => e.enabled), [true, true]);
   const down = buildFragment(n, { spark1: state('spark1', { state: 'down' }), spark2: state('spark2', { state: 'failed' }) });
   assert.deepEqual(down.fragment.models![0].endpoints.map((e) => e.enabled), [true, false]);
@@ -569,19 +571,19 @@ test('cli: --dry-run creates no runner and changes no state', async () => {
   const rec = new RecordingRunner();
   const c = capture();
   const code = await main(['up', 'best', '--node', 'spark2', '--dry-run'], {
-    ...c.deps, env: { PULSE_STATE_DIR: stateDir }, now: () => NOW, runnerFor: () => { made++; return rec; },
+    ...c.deps, env: { PULSE_STATE_DIR: stateDir, PULSE_NODES_FILE: NODES_FILE }, now: () => NOW, runnerFor: () => { made++; return rec; },
   });
   assert.equal(code, 0);
   assert.equal(made, 0);
   assert.equal(rec.calls.length, 0);
   assert.deepEqual(readdirSync(stateDir), []);
   const text = c.out.join('\n');
-  assert.match(text, /rendered \.env for spark2:\/models\/usman\/qwen38-flash\/\.env/);
+  assert.match(text, /rendered \.env for spark2:\/mnt\/models\/qwen38-flash\/\.env/);
   assert.match(text, /1\. \[preflight\]/);
   assert.match(text, /9\. \[state\]/);
   assert.match(text, /dry run: nothing ran and nothing changed/);
   // The down dry run does not run anything either.
-  assert.equal(await main(['down', '--node', 'spark2', '--dry-run'], { ...c.deps, env: { PULSE_STATE_DIR: stateDir }, runnerFor: () => { made++; return rec; } }), 0);
+  assert.equal(await main(['down', '--node', 'spark2', '--dry-run'], { ...c.deps, env: { PULSE_STATE_DIR: stateDir, PULSE_NODES_FILE: NODES_FILE }, runnerFor: () => { made++; return rec; } }), 0);
   assert.equal(made, 0);
 });
 
@@ -589,7 +591,7 @@ test('cli: --dry-run --preflight runs exactly the read-only preflight script', a
   const rec = new RecordingRunner(() => ({
     code: 0,
     stdout: [
-      '@pulse ok recipe-dir /models/usman/qwen38-flash',
+      '@pulse ok recipe-dir /mnt/models/qwen38-flash',
       '@pulse container running 2026-09-23T10:48:04Z',
       ...Object.entries(SPARK2_DATAGEN).map(([k, v]) => `@pulse env-var ${k}=${v}`),
       '@pulse env-body-sha 0000',
@@ -599,7 +601,7 @@ test('cli: --dry-run --preflight runs exactly the read-only preflight script', a
     ].join('\n'),
   }));
   const c = capture();
-  const code = await main(['up', 'datagen', '--node', 'spark2', '--dry-run', '--preflight'], { ...c.deps, env: { PULSE_STATE_DIR: tmpdir() }, now: () => NOW, runnerFor: () => rec });
+  const code = await main(['up', 'datagen', '--node', 'spark2', '--dry-run', '--preflight'], { ...c.deps, env: { PULSE_STATE_DIR: tmpdir(), PULSE_NODES_FILE: NODES_FILE }, now: () => NOW, runnerFor: () => rec });
   assert.equal(code, 0);
   assert.equal(rec.calls.length, 1);
   assert.match(rec.calls[0].script, /@pulse preflight-fails/);
@@ -607,16 +609,16 @@ test('cli: --dry-run --preflight runs exactly the read-only preflight script', a
   assert.match(text, /change none: the effective key map of the current \.env equals the render \(26 keys\)/);
   assert.match(text, /8 open client connection/);
 
-  const failing = new RecordingRunner(() => ({ code: 1, stdout: '@pulse fail mount-source /models/usman/distill/shard34_r2.safetensors is missing (profile:best)\n@pulse preflight-fails 1\n' }));
+  const failing = new RecordingRunner(() => ({ code: 1, stdout: '@pulse fail mount-source /mnt/models/distill/shard34_r2.safetensors is missing (profile:best)\n@pulse preflight-fails 1\n' }));
   const c2 = capture();
-  assert.equal(await main(['up', 'best', '--node', 'spark2', '--dry-run', '--preflight'], { ...c2.deps, env: { PULSE_STATE_DIR: tmpdir() }, runnerFor: () => failing }), 1);
-  assert.match(c2.out.join('\n'), /FAIL   mount-source \/models\/usman\/distill\/shard34_r2\.safetensors/);
+  assert.equal(await main(['up', 'best', '--node', 'spark2', '--dry-run', '--preflight'], { ...c2.deps, env: { PULSE_STATE_DIR: tmpdir(), PULSE_NODES_FILE: NODES_FILE }, runnerFor: () => failing }), 1);
+  assert.match(c2.out.join('\n'), /FAIL   mount-source \/mnt\/models\/distill\/shard34_r2\.safetensors/);
 });
 
 test('cli: a real up on spark1 without --yes and on tp2 runs nothing', async () => {
   let made = 0;
   const c = capture();
-  const deps = { ...c.deps, env: { PULSE_STATE_DIR: tmpdir() }, runnerFor: () => { made++; return new RecordingRunner(); } };
+  const deps = { ...c.deps, env: { PULSE_STATE_DIR: tmpdir(), PULSE_NODES_FILE: NODES_FILE }, runnerFor: () => { made++; return new RecordingRunner(); } };
   assert.equal(await main(['up', 'best', '--node', 'spark1'], deps), 2);
   assert.equal(await main(['down', '--node', 'spark1'], deps), 2);
   assert.equal(await main(['up', 'tp2', '--node', 'spark1', '--yes', '--experimental'], deps), 2);
@@ -633,7 +635,7 @@ test('cli: status sends no HTTP request to a protected node without --yes; smoke
   const calls: { node: string; script: string }[] = [];
   const deps = (c: ReturnType<typeof capture>) => ({
     ...c.deps,
-    env: { PULSE_STATE_DIR: tmpdir() },
+    env: { PULSE_STATE_DIR: tmpdir(), PULSE_NODES_FILE: NODES_FILE },
     now: () => NOW,
     runnerFor: (node: NodeConfig) => new RecordingRunner((script) => { calls.push({ node: node.name, script }); return { code: 0, stdout: '' }; }),
   });
@@ -666,7 +668,7 @@ test('cli: status sends no HTTP request to a protected node without --yes; smoke
   c = capture();
   assert.equal(await main(['status', '--node', 'spark2', '--gpu-probe'], deps(c)), 0);
   assert.deepEqual(calls.map((x) => x.node), ['spark2']);
-  assert.match(calls[0].script, /bash \/models\/usman\/distill\/probe\.sh/);
+  assert.match(calls[0].script, /bash \/mnt\/models\/distill\/probe\.sh/);
   // --yes allows the request on spark1.
   calls.length = 0;
   assert.equal(await main(['status', '--node', 'spark1', '--yes'], deps(capture())), 0);

@@ -12,13 +12,14 @@ wall clock) across both axes, with speculation on and off.
 Each client gets a DIFFERENT prompt offset so they do not share a slot cache,
 which is what real multi-session serving looks like.
 """
+import os
 import glob, json, statistics, sys, threading, time, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8085"
 REPEATS = 3
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

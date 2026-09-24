@@ -10,13 +10,14 @@ decision and was never measured.
 Reports acceptance (draft_n_accepted / draft_n) and decode tok/s per context
 length, warm, with the prompt cached so prefill is not what is being timed.
 """
+import os
 import glob, json, statistics, sys, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8085"
 REPEATS = 3
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

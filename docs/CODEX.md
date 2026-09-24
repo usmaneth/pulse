@@ -54,11 +54,11 @@ Run from the Pulse repository:
 
 ```sh
 python3 bench/drafter-parity/metadata_variant.py \
-  --gguf-py /home/usman/Bonsai-demo/llama.cpp/gguf-py \
-  --source /home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf \
-  --destination /home/usman/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.gguf \
-  --manifest /home/usman/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.manifest.json
-sha256sum /home/usman/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.gguf
+  --gguf-py ~/Bonsai-demo/llama.cpp/gguf-py \
+  --source ~/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf \
+  --destination ~/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.gguf \
+  --manifest ~/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.manifest.json
+sha256sum ~/Bonsai-demo/models/bonsai2-gguf/27B/bonsai2-v2-Q4_K_M-yarn32.gguf
 ```
 
 Require output SHA256 `a39f89a344155e90e76b2fb0f8a79ef0c3bd42634c5e229a5fc9ab281f94f31d` before launch.

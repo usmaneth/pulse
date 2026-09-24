@@ -9,6 +9,7 @@ shows is rare (0.59% of records carry a context-mutating marker).
 Sequence per repeat:  A1 (cold) -> B1 (evicts A) -> A2 (return) -> B2 (return)
 A2 and B2 are the measurement: returning to a session whose slot is gone.
 """
+import os
 import glob, json, statistics, sys, time, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
@@ -29,7 +30,7 @@ def status():
         return {}
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp'))):
     try:
         pool += open(p, errors='replace').read() + "\n"
     except Exception:

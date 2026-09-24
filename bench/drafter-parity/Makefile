@@ -1,6 +1,6 @@
-LLAMA_DIR ?= /home/usman/Bonsai-demo/llama.cpp
+LLAMA_DIR ?= ../../../llama.cpp
 LLAMA_LIB_DIR ?= $(LLAMA_DIR)/build-cuda/bin
-OUTPUT ?= /home/usman/Documents/spark-orchestration/drafter-artifacts/rope-probe
+OUTPUT ?= ./artifacts/rope-probe
 CXX ?= g++
 
 $(OUTPUT): rope_probe.cpp

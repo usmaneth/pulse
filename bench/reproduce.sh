@@ -8,12 +8,13 @@
 # states plainly that it is a single-shot figure.
 set -euo pipefail
 
-ROOT=${ROOT:-/home/usman/Bonsai-demo}
+HERE=$(cd "$(dirname "$0")" && pwd)
+# Ternary Bonsai 2 checkout: a sibling of this repo by default.
+ROOT=${ROOT:-"$HERE/../../Bonsai-demo"}
 BIN=$ROOT/bin/cuda
 M=$ROOT/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf
 V1=$ROOT/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-Q4_0.gguf
 V2=$ROOT/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf
-HERE=$(cd "$(dirname "$0")" && pwd)
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
@@ -40,7 +41,7 @@ for m in 1 3 4 6 8 12 16; do
 done
 
 step "3. best single-stream config (median of 6, interleaved)"
-head -c 5000 /home/usman/llama.cpp-upstream/src/llama-model.cpp > /tmp/rep_code.txt 2>/dev/null || true
+head -c 5000 ~/llama.cpp-upstream/src/llama-model.cpp > /tmp/rep_code.txt 2>/dev/null || true
 SPEC_DRAFT=models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf \
 python3 "$HERE/ab.py" -n 6 --warmup 2 --prompt /tmp/rep_code.txt \
   --config "v2 K=7= -- " || true

@@ -3,7 +3,7 @@
     "localhost"
   ],
   "expires_unix": 0,
-  "lock_path": "/home/usman/Documents/spark-orchestration/gpu-evaluation.lock",
+  "lock_path": "/tmp/pulse-gpu-evaluation.lock",
   "allowed_gpu_pids": {
     "localhost": []
   }

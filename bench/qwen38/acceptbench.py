@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--n", type=int, default=40)
     ap.add_argument("--heldout", default=f"{HERE}/heldout_prompts.jsonl")
     a = ap.parse_args()
-    template = json.load(open("/models/usman/distill/codex_template.json"))
+    template = json.load(open("/mnt/models/distill/codex_template.json"))
     rows = [json.loads(l) for l in open(a.heldout)][: a.n]
     by_src, total0 = {}, metrics(a.port)
     toks = 0

@@ -13,6 +13,7 @@ Scenarios, all after the same prefix is already cached:
   B. mid-edit      (a chunk in the middle changed)
   C. prefix-drop   (an early chunk removed)
 """
+import os
 import glob, json, sys, time, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8085"
@@ -27,8 +28,8 @@ def post(path, body, timeout=3600):
 def ntok(t): return len(post("/tokenize", {"content": t})["tokens"])
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp') +
-                glob.glob('/home/usman/llama.cpp-upstream/common/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp')) +
+                glob.glob(os.path.expanduser('~/llama.cpp-upstream/common/*.cpp'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

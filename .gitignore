@@ -3,13 +3,10 @@ dist
 .env
 .env.*
 *.log
+# Only the CLI launcher script is tracked. The other bin/ entries are build
+# outputs (native binaries and libpulse_engine.so); build them with `make`.
 bin/*
 !bin/pulse-cli
-!bin/pulse-gguf
-!bin/pulse-matvec
-!bin/pulse-engine
-!bin/pulse-dumpref
-!bin/pulse-dequant
 *.gguf
 packages/**/*.gguf
 build/
@@ -17,3 +14,8 @@ __pycache__/
 *.py[cod]
 *.gguf
 **/*.gguf
+
+# Node and gateway configuration with real hosts, IPs and paths for this
+# deployment. Copy the matching *.example.json file and edit it in place.
+runtime/nodes.json
+config/qwen38-gateway.json

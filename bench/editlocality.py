@@ -11,7 +11,7 @@ bench/ckpt_evict.py replaced it. That script counts the events which actually
 mutate earlier context, and then measures the serving case directly.
 """
 
-import glob, json, statistics as st, sys
+import glob, json, os, statistics as st, sys
 from collections import Counter
 
 def msg_text(m):
@@ -65,8 +65,12 @@ def analyse(path):
         out.append(frac)
     return out
 
-files = sorted(glob.glob('/home/usman/.claude/projects/-home-usman/*.jsonl'))
-files += sorted(glob.glob('/home/usman/.omp/profiles/mafia/agent/sessions/-/*.jsonl'))
+# Claude Code names a project's log directory after the cwd path, with each
+# `/` turned into `-` (so /home/alice/proj becomes -home-alice-proj).
+_HOME = os.path.expanduser('~')
+_PROJECT_SLUG = _HOME.replace('/', '-')
+files = sorted(glob.glob(f'{_HOME}/.claude/projects/{_PROJECT_SLUG}/*.jsonl'))
+files += sorted(glob.glob(f'{_HOME}/.omp/profiles/mafia/agent/sessions/-/*.jsonl'))
 allf, per_session = [], []
 for f in files:
     fr = analyse(f)

@@ -61,6 +61,10 @@ A protected node gets these limits, also when `status` has no `--node`:
 
 ### runtime/nodes.json
 
+This file holds real hosts, IPs and paths for one site, so it is gitignored.
+Copy `runtime/nodes.example.json` to `runtime/nodes.json` and edit it for your
+nodes.
+
 One entry for each node:
 
 | Field | Meaning |
@@ -246,7 +250,7 @@ The server on spark2 listens on `127.0.0.1` (`BIND` in `runtime/nodes.json`).
 The gateway on spark1 cannot reach it, so the spark2 endpoint stays disabled.
 Do not change `BIND` without a decision:
 
-- `BIND=10.99.0.2` breaks the readiness check of `start.sh`, which uses
+- `BIND=203.0.113.2` breaks the readiness check of `start.sh`, which uses
   `localhost`. `start.sh` then removes the container after the timeout.
 - `BIND=0.0.0.0` makes the server open on every interface of spark2, also the
   wireless LAN and each VPN interface. The server has no key, and the gateway

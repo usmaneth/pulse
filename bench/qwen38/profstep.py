@@ -9,7 +9,7 @@ the "overhead" the decode loop pays on top of streaming weights.
 import glob, gzip, json, os, sys
 from collections import defaultdict
 
-d = sys.argv[1] if len(sys.argv) > 1 else "/models/usman/qwen38-tune/prof"
+d = sys.argv[1] if len(sys.argv) > 1 else "/mnt/models/qwen38-tune/prof"
 files = sorted(glob.glob(os.path.join(d, "**", "*.json*"), recursive=True), key=os.path.getmtime)
 path = files[-1]
 op = gzip.open if path.endswith(".gz") else open

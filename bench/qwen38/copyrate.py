@@ -16,7 +16,7 @@ import argparse, glob, json, os
 from tokenizers import Tokenizer
 
 TOK = Tokenizer.from_file(glob.glob(
-    "/models/usman/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/tokenizer.json")[0])
+    "/mnt/models/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/tokenizer.json")[0])
 
 
 def events(path):

@@ -25,18 +25,18 @@
   "max_tokens": 512,
   "resource_check": [
     "python3",
-    "/home/usman/pulse/bench/agent-eval/resource_check.py"
+    "bench/agent-eval/resource_check.py"
   ],
   "token_counter": [
     "python3",
-    "/home/usman/pulse/bench/agent-eval/llama_hooks.py",
+    "bench/agent-eval/llama_hooks.py",
     "count",
     "--url",
     "http://127.0.0.1:18085"
   ],
   "reset_cache": [
     "python3",
-    "/home/usman/pulse/bench/agent-eval/llama_hooks.py",
+    "bench/agent-eval/llama_hooks.py",
     "reset",
     "--url",
     "http://127.0.0.1:18085"

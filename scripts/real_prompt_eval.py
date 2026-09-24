@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 import subprocess
 import re
+import os
 import sys
+
+# Ternary Bonsai 2 checkout: a sibling of this repo by default.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BONSAI_DEFAULT = os.environ.get("PULSE_BONSAI_DIR", os.path.join(_REPO_ROOT, "..", "Bonsai-demo"))
 
 PROMPTS = [
     ("Binary Search", "def binary_search(arr: list[int], target: int) -> int:\n    \"\"\"Perform binary search on a sorted list and return target index or -1.\"\"\"\n    left = 0\n    right = len(arr) - 1\n", 120),
@@ -11,9 +16,9 @@ PROMPTS = [
     ("FlashAttention Prose", "Explain the fundamental mechanism of FlashAttention (tiling, online softmax re-computation, and SRAM memory hierarchy):\n1. Tiling in SRAM:\n", 120),
 ]
 
-BIN_SPEC = "/home/usman/Bonsai-demo/bin/cuda/llama-speculative-simple"
-MODEL = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf"
-DRAFTER = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf"
+BIN_SPEC = os.path.join(_BONSAI_DEFAULT, "bin/cuda/llama-speculative-simple")
+MODEL = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf")
+DRAFTER = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf")
 
 def run_prompt(prompt, n_pred, use_drafter):
     cmd = [

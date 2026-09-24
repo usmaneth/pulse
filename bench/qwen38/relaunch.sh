@@ -2,7 +2,7 @@
 # Stop the server, wait until the host has the memory back, start it again.
 # Usage: relaunch.sh <log-name>
 set -u
-cd /models/usman/qwen38-flash
+cd "${QWEN38_RECIPE_DIR:-/mnt/models/qwen38-flash}"
 ./stop.sh >/dev/null 2>&1
 for i in $(seq 1 60); do
   docker ps --format '{{.Names}}' | grep -q vllm-fn-tp1 || \
