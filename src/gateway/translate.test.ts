@@ -575,3 +575,60 @@ test('stream: a backend error chunk throws', () => {
   const t = new ChatStreamTranslator('m', flattenTools([]).map);
   assert.throws(() => t.push({ error: { message: 'boom' } }), /boom/);
 });
+
+test('stream: a custom call and a function call keep the slot order in the output and the events', () => {
+  const patch = JSON.stringify({ input: '*** Begin Patch\n*** End Patch' });
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'p', function: { name: 'apply_patch', arguments: patch } }] }),
+    chunk({ tool_calls: [{ index: 1, id: 's', function: { name: 'shell_command', arguments: '{"command":"git diff"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.deepEqual(t.response.output.map((i: Obj) => [i.type, i.call_id]), [['custom_tool_call', 'p'], ['function_call', 's']]);
+  const added = events.filter((e) => e.type === 'response.output_item.added').map((e) => [(e as Obj).item.call_id, (e as Obj).output_index]);
+  assert.deepEqual(added, [['p', 0], ['s', 1]]);
+  const done = events.filter((e) => e.type === 'response.output_item.done').map((e) => [(e as Obj).item.call_id, (e as Obj).output_index]);
+  assert.deepEqual(done, [['p', 0], ['s', 1]]);
+});
+
+test('stream: a custom call opens its item when the name arrives', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  const first = t.push(chunk({ tool_calls: [{ index: 0, id: 'p', function: { name: 'apply_patch', arguments: '{"input":' } }] }));
+  assert.deepEqual(types(first), ['response.output_item.added']);
+  assert.deepEqual([(first[0] as Obj).item.type, (first[0] as Obj).item.status, (first[0] as Obj).item.input], ['custom_tool_call', 'in_progress', '']);
+  // The input is JSON that must be unwrapped as a whole, so no delta goes out before the finish reason.
+  assert.deepEqual(t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] })), []);
+  t.push(chunk({}, 'tool_calls'));
+  const end = t.finishStream();
+  assert.deepEqual(types(end), [
+    'response.custom_tool_call_input.delta', 'response.custom_tool_call_input.done', 'response.output_item.done', 'response.completed',
+  ]);
+  assert.equal((end[2] as Obj).item.input, 'x');
+  assert.equal((end[2] as Obj).item.status, 'completed');
+});
+
+test('stream: a tool call that never gets a name does not count as output', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { arguments: '{"command":' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.equal(events.at(-1)!.type, 'response.failed');
+  assert.equal(t.response.status, 'failed');
+  assert.equal(t.hasOutput, false);
+});
+
+test('stream: a failed response carries the call arguments that already went out', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  t.push(chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":' } }] }));
+  t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"' } }] }));
+  // The server fails the stream this way on a timeout or a client drop.
+  const failed = t.fail('backend idle for 900000 ms');
+  assert.equal((failed[0] as Obj).response.output[0].arguments, '{"command":"ls"');
+  // A stream without a finish reason fails the same way.
+  assert.equal(t.finishStream().at(-1)!.type, 'response.failed');
+  assert.equal(t.response.output[0].arguments, '{"command":"ls"');
+});

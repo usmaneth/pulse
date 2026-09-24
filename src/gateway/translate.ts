@@ -477,25 +477,29 @@ interface PendingCall {
   /** The Responses item, once `output_item.added` went out. */
   item?: Obj;
   index?: number;
+  /** True for a Codex custom (freeform) tool, for example apply_patch. */
+  custom?: boolean;
 }
 
 /**
  * Turn a stream of chat-completions chunks into Responses stream events.
  *
- * Text and reasoning go out as deltas when they arrive. Function-call
- * arguments also go out as deltas when they arrive, but the
- * `function_call_arguments.done` and `output_item.done` events of all calls
- * wait for the finish reason. Codex runs a call when its `output_item.done`
- * arrives, and a call that the token limit cut off must not run. Custom tool
- * calls go out complete after the backend finishes, because their arguments
- * are JSON that must be unwrapped as a whole. The event order:
+ * Text and reasoning go out as deltas when they arrive. Each tool call gets
+ * its `output_item.added` event and its place in the output when its name
+ * arrives. Function-call arguments go out as deltas when they arrive. The
+ * input of a custom tool call goes out after the finish reason, because the
+ * backend sends it as JSON that must be unwrapped as a whole. The done events
+ * of all calls wait for the finish reason, in slot order. Codex runs a call
+ * when its `output_item.done` arrives, and a call that the token limit cut off
+ * must not run. The event order:
  *
  *   response.created, response.in_progress,
  *   [reasoning item events], [message item events],
  *   [function call: output_item.added, function_call_arguments.delta...],
+ *   [custom call: output_item.added],
  *   ...finish reason...
  *   [function call: function_call_arguments.done, output_item.done],
- *   [custom call: output_item.added, custom_tool_call_input.delta/.done, output_item.done],
+ *   [custom call: custom_tool_call_input.delta, .done, output_item.done],
  *   response.completed | response.incomplete | response.failed
  */
 export class ChatStreamTranslator {
@@ -576,7 +580,6 @@ export class ChatStreamTranslator {
           call = { name: '', args: '' };
           this.calls.set(slot, call);
         }
-        this.sawVisibleOutput = true;
         if (tc.id && !call.id) call.id = tc.id;
         // Some servers repeat the full name in every chunk, others send it
         // once. Keep the first non-empty name, as the router does.
@@ -660,28 +663,38 @@ export class ChatStreamTranslator {
   }
 
   /**
-   * Open the function_call item when the name is known and send the new
-   * argument text as a delta. Custom tool calls wait for the finish reason.
+   * Open the item of a call when its name is known. The item takes its place
+   * in the output then, for a function call and for a custom call, so the
+   * output keeps the order in which the model made the calls. A function call
+   * also sends the new argument text as a delta.
    */
   private streamCall(call: PendingCall, piece: string): ResponseEvent[] {
     if (!call.name) return [];
-    const { name, namespace, custom } = codexToolName(call.name, this.tools);
-    if (custom) return [];
     if (!call.item) {
+      const { name, namespace, custom } = codexToolName(call.name, this.tools);
       call.id ??= newId('call', 16);
-      const item: Obj = { id: newId('fc', 16), type: 'function_call', status: 'in_progress', call_id: call.id, name, arguments: '' };
-      if (namespace) item.namespace = namespace;
+      call.custom = custom;
+      const item: Obj = custom
+        ? { id: newId('ctc', 16), type: 'custom_tool_call', status: 'in_progress', call_id: call.id, name, input: '' }
+        : { id: newId('fc', 16), type: 'function_call', status: 'in_progress', call_id: call.id, name, arguments: '' };
+      if (namespace && !custom) item.namespace = namespace;
       call.item = item;
       call.index = this.response.output.push(item) - 1;
+      this.sawVisibleOutput = true;
       const events = [this.event('response.output_item.added', { output_index: call.index, item: { ...item } })];
       // Arguments that arrived before the name go out now, in one delta.
-      if (call.args) events.push(this.argsDelta(call, call.args));
+      if (call.args && !custom) events.push(this.argsDelta(call, call.args));
       return events;
     }
-    return piece ? [this.argsDelta(call, piece)] : [];
+    return piece && !call.custom ? [this.argsDelta(call, piece)] : [];
   }
 
+  /**
+   * Send argument text of a function call. The item keeps the text that went
+   * out, so a `response.failed` snapshot agrees with the deltas.
+   */
   private argsDelta(call: PendingCall, delta: string): ResponseEvent {
+    call.item!.arguments = call.args;
     return this.event('response.function_call_arguments.delta', { item_id: call.item!.id, output_index: call.index, delta });
   }
 
@@ -713,9 +726,9 @@ export class ChatStreamTranslator {
       const open = new Set(slots.map((call) => call.item).filter(Boolean));
       this.response.output = this.response.output.filter((item: Obj) => !open.has(item));
     } else {
+      // A call without a name has no item. It is not in the output.
       for (const call of slots) {
-        if (!call.name) continue;
-        events.push(...(call.item ? this.closeCall(call) : this.emitCall(call)));
+        if (call.item) events.push(...(call.custom ? this.closeCustomCall(call) : this.closeCall(call)));
       }
     }
     this.response.status = truncated ? 'incomplete' : 'completed';
@@ -738,30 +751,17 @@ export class ChatStreamTranslator {
     return events;
   }
 
-  /** Emit a custom tool call, complete, after the finish reason. */
-  private emitCall(call: PendingCall): ResponseEvent[] {
-    const { name, namespace, custom } = codexToolName(call.name, this.tools);
-    const callId = call.id ?? newId('call', 16);
-    const args = call.args || '{}';
-    const events: ResponseEvent[] = [];
-    if (custom) {
-      const input = customToolInput(args);
-      const item: Obj = { id: newId('ctc', 16), type: 'custom_tool_call', status: 'completed', call_id: callId, name, input };
-      const index = this.response.output.push(item) - 1;
-      events.push(this.event('response.output_item.added', { output_index: index, item: { ...item, status: 'in_progress', input: '' } }));
-      events.push(this.event('response.custom_tool_call_input.delta', { item_id: item.id, output_index: index, delta: input }));
-      events.push(this.event('response.custom_tool_call_input.done', { item_id: item.id, output_index: index, input }));
-      events.push(this.event('response.output_item.done', { output_index: index, item }));
-    } else {
-      const item: Obj = { id: newId('fc', 16), type: 'function_call', status: 'completed', call_id: callId, name, arguments: args };
-      if (namespace) item.namespace = namespace;
-      const index = this.response.output.push(item) - 1;
-      events.push(this.event('response.output_item.added', { output_index: index, item: { ...item, status: 'in_progress', arguments: '' } }));
-      events.push(this.event('response.function_call_arguments.delta', { item_id: item.id, output_index: index, delta: args }));
-      events.push(this.event('response.function_call_arguments.done', { item_id: item.id, output_index: index, arguments: args }));
-      events.push(this.event('response.output_item.done', { output_index: index, item }));
-    }
-    return events;
+  /** Send the unwrapped input of a custom tool call and close it. */
+  private closeCustomCall(call: PendingCall): ResponseEvent[] {
+    const item = call.item!;
+    const input = customToolInput(call.args || '{}');
+    item.input = input;
+    item.status = 'completed';
+    return [
+      this.event('response.custom_tool_call_input.delta', { item_id: item.id, output_index: call.index, delta: input }),
+      this.event('response.custom_tool_call_input.done', { item_id: item.id, output_index: call.index, input }),
+      this.event('response.output_item.done', { output_index: call.index, item }),
+    ];
   }
 
   /** Emit `response.failed`. The response keeps the output that arrived. */
