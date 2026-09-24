@@ -6,9 +6,9 @@ starts the recipe, waits until `/v1/models` returns 200, and checks the result.
 It also writes a backend file for the Pulse gateway.
 
 The recipe is the single-Spark Qwen3.8-Flash-Next recipe (`start.sh`,
-`stop.sh`, `.env`) in `/models/usman/qwen38-flash` on each node. Pulse does not
-change the recipe. It writes only the recipe `.env`, a backup of it, and a log
-file in `logs/`.
+`stop.sh`, `.env`). `runtime/nodes.json` gives its directory on each node.
+Pulse does not change the recipe. It writes only the recipe `.env`, a backup of
+it, and a log file in `logs/`.
 
 ## Build
 
@@ -249,7 +249,8 @@ Do not change `BIND` without a decision:
 - `BIND=10.99.0.2` breaks the readiness check of `start.sh`, which uses
   `localhost`. `start.sh` then removes the container after the timeout.
 - `BIND=0.0.0.0` makes the server open on every interface of spark2, also the
-  WLAN and tailscale. The server has no key, and the gateway cannot send one.
+  wireless LAN and each VPN interface. The server has no key, and the gateway
+  cannot send one.
 
 Possible solutions: an ssh tunnel from spark1, a change to `start.sh` so that
 it checks `$BIND`, or `0.0.0.0` with a firewall.
@@ -277,7 +278,7 @@ replacement. A mount on a path that `start.sh` mounts itself (for example
 ## The tp2 profile
 
 `start.sh` of the single-Spark recipe always uses tensor parallel size 1.
-Tensor parallel size 2 needs the two-node recipe in `/models/usman/qwen38-dual`.
+Tensor parallel size 2 needs the two-node recipe (`qwen38-dual` in `runtime/nodes.json`).
 spark1 is its head node, and its `stop.sh` stops the servers on both nodes. So
 `tp2` is render-only: `up tp2 --dry-run` shows the `.env`, and a real `up` refuses.
 

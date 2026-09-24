@@ -4,7 +4,7 @@
   "readyGraceS": 300,
   "nodes": {
     "spark1": {
-      "description": "DGX Spark 1 (10.99.0.1). Serves live Codex traffic.",
+      "description": "DGX Spark 1. Serves live Codex traffic.",
       "host": "local",
       "protected": true,
       "env": {
@@ -44,7 +44,7 @@
       }
     },
     "spark2": {
-      "description": "DGX Spark 2 (10.99.0.2), reached over ssh.",
+      "description": "DGX Spark 2, reached over ssh.",
       "host": "ssh",
       "ssh": "spark2",
       "env": {
