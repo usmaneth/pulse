@@ -65,6 +65,13 @@ native-cpu-test: $(BIN_DIR)/test-reference-layout $(BIN_DIR)/test-sequence-contr
 
 .PHONY: native-cpu-test
 
+# CPU-only tests of the Qwen3.8 vLLM overlays. They use docker without the GPU,
+# and they skip when docker or the pinned image is not present.
+overlays-test:
+	python3 -m unittest discover -s overlays/qwen38/tests -v
+
+.PHONY: overlays-test
+
 $(BIN_DIR)/test-pq2-q8: tests/engine/pq2_q8.cu src/engine/pq2_q8.cuh | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) -I$(LLAMA_DIR)/ggml/include -Isrc/engine -I$(LLAMA_DIR)/ggml/src -I$(LLAMA_DIR)/ggml/src/ggml-cuda $< -L$(LLAMA_LIB_DIR) -Xlinker -rpath -Xlinker $(LLAMA_LIB_DIR) -lggml-cuda -lggml-base -o $@
 

@@ -27,7 +27,7 @@ the serving profile only when it wins a measured A/B.
 
 1. `build_prompts.py` assembles prompts: Magicoder OSS-Instruct, self-oss-instruct, SWE-bench issues, UltraChat, the user's own session prompts, and a Codex-shaped slice with the real Codex system prompt and tools.
 2. `gen_client.py` has the target model answer every prompt and stores the exact token ids.
-3. `capture_client.py` replays each row as a prefill-only request with a unique `cache_salt`. The capture hook in the recipe writes the MTP input hidden states: the pre-final-mixer multi-stream state, `[T, 4 x 2560]` BF16.
+3. `capture_client.py` replays each row as a prefill-only request with a unique `cache_salt`. The `capture` overlay (`overlays/qwen38/`) writes the MTP input hidden states: the pre-final-mixer multi-stream state, `[T, 4 x 2560]` BF16.
 4. `train_mtp.py` trains the MTP block. The block is one Qwen4Exp decoder layer from transformers 5.16 behind the vLLM input fusion. The NVFP4 routed experts stay frozen at the served values, and the BF16 tensors train (90.6M parameters). `--eval-only` with the stock head is the parity check.
 5. `export_mtp.py` writes the trained tensors into a copy of the MTP shard. The serving profile bind-mounts it over the original.
 
@@ -49,6 +49,8 @@ Measured with probe-gated runs. Tokens per step comes from the held-out acceptan
 | Fused QSA draft metadata | Neutral after probe normalization | rejected |
 | FP8 target lm_head (`_scaled_mm`) | No speed gain after normalization; 92.9% top-1 agreement | rejected |
 | FP8 hyper-connection projections | 4-5x slower at these shapes | rejected |
+
+The vLLM patches for the shipped and rejected speculation-layer changes are in `overlays/qwen38/`. `overlays/qwen38/MANIFEST.md` gives the status, the evidence and the profile arguments of each one.
 
 Other measured facts:
 

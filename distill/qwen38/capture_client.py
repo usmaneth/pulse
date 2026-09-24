@@ -3,7 +3,7 @@
 
 Each row's exact token ids (prompt + completion) go to /v1/completions as a
 prefill-only request (max_tokens=1) tagged X-Request-Id: cap-<row>. The capture
-hook (files/ours/ar_speculator_capture.py) writes <row>_<start>.pt per prefill
+overlay (overlays/qwen38, overlay "capture") writes <row>_<start>.pt per prefill
 chunk. The script then writes <row>.ids.pt with the token ids, so a training
 example is (ids, concatenated hidden rows).
 
