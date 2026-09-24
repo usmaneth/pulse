@@ -7,6 +7,9 @@
 //   GET  /v1/models      configured model ids
 //   GET  /health         200 when every model has an available backend
 //   GET  /metrics        JSON counters and per-backend latency
+//
+// When a backend becomes healthy again, the warmer (warmer.ts) sends it the
+// recent prompt prefixes as prefill-only requests.
 
 import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -18,6 +21,7 @@ import type { BackendStream } from './backends.js';
 import { GatewayMetrics } from './metrics.js';
 import { log } from './log.js';
 import { sseData } from './sse.js';
+import { Warmer } from './warmer.js';
 import {
   BackendStreamError, ChatStreamTranslator, RequestError, isJsonObjectText, newId, responsesToChat, sseFrame,
 } from './translate.js';
@@ -69,6 +73,7 @@ export function backendErrorCode(message: string): string {
 export class Gateway {
   readonly metrics = new GatewayMetrics();
   readonly routes: ModelRoute[];
+  readonly warmer: Warmer;
   private readonly health: HealthChecker;
   private server: http.Server | null = null;
   private readonly inflight = new Set<AbortController>();
@@ -79,6 +84,12 @@ export class Gateway {
 
   constructor(readonly config: GatewayConfig) {
     this.routes = config.models.map((m) => new ModelRoute(m));
+    this.warmer = new Warmer(config.warmup, config, () => this.inflight.size);
+    for (const route of this.routes) {
+      for (const endpoint of route.endpoints) {
+        endpoint.onHealthy = (e, previous) => this.warmer.onHealthy(route, e, previous);
+      }
+    }
     this.health = new HealthChecker(this.routes, config);
     const catalogPath = process.env.PULSE_GATEWAY_MODEL_CATALOG;
     if (catalogPath) {
@@ -129,6 +140,7 @@ export class Gateway {
   async stop(): Promise<void> {
     this.draining = true;
     this.health.stop();
+    const warmerStopped = this.warmer.stop();
     const closed = new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
     this.server?.closeIdleConnections();
     const deadline = Date.now() + this.config.shutdownGraceMs;
@@ -148,6 +160,7 @@ export class Gateway {
     this.server?.closeAllConnections();
     await closed;
     closeAgents();
+    await warmerStopped;
     await this.closeTrace();
   }
 
@@ -243,6 +256,7 @@ export class Gateway {
         reasoning: m.reasoningTokens,
       },
       tool_calls: m.toolCalls,
+      warmup: this.warmer.snapshot(),
       backends: this.routes.flatMap((route) => route.endpoints.map((e) => ({
         model: route.config.id,
         name: e.name,
@@ -422,6 +436,7 @@ export class Gateway {
     if (this.config.traceFile) {
       this.trace(`{"request_id":${JSON.stringify(requestId)},"request":${JSON.stringify(request)},"payload":${payload}}`);
     }
+    this.warmer.observe(route, chat.payload, request.prompt_cache_key);
 
     const streaming = request.stream === true;
     const controller = new AbortController();
@@ -432,6 +447,9 @@ export class Gateway {
     res.on('close', onClose);
     this.inflight.add(controller);
     m.inFlight++;
+    // A real request goes first. The server keeps the blocks that the warm
+    // request completed, so this request still gets them.
+    this.warmer.yieldToRealRequest();
 
     const translator = new ChatStreamTranslator(String(request.model), chat.tools, this.config.emitReasoning);
     const deadline = Date.now() + this.config.retryWindowMs;
@@ -495,6 +513,10 @@ export class Gateway {
       for (let attempt = 0; ; attempt++) {
         const opened = await this.openBackend(route, payload, controller.signal, requestId, deadline);
         endpoint = opened.endpoint;
+        if (opened.stream.status >= 200 && opened.stream.status < 300) {
+          // The prefix and the session of this request are now in the cache.
+          this.warmer.served(route, opened.endpoint, chat.payload, request.prompt_cache_key);
+        }
         active = endpoint;
         endpoint.stats.inFlight++;
         const backend = opened.stream;

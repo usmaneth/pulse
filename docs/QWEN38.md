@@ -357,12 +357,53 @@ curl -s http://127.0.0.1:8800/health | jq
   client_errors, retries (backend attempts repeated before the first output)
 - `tokens`: input, cached_input, output, reasoning (from backend usage)
 - `tool_calls`
+- `warmup`: triggers, requests, completed, aborted, errors, skipped, prompt
+  and cached tokens of the warm requests, and the last warm result
 - `backends[]`: per endpoint health, requests, errors, failovers, in_flight,
   and latency windows (count, mean, p50, p95, recent maximum) for the
   response headers, the first token and the full request
 
 ```
 curl -s http://127.0.0.1:8800/metrics | jq '.backends[] | {name, healthy, requests, p50: .latency.first_token.p50_ms}'
+```
+
+## Cache warmup
+
+A restarted vLLM server has an empty prefix cache. The first turn of each new
+Codex session then pays the prefill of the system prompt, the tools and the
+environment message: about 11k tokens, 5.7 s to the first token on spark1.
+The next turn of a session that was active before the restart pays the
+prefill of its full history.
+
+The gateway keeps the most recent prompt prefix of each template variant (the
+effort level changes the head of the Qwen3.8 prompt) and the last payload of
+the most recent session. When an endpoint becomes healthy after a failure, the
+gateway sends these to the endpoint as prefill-only requests (`max_tokens` 1):
+
+1. the prefix: the system message, the environment message and the tools
+2. the last payload of the most recent session, when it is less than 30
+   minutes old
+
+The gateway sends each item two times. With the Mamba "align" prefix cache,
+the state at some block boundaries is not reusable after the first prefill.
+The second request computes it again, and its log line shows the cached token
+count. On spark1 the first turn of a new session after a warmup took 0.9 s to
+the first token (10080 of 11213 prompt tokens cached), against 5.7 s cold.
+
+A warm request goes only when the gateway has no real request in flight, so
+the requests that wait in the retry window go first. A real request aborts the
+warm request in flight, and vLLM keeps the blocks that the warm request
+completed. The gateway does not warm a prefix or a session on an endpoint when
+a real request with it reached that endpoint after the endpoint became healthy.
+
+The prefixes are in memory. Set `PULSE_GATEWAY_WARMUP_STATE_FILE` to keep them
+in a file (mode 0600), so that the gateway can also warm the backend after its
+own restart. The file holds the system prompt, the tools and the environment
+message. The gateway writes a new file and renames it, and it writes a due
+change also at shutdown.
+
+```
+curl -s http://127.0.0.1:8800/metrics | jq .warmup
 ```
 
 ## Configuration
@@ -395,6 +436,10 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_HEALTH_INTERVAL_MS` | `10000` | health check period, 0 checks once at start |
 | `PULSE_GATEWAY_HEALTH_TIMEOUT_MS` | `3000` | health check limit |
 | `PULSE_GATEWAY_SHUTDOWN_GRACE_MS` | `30000` | drain time after SIGTERM |
+| `PULSE_GATEWAY_WARMUP` | `1` | `0` turns the cache warmup off |
+| `PULSE_GATEWAY_WARMUP_SESSIONS` | `1` | recent sessions to warm after a restart, 0 warms the prefixes only |
+| `PULSE_GATEWAY_WARMUP_SESSION_MAX_AGE_MS` | `1800000` | do not warm a session older than this |
+| `PULSE_GATEWAY_WARMUP_STATE_FILE` | none | keep the warm prefixes in this file (mode 0600; it holds the system prompt) |
 | `PULSE_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 The idle and headers limits are long on purpose. vLLM sends no byte while it

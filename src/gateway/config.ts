@@ -8,6 +8,8 @@
 
 import { readFileSync } from 'node:fs';
 import type { ProfileName } from './translate.js';
+import { defaultWarmupConfig } from './warmer.js';
+import type { WarmupConfig } from './warmer.js';
 
 export interface EndpointConfig {
   /** Short name for logs and metrics, for example `spark1`. */
@@ -78,6 +80,8 @@ export interface GatewayConfig {
   healthTimeoutMs: number;
   /** Time that in-flight requests get to finish after SIGTERM. */
   shutdownGraceMs: number;
+  /** Prefill of the recent prompt prefixes when a backend becomes healthy. */
+  warmup: WarmupConfig;
 }
 
 export const DEFAULT_QWEN_MODEL = 'qwen3.8-flash-next';
@@ -110,6 +114,7 @@ export function defaultConfig(): GatewayConfig {
     healthIntervalMs: 10_000,
     healthTimeoutMs: 3_000,
     shutdownGraceMs: 30_000,
+    warmup: defaultWarmupConfig(),
   };
 }
 
@@ -179,7 +184,9 @@ export function loadConfig(
   const file = flag >= 0 ? argv[flag + 1] : env.PULSE_GATEWAY_CONFIG;
   if (file) {
     const fromFile = JSON.parse(readFileSync(file, 'utf8')) as Partial<GatewayConfig>;
+    const warmup = { ...config.warmup, ...fromFile.warmup };
     Object.assign(config, fromFile);
+    config.warmup = warmup;
   }
 
   if (env.PULSE_GATEWAY_HOST) config.host = env.PULSE_GATEWAY_HOST;
@@ -213,5 +220,9 @@ export function loadConfig(
   config.healthIntervalMs = num(env, 'PULSE_GATEWAY_HEALTH_INTERVAL_MS') ?? config.healthIntervalMs;
   config.healthTimeoutMs = num(env, 'PULSE_GATEWAY_HEALTH_TIMEOUT_MS') ?? config.healthTimeoutMs;
   config.shutdownGraceMs = num(env, 'PULSE_GATEWAY_SHUTDOWN_GRACE_MS') ?? config.shutdownGraceMs;
+  if (env.PULSE_GATEWAY_WARMUP) config.warmup.enabled = env.PULSE_GATEWAY_WARMUP !== '0';
+  config.warmup.sessions = num(env, 'PULSE_GATEWAY_WARMUP_SESSIONS') ?? config.warmup.sessions;
+  config.warmup.sessionMaxAgeMs = num(env, 'PULSE_GATEWAY_WARMUP_SESSION_MAX_AGE_MS') ?? config.warmup.sessionMaxAgeMs;
+  if (env.PULSE_GATEWAY_WARMUP_STATE_FILE) config.warmup.stateFile = env.PULSE_GATEWAY_WARMUP_STATE_FILE;
   return validateConfig(config);
 }

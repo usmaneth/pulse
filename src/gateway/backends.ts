@@ -24,6 +24,11 @@ export class Endpoint {
   lastOkAt: number | null = null;
   lastError: string | null = null;
   consecutiveFailures = 0;
+  /**
+   * Called when the endpoint becomes healthy: at the first successful check
+   * (previous is null) and after a failure (previous is false).
+   */
+  onHealthy: ((endpoint: Endpoint, previous: boolean | null) => void) | null = null;
 
   constructor(readonly config: EndpointConfig) {}
 
@@ -31,11 +36,13 @@ export class Endpoint {
   get enabled(): boolean { return this.config.enabled !== false; }
 
   markUp(): void {
-    if (this.healthy === false) log('info', 'backend is healthy again', { backend: this.name });
+    const previous = this.healthy;
+    if (previous === false) log('info', 'backend is healthy again', { backend: this.name });
     this.healthy = true;
     this.lastOkAt = Date.now();
     this.consecutiveFailures = 0;
     this.lastError = null;
+    if (previous !== true) this.onHealthy?.(this, previous);
   }
 
   markDown(reason: string): void {
