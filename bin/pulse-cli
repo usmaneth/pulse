@@ -204,6 +204,15 @@ function help() {
   pulse profile   print the active tuning profile with provenance
   pulse version
 
+  pulse model     bring a measured vLLM profile up or down on a node (Qwen3.8)
+    profiles                  list runtime/qwen38/profiles and runtime/nodes.json
+    up <profile> --node N     render the .env, restart the recipe, wait for /v1/models
+    down --node N             stop the server on the node
+    status [--node N]         container, profile, drift, health, KV size, memory
+    smoke --node N            one short chat completion on the node
+    --dry-run                 print the rendered .env and every step; run nothing
+    See docs/RUNTIME.md and 'pulse model --help'.
+
 Pulse does not replace llama.cpp. It encodes what was measured to work on this
 hardware, and ships the suite that measured it. See bench/RESULTS.md - including
 the negative results, which are the more useful half.`);
@@ -215,5 +224,16 @@ switch (command) {
   case 'doctor': process.exit(doctor()); break;
   case 'profile': console.log(JSON.stringify(loadProfile(flag('profile', 'gb10-bonsai2')), null, 2)); break;
   case 'version': case '--version': case '-v': console.log('pulse 2.0.0 (GB10 / sm_121)'); break;
+  case 'model': {
+    let mod;
+    try {
+      mod = await import('../dist/runtime/cli.js');
+    } catch (e) {
+      if (e?.code !== 'ERR_MODULE_NOT_FOUND') throw e;
+      console.error('pulse model: dist/runtime/cli.js is missing. Run npx tsc in the repo first.');
+      process.exit(1);
+    }
+    process.exit(await mod.main(args.slice(1)));
+  }
   default: help();
 }
