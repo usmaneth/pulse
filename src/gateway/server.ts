@@ -324,8 +324,10 @@ export class Gateway {
       }
       if (signal.aborted) throw new HttpError(499, 'client closed the request', 'cancelled');
       const reason = errors.join('; ') || 'no enabled backends';
-      const wait = retryDelayMs(attempt);
-      if (Date.now() + wait > deadline) {
+      // The last wait ends at the deadline, so the last attempt comes at the
+      // end of the full retry window.
+      const wait = Math.min(retryDelayMs(attempt), deadline - Date.now());
+      if (wait <= 0) {
         throw new HttpError(503, `no backend could take the request (${reason})`, 'backend_unavailable', { 'Retry-After': String(RETRY_AFTER_S) });
       }
       this.metrics.retries++;
@@ -541,11 +543,11 @@ export class Gateway {
           // The client has no output of this attempt yet, so the gateway can
           // send the request again. It is stateless, and the prefix cache of
           // the backend makes the new prefill short.
-          const wait = retryDelayMs(attempt);
+          const wait = Math.min(retryDelayMs(attempt), deadline - Date.now());
           endpoint.stats.errors++;
           endpoint.markDown(broken);
           release();
-          if (Date.now() + wait > deadline) throw new Error(broken);
+          if (wait <= 0) throw new Error(broken);
           m.retries++;
           log('warn', 'backend stream broke before any output; retrying', {
             request_id: requestId, backend: endpoint.name, attempt: attempt + 1, wait_ms: wait, error: broken,

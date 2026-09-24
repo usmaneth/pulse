@@ -560,6 +560,63 @@ test('retry: a backend that comes back within the retry window serves the reques
   }
 });
 
+test('retry: the last attempt comes at the end of the full retry window', async () => {
+  // The waits are 250 ms and 500 ms, then the rest of the window. A backend
+  // that comes back after 850 ms of a 1000 ms window still gets the request.
+  const dead = await deadPort();
+  const port = Number(new URL(dead).port);
+  let late: http.Server | null = null;
+  const lateStart = setTimeout(() => {
+    late = http.createServer(async (req, res) => {
+      if (req.url === '/health') { res.writeHead(200); res.end(); return; }
+      for await (const _ of req) { /* drain */ }
+      sse(res, reply('just in time'));
+    });
+    late.listen(port, '127.0.0.1');
+  }, 850);
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }], { retryWindowMs: 1_000 });
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x' });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json() as Obj).output[0].content[0].text, 'just in time');
+  } finally {
+    clearTimeout(lateStart);
+    await gateway.stop();
+    const server = late as http.Server | null;
+    if (server) await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); });
+  }
+});
+
+test('retry: a backend that stays down gets attempts until the window ends', async () => {
+  const dead = await deadPort();
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }], { retryWindowMs: 1_000 });
+  try {
+    const started = Date.now();
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x' });
+    const elapsed = Date.now() - started;
+    assert.equal(res.status, 503);
+    assert(elapsed >= 950, `the gateway gave up after ${elapsed} ms of a 1000 ms window`);
+    assert(elapsed < 2_000, `the gateway waited ${elapsed} ms for a 1000 ms window`);
+  } finally { await gateway.stop(); }
+});
+
+test('retry: a stream that breaks before output is sent again until the end of the window', async () => {
+  const started = Date.now();
+  const backend = await mockBackend((_b, _q, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    if (Date.now() - started < 850) { res.destroy(); return; }
+    for (const c of reply('after the restart')) res.write(chunkFrame(c));
+    res.end('data: [DONE]\n\n');
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { retryWindowMs: 1_000 });
+  try {
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+    assert.equal(evs.at(-1)!.response.output[0].content[0].text, 'after the restart');
+    assert(backend.requests.length >= 4);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
 test('retry: 503 while the backend loads, then 200, is one completed response', async () => {
   let calls = 0;
   const backend = await mockBackend((_b, _q, res) => {
