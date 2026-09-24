@@ -27,6 +27,10 @@ async function main(): Promise<void> {
     log('info', 'stopped');
     process.exit(0);
   };
+  // A stray rejected promise must not stop the process and every stream in it.
+  process.on('unhandledRejection', (reason) => {
+    log('error', 'unhandled promise rejection', { error: String(reason) });
+  });
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }

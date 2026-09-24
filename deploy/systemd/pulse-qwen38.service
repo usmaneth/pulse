@@ -30,7 +30,8 @@ ExecStart=%h/.nvm/versions/node/v24.21.0/bin/node %h/pulse/dist/gateway/index.js
 # PULSE_GATEWAY_SHUTDOWN_GRACE_MS (default 30 s) for in-flight requests.
 KillSignal=SIGTERM
 TimeoutStopSec=45
-Restart=on-failure
+# Restart after any exit. Codex retries the requests of the gap.
+Restart=always
 RestartSec=3
 # The gateway holds no model weights. A small cap protects the GPU host.
 MemoryMax=1G

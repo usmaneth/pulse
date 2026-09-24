@@ -4,7 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, flattenTools, normalizeToolOutput, responsesToChat,
+  ChatStreamTranslator, CUSTOM_TOOL_HINT, RequestError, arrangeSystem, flattenTools, forcedCallSchema, grammarHint,
+  mapToolChoice, mergeAssistantTurns, normalizeToolOutput, repairPatchEnvelope, responsesToChat,
 } from './translate.js';
 import type { Obj, ResponseEvent } from './translate.js';
 
@@ -68,7 +69,8 @@ test('tools: function kept, custom wrapped, namespace flattened, tool_search and
   const { tools, map } = flattenTools(CODEX_TOOLS);
   assert.deepEqual(tools.map((t) => t.function.name), ['shell_command', 'apply_patch', 'mcp__github__get_issue']);
   const patch = tools[1].function;
-  assert.equal(patch.description, 'Use the apply_patch tool to edit files.' + CUSTOM_TOOL_HINT);
+  assert.equal(patch.description, 'Use the apply_patch tool to edit files.' + CUSTOM_TOOL_HINT +
+    '\nThe input string must follow this lark grammar:\nstart: begin_patch');
   assert.deepEqual(patch.parameters, { type: 'object', properties: { input: { type: 'string' } }, required: ['input'] });
   assert(map.custom.has('apply_patch'));
   assert.deepEqual(map.namespaced.get('mcp__github__get_issue'), ['mcp__github', 'get_issue']);
@@ -98,7 +100,7 @@ test('history: system merge, tool calls, custom calls, namespaces, parallel call
   assert.deepEqual(payload.messages, [
     { role: 'system', content: 'base instructions\n\ndev note' },
     { role: 'user', content: 'fix the bug' },
-    { role: 'assistant', content: null, tool_calls: [
+    { role: 'assistant', content: null, reasoning_content: 'thinking', tool_calls: [
       { id: 'c1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
       { id: 'c2', type: 'function', function: { name: 'mcp__github__get_issue', arguments: '{"number":1}' } },
     ] },
@@ -125,6 +127,197 @@ test('invalid requests raise RequestError', () => {
   assert.throws(() => responsesToChat([], qwen), RequestError);
   assert.throws(() => responsesToChat({ input: 3 }, qwen), RequestError);
   assert.throws(() => responsesToChat({ input: 'x', previous_response_id: 'r' }, qwen), RequestError);
+});
+
+test('unsupported input gets a clear RequestError instead of a silent drop', () => {
+  const bad: Array<[Obj, RegExp]> = [
+    [{ input: 'x', conversation: 'c' }, /conversation is not supported/],
+    [{ input: 'x', background: true }, /background is not supported/],
+    [{ input: 'x', store: true }, /store=true is not supported/],
+    [{ input: 'x', text: { format: { type: 'xml' } } }, /text.format xml is not supported/],
+    [{ input: 'x', text: { format: { type: 'json_schema', name: 'n' } } }, /json_schema needs a schema object/],
+    [{ input: [{ type: 'web_search_call', id: 'w' }] }, /unsupported input item type: web_search_call/],
+    [{ input: [{ type: 'message', role: 'tool', content: 'x' }] }, /unsupported message role: tool/],
+  ];
+  for (const [request, message] of bad) assert.throws(() => responsesToChat(request, qwen), message);
+  // Codex sends these. They must pass.
+  responsesToChat({ input: 'x', store: false, text: { format: { type: 'text' }, verbosity: 'low' } }, qwen);
+});
+
+test('history: only the plugin block leaves the Codex context message', () => {
+  // Codex 0.156 sends the plugin list, AGENTS.md and the environment context
+  // as three parts of one user message.
+  const plugins = '<recommended_plugins>\n- Box (box@openai-curated-remote)\n</recommended_plugins>';
+  const agents = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\nUse short sentences.\n</INSTRUCTIONS>';
+  const env = '<environment_context>\n  <cwd>/work/app</cwd>\n  <shell>zsh</shell>\n</environment_context>';
+  const { payload } = responsesToChat({ model: 'm', input: [
+    { type: 'message', role: 'user', content: [
+      { type: 'input_text', text: plugins }, { type: 'input_text', text: agents }, { type: 'input_text', text: env },
+    ] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fix the bug' }] },
+  ] }, qwen);
+  assert.deepEqual(payload.messages, [
+    { role: 'user', content: agents + env },
+    { role: 'user', content: 'fix the bug' },
+  ]);
+  // A block inside a text part goes, and the text around it stays.
+  const inline = responsesToChat({ model: 'm', input: [{ type: 'message', role: 'user', content: `a\n${plugins}\nb` }] }, qwen);
+  assert.deepEqual(inline.payload.messages, [{ role: 'user', content: 'a\nb' }]);
+});
+
+test('text.format: json_schema and json_object become an instruction at the end of the system prompt', () => {
+  const schema = { type: 'object', properties: { answer: { type: 'integer' } }, required: ['answer'], additionalProperties: false };
+  const input = [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'dev' }] },
+    { type: 'message', role: 'user', content: 'what is 2+3?' },
+  ];
+  // The shape that `codex exec --output-schema` sends.
+  const text = { verbosity: 'low', format: { type: 'json_schema', name: 'codex_output_schema', strict: true, schema } };
+  const { payload } = responsesToChat({ model: 'm', instructions: 'base', tools: CODEX_TOOLS, input, text }, qwen);
+  const system = payload.messages[0];
+  assert.equal(system.role, 'system');
+  assert(system.content.startsWith('base\n\ndev\n\n'), system.content);
+  assert(system.content.endsWith(JSON.stringify(schema)), system.content);
+  assert.match(system.content, /final answer must be one JSON object that matches this JSON schema/);
+  // The tool loop must keep working, so the backend gets no response_format.
+  assert.equal(payload.response_format, undefined);
+  assert.equal(payload.tools.length, 3);
+  assert.deepEqual(payload.messages.slice(1), [{ role: 'user', content: 'what is 2+3?' }]);
+  const plain = responsesToChat({ model: 'm', input: 'x', text: { format: { type: 'json_object' } } }, qwen).payload;
+  assert.equal(plain.messages[0].role, 'system');
+  assert.match(plain.messages[0].content, /final answer must be one JSON object/);
+  assert.deepEqual(plain.messages[1], { role: 'user', content: 'x' });
+  const none = responsesToChat({ model: 'm', input: 'x', text: { format: { type: 'text' } } }, qwen).payload;
+  assert.deepEqual(none.messages, [{ role: 'user', content: 'x' }]);
+});
+
+test('history: call arguments that are not a JSON object go back as {}', () => {
+  // vLLM parses the arguments of each earlier call to render the template. A
+  // call cut short in the stream made every later request of the session fail
+  // with 400 "Unterminated string".
+  const input = [
+    { type: 'message', role: 'user', content: 'go' },
+    { type: 'function_call', call_id: 'a', name: 'shell_command', arguments: '{"command": "ls -la' },
+    { type: 'function_call_output', call_id: 'a', output: 'failed to parse function arguments: EOF while parsing a string' },
+    { type: 'function_call', call_id: 'b', name: 'shell_command', arguments: '["ls"]' },
+    { type: 'function_call_output', call_id: 'b', output: 'x' },
+    { type: 'function_call', call_id: 'c', name: 'shell_command', arguments: '{"command": "pwd"}' },
+    { type: 'function_call_output', call_id: 'c', output: '/w' },
+  ];
+  const { payload } = responsesToChat({ model: 'm', input }, qwen);
+  const args = payload.messages.filter((m: Obj) => m.tool_calls).flatMap((m: Obj) => m.tool_calls.map((c: Obj) => c.function.arguments));
+  // A valid object keeps its exact bytes, so the prompt prefix does not change.
+  assert.deepEqual(args, ['{}', '{}', '{"command": "pwd"}']);
+});
+
+test('grammar hint: only custom tools with a grammar format get one', () => {
+  assert.equal(grammarHint(undefined), '');
+  assert.equal(grammarHint({ type: 'text' }), '');
+  assert.equal(grammarHint({ type: 'grammar', syntax: 'lark', definition: '  ' }), '');
+  assert.equal(grammarHint({ type: 'grammar', syntax: 'regex', definition: 'a+\n' }), '\nThe input string must follow this regex grammar:\na+');
+  const { tools } = flattenTools([{ type: 'custom', name: 'free', description: 'd' }]);
+  assert.equal(tools[0].function.description, 'd' + CUSTOM_TOOL_HINT);
+});
+
+test('reasoning replay: reasoning, text and calls of one turn become one assistant message', () => {
+  const input = [
+    { type: 'message', role: 'user', content: 'go' },
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'plan' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Running ls.' }] },
+    { type: 'function_call', call_id: 'c1', name: 'shell_command', arguments: '{"command":"ls"}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'a.ts' },
+    { type: 'reasoning', summary: [], encrypted_content: 'opaque' },
+    { type: 'reasoning', summary: [], content: [{ type: 'reasoning_text', text: 'from content' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] },
+  ];
+  const { payload } = responsesToChat({ model: 'm', input }, qwen);
+  assert.deepEqual(payload.messages, [
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: 'Running ls.', reasoning_content: 'plan', tool_calls: [
+      { id: 'c1', type: 'function', function: { name: 'shell_command', arguments: '{"command":"ls"}' } },
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: 'a.ts' },
+    { role: 'assistant', content: 'Done.', reasoning_content: 'from content' },
+  ]);
+  const off = responsesToChat({ model: 'm', input }, { ...qwen, replayReasoning: false }).payload;
+  assert.equal(off.messages[1].reasoning_content, undefined);
+  assert.equal(off.messages[1].content, 'Running ls.');
+});
+
+test('merge: a new model turn starts at reasoning or text that follows calls', () => {
+  const call = (id: string) => ({ id, type: 'function', function: { name: 'f', arguments: '{}' } });
+  assert.deepEqual(mergeAssistantTurns([
+    { role: 'assistant', content: null, tool_calls: [call('a')] },
+    { role: 'assistant', content: null, tool_calls: [call('b')] },
+    { role: 'assistant', content: null, reasoning_content: 'r2' },
+    { role: 'assistant', content: 'x' },
+    { role: 'assistant', content: null, tool_calls: [call('c')] },
+    { role: 'assistant', content: 'after calls' },
+  ]), [
+    { role: 'assistant', content: null, tool_calls: [call('a'), call('b')] },
+    { role: 'assistant', content: 'x', reasoning_content: 'r2', tool_calls: [call('c')] },
+    { role: 'assistant', content: 'after calls' },
+  ]);
+});
+
+test('system: qwen38 keeps a late developer message in place; llamacpp moves it to the start', () => {
+  const messages = [
+    { role: 'system', content: 'a' },
+    { role: 'system', content: 'b' },
+    { role: 'user', content: 'u1' },
+    { role: 'system', content: 'late' },
+    { role: 'system', content: '' },
+    { role: 'user', content: 'u2' },
+  ];
+  assert.deepEqual(arrangeSystem(messages.map((m) => ({ ...m })), 'qwen38'), [
+    { role: 'system', content: 'a\n\nb' },
+    { role: 'user', content: 'u1' },
+    { role: 'system', content: 'late' },
+    { role: 'user', content: 'u2' },
+  ]);
+  assert.deepEqual(arrangeSystem(messages.map((m) => ({ ...m })), 'llamacpp'), [
+    { role: 'system', content: 'a\n\nb\n\nlate' },
+    { role: 'user', content: 'u1' },
+    { role: 'user', content: 'u2' },
+  ]);
+});
+
+test('prefix stability: the next turn starts with the same messages', () => {
+  const turn1 = [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'rules' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'task' }] },
+  ];
+  const turn2 = [
+    ...turn1,
+    { type: 'reasoning', summary: [{ type: 'summary_text', text: 'plan' }] },
+    { type: 'function_call', call_id: 'c1', name: 'shell_command', arguments: '{"command":"ls"}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'a.ts' },
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'approval mode changed' }] },
+  ];
+  const body = { model: 'm', instructions: 'base', tools: CODEX_TOOLS, reasoning: { effort: 'high' } };
+  const a = responsesToChat({ ...body, input: turn1 }, qwen).payload;
+  const b = responsesToChat({ ...body, input: turn2 }, qwen).payload;
+  assert.equal(JSON.stringify(b.tools), JSON.stringify(a.tools));
+  assert.equal(JSON.stringify(b.messages.slice(0, a.messages.length)), JSON.stringify(a.messages));
+});
+
+test('tool_choice: names map to the flat function name; parallel_tool_calls passes', () => {
+  const names = new Set(['shell_command', 'apply_patch', 'mcp__github__get_issue']);
+  assert.equal(mapToolChoice('auto', names), 'auto');
+  assert.equal(mapToolChoice('required', names), 'required');
+  assert.deepEqual(mapToolChoice({ type: 'custom', name: 'apply_patch' }, names), { type: 'function', function: { name: 'apply_patch' } });
+  assert.deepEqual(mapToolChoice({ type: 'function', name: 'get_issue', namespace: 'mcp__github' }, names),
+    { type: 'function', function: { name: 'mcp__github__get_issue' } });
+  assert.throws(() => mapToolChoice({ type: 'function', name: 'nope' }, names), /not in tools/);
+  assert.throws(() => mapToolChoice({ type: 'allowed_tools', tools: [] }, names), /unsupported tool_choice type/);
+  assert.throws(() => mapToolChoice('sometimes', names), /unsupported tool_choice/);
+  const { payload } = responsesToChat({ model: 'm', input: 'x', tools: CODEX_TOOLS, tool_choice: 'auto', parallel_tool_calls: true }, qwen);
+  assert.equal(payload.tool_choice, 'auto');
+  assert.equal(payload.parallel_tool_calls, true);
+  // vLLM rejects tool_choice without tools, so it is not sent.
+  const bare = responsesToChat({ model: 'm', input: 'x', tool_choice: 'auto', parallel_tool_calls: false }, qwen).payload;
+  assert.equal(bare.tool_choice, undefined);
+  assert.equal(bare.parallel_tool_calls, undefined);
 });
 
 // ----------------------------------------------------------------- stream
@@ -204,14 +397,17 @@ test('stream: qwen3_xml tool call deltas become a function_call', () => {
     { type: call.type, call_id: call.call_id, name: call.name, arguments: call.arguments, status: call.status },
     { type: 'function_call', call_id: 'chatcmpl-tool-1', name: 'shell_command', arguments: '{"command": "ls -la"}', status: 'completed' },
   );
-  assert.deepEqual(types(events).slice(-6), [
+  assert.deepEqual(types(events).slice(-7), [
     'response.output_item.done', // reasoning closes when the tool call starts
     'response.output_item.added',
+    'response.function_call_arguments.delta',
     'response.function_call_arguments.delta',
     'response.function_call_arguments.done',
     'response.output_item.done',
     'response.completed',
   ]);
+  const deltas = events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta);
+  assert.deepEqual(deltas, ['{"command": ', '"ls -la"}']);
   const added = events.find((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call') as Obj;
   assert.equal(added.output_index, 1);
   assert.equal(added.item.status, 'in_progress');
@@ -272,9 +468,83 @@ test('stream: finish_reason length is incomplete and drops partial tool calls', 
   ]);
   assert.equal(t.response.status, 'incomplete');
   assert.deepEqual(t.response.incomplete_details, { reason: 'max_output_tokens' });
+  // The text before the call is complete. The call is not, and it leaves the output.
   assert.equal(t.response.output.length, 1);
-  assert.equal(t.response.output[0].status, 'incomplete');
+  assert.equal(t.response.output[0].type, 'message');
+  assert.equal(t.response.output[0].status, 'completed');
   assert.equal(events.at(-1)!.type, 'response.incomplete');
+  assert(!events.some((e) => e.type === 'response.function_call_arguments.done'));
+  assert(!events.some((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'function_call'));
+});
+
+test('stream: finish_reason length marks a text-only message incomplete', () => {
+  const { t } = run([chunk({ content: 'partial' }), chunk({}, 'length')]);
+  assert.equal(t.response.output[0].status, 'incomplete');
+});
+
+test('stream: finish_reason length drops every call of the turn, also the complete ones', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":"ls"}' } }] }),
+    chunk({ tool_calls: [{ index: 1, id: 'b', function: { name: 'shell_command', arguments: '{"comm' } }] }),
+    chunk({}, 'length'),
+  ]);
+  assert.deepEqual(t.response.output, []);
+  assert(!events.some((e) => e.type === 'response.output_item.done'));
+});
+
+test('stream: function call arguments go out before the finish reason', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  const first = t.push(chunk({ tool_calls: [{ index: 0, id: 'c', function: { name: 'shell_command', arguments: '{"comm' } }] }));
+  assert.deepEqual(types(first), ['response.output_item.added', 'response.function_call_arguments.delta']);
+  assert.equal((first[0] as Obj).item.status, 'in_progress');
+  assert.equal((first[0] as Obj).item.arguments, '');
+  const second = t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: 'and":"ls"}' } }] }));
+  assert.deepEqual(types(second), ['response.function_call_arguments.delta']);
+  assert.equal((second[0] as Obj).delta, 'and":"ls"}');
+  t.push(chunk({}, 'tool_calls'));
+  const end = t.finishStream();
+  assert.deepEqual(types(end), ['response.function_call_arguments.done', 'response.output_item.done', 'response.completed']);
+  assert.equal((end[0] as Obj).arguments, '{"command":"ls"}');
+  assert.equal((end[1] as Obj).item.status, 'completed');
+});
+
+test('stream: text closes before the first call; white space between calls is dropped', () => {
+  const { events, t } = run([
+    chunk({ content: 'I will list.' }),
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":"ls"}' } }] }),
+    chunk({ content: '\n' }),
+    chunk({ tool_calls: [{ index: 1, id: 'b', function: { name: 'shell_command', arguments: '{"command":"pwd"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.deepEqual(t.response.output.map((i: Obj) => i.type), ['message', 'function_call', 'function_call']);
+  assert.equal(t.response.output[0].content[0].text, 'I will list.');
+  const doneMsg = events.findIndex((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'message');
+  const addedCall = events.findIndex((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call');
+  assert(doneMsg < addedCall);
+  const doneIds = events.filter((e) => e.type === 'response.output_item.done').map((e) => (e as Obj).item.call_id);
+  assert.deepEqual(doneIds, [undefined, 'a', 'b']);
+});
+
+test('stream: arguments that arrive before the name go out when the name arrives', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { arguments: '{"command":' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { name: 'shell_command', arguments: '"ls"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  const deltas = events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta);
+  assert.equal(deltas.join(''), '{"command":"ls"}');
+  assert.equal(t.response.output[0].arguments, '{"command":"ls"}');
+});
+
+test('stream: a call without arguments gets {}', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.equal(t.response.output[0].arguments, '{}');
+  assert.equal(events.filter((e) => e.type === 'response.function_call_arguments.delta').map((e) => (e as Obj).delta).join(''), '{}');
 });
 
 test('stream: a stream without a finish reason fails', () => {
@@ -284,7 +554,262 @@ test('stream: a stream without a finish reason fails', () => {
   assert(!types(events).includes('response.completed'));
 });
 
+test('stream: a finish reason without any output fails instead of an empty completed response', () => {
+  // Seen live: vLLM generated 156 tokens and streamed no delta. An empty
+  // completed response ends the Codex task with no answer.
+  const { events, t } = run([
+    chunk({ role: 'assistant', content: '' }),
+    chunk({}, 'stop'),
+    { choices: [], usage: { prompt_tokens: 11335, completion_tokens: 156, total_tokens: 11491 } },
+  ]);
+  assert.equal(events.at(-1)!.type, 'response.failed');
+  assert.equal(t.response.status, 'failed');
+  assert.match(t.response.error.message, /finished \(stop\) without any text, reasoning or tool call after 156 output tokens/);
+  assert(!types(events).includes('response.completed'));
+  // Hidden reasoning is still output: the model did answer.
+  const hidden = run([chunk({ reasoning_content: 'x' }), chunk({}, 'stop')], [], false);
+  assert.equal(hidden.t.response.status, 'completed');
+});
+
 test('stream: a backend error chunk throws', () => {
   const t = new ChatStreamTranslator('m', flattenTools([]).map);
   assert.throws(() => t.push({ error: { message: 'boom' } }), /boom/);
+});
+
+test('stream: a custom call and a function call keep the slot order in the output and the events', () => {
+  const patch = JSON.stringify({ input: '*** Begin Patch\n*** End Patch' });
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'p', function: { name: 'apply_patch', arguments: patch } }] }),
+    chunk({ tool_calls: [{ index: 1, id: 's', function: { name: 'shell_command', arguments: '{"command":"git diff"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.deepEqual(t.response.output.map((i: Obj) => [i.type, i.call_id]), [['custom_tool_call', 'p'], ['function_call', 's']]);
+  const added = events.filter((e) => e.type === 'response.output_item.added').map((e) => [(e as Obj).item.call_id, (e as Obj).output_index]);
+  assert.deepEqual(added, [['p', 0], ['s', 1]]);
+  const done = events.filter((e) => e.type === 'response.output_item.done').map((e) => [(e as Obj).item.call_id, (e as Obj).output_index]);
+  assert.deepEqual(done, [['p', 0], ['s', 1]]);
+});
+
+test('stream: a custom call opens its item when the name arrives', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  const first = t.push(chunk({ tool_calls: [{ index: 0, id: 'p', function: { name: 'apply_patch', arguments: '{"input":' } }] }));
+  assert.deepEqual(types(first), ['response.output_item.added']);
+  assert.deepEqual([(first[0] as Obj).item.type, (first[0] as Obj).item.status, (first[0] as Obj).item.input], ['custom_tool_call', 'in_progress', '']);
+  // The input is JSON that must be unwrapped as a whole, so no delta goes out before the finish reason.
+  assert.deepEqual(t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] })), []);
+  t.push(chunk({}, 'tool_calls'));
+  const end = t.finishStream();
+  assert.deepEqual(types(end), [
+    'response.custom_tool_call_input.delta', 'response.custom_tool_call_input.done', 'response.output_item.done', 'response.completed',
+  ]);
+  assert.equal((end[2] as Obj).item.input, 'x');
+  assert.equal((end[2] as Obj).item.status, 'completed');
+});
+
+test('stream: a tool call that never gets a name does not count as output', () => {
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'a', function: { arguments: '{"command":' } }] }),
+    chunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  assert.equal(events.at(-1)!.type, 'response.failed');
+  assert.equal(t.response.status, 'failed');
+  assert.equal(t.hasOutput, false);
+});
+
+test('stream: a failed response carries the call arguments that already went out', () => {
+  const { map } = flattenTools(CODEX_TOOLS);
+  const t = new ChatStreamTranslator('m', map);
+  t.start();
+  t.push(chunk({ tool_calls: [{ index: 0, id: 'a', function: { name: 'shell_command', arguments: '{"command":' } }] }));
+  t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"' } }] }));
+  // The server fails the stream this way on a timeout or a client drop.
+  const failed = t.fail('backend idle for 900000 ms');
+  assert.equal((failed[0] as Obj).response.output[0].arguments, '{"command":"ls"');
+  // A stream without a finish reason fails the same way.
+  assert.equal(t.finishStream().at(-1)!.type, 'response.failed');
+  assert.equal(t.response.output[0].arguments, '{"command":"ls"');
+});
+
+// ------------------------------------------------------- patch envelope
+
+test('patch envelope: a patch that starts at its hunk header gets Begin and End lines', () => {
+  const bare = '*** Add File: primes.py\n+print(2)\n';
+  assert.deepEqual(repairPatchEnvelope(bare), {
+    input: '*** Begin Patch\n*** Add File: primes.py\n+print(2)\n*** End Patch\n', added: ['begin', 'end'],
+  });
+  const noBegin = '\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch';
+  assert.deepEqual(repairPatchEnvelope(noBegin), {
+    input: '*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch\n', added: ['begin'],
+  });
+  const noEnd = '*** Begin Patch\n*** Delete File: old.txt';
+  assert.deepEqual(repairPatchEnvelope(noEnd), {
+    input: '*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\n', added: ['end'],
+  });
+});
+
+test('patch envelope: a complete patch and other text stay byte for byte the same', () => {
+  for (const input of [
+    '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch',
+    '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n',
+    'echo hello',
+    '',
+    '*** Add File:',
+    '*** Begin Patch',
+    '*** Begin Patch\n+stray line',
+    '--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n',
+  ]) {
+    assert.deepEqual(repairPatchEnvelope(input), { input, added: [] });
+  }
+});
+
+test('stream: an apply_patch call without Begin Patch is repaired and recorded', () => {
+  const bare = '*** Add File: primes.py\n+print(2)\n';
+  const { events, t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'call_b', function: { name: 'apply_patch', arguments: JSON.stringify({ input: bare }) } }] }),
+    chunk({}, 'tool_calls'),
+  ]);
+  const fixed = '*** Begin Patch\n*** Add File: primes.py\n+print(2)\n*** End Patch\n';
+  assert.equal(t.response.output[0].input, fixed);
+  assert.equal((events.find((e) => e.type === 'response.custom_tool_call_input.done') as Obj).input, fixed);
+  assert.equal((events.find((e) => e.type === 'response.custom_tool_call_input.delta') as Obj).delta, fixed);
+  assert.deepEqual(t.repairs, [{ call_id: 'call_b', name: 'apply_patch', added: ['begin', 'end'] }]);
+});
+
+test('stream: only apply_patch gets the envelope repair', () => {
+  const tools = [{ type: 'custom', name: 'notes' }];
+  const input = '*** Add File: primes.py\n+print(2)\n';
+  const { t } = run([
+    chunk({ tool_calls: [{ index: 0, id: 'call_n', function: { name: 'notes', arguments: JSON.stringify({ input }) } }] }),
+    chunk({}, 'tool_calls'),
+  ], tools);
+  assert.equal(t.response.output[0].input, input);
+  assert.deepEqual(t.repairs, []);
+});
+
+// ------------------------------------------------------ forced tool_choice
+
+const FORCE_TOOLS = [
+  { type: 'function', name: 'calculator', description: 'Math.', parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] } },
+  { type: 'function', name: 'web_search', description: 'Search.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
+  { type: 'custom', name: 'apply_patch', description: 'Patch.' },
+];
+
+test('forced tool_choice: qwen38 sends a JSON schema of the calls, not the tool_choice', () => {
+  const chat = responsesToChat({ model: 'm', input: 'What is 7 times 8?', tools: FORCE_TOOLS, tool_choice: 'required' }, qwen);
+  const p = chat.payload;
+  assert.equal(p.tool_choice, undefined);
+  assert.equal(p.tools.length, 3);
+  assert.equal(chat.tools.forced, true);
+  assert.equal(p.response_format.type, 'json_schema');
+  assert.equal(p.response_format.json_schema.name, 'tool_calls');
+  const schema = p.response_format.json_schema.schema;
+  assert.equal(schema.type, 'array');
+  assert.equal(schema.minItems, 1);
+  assert.equal(schema.maxItems, undefined);
+  assert.deepEqual(schema.items.anyOf.map((v: Obj) => v.properties.name.enum[0]), ['calculator', 'web_search', 'apply_patch']);
+  assert.deepEqual(schema.items.anyOf[0].properties.parameters, FORCE_TOOLS[0].parameters);
+  assert.deepEqual(schema.items.anyOf[2].properties.parameters.required, ['input']);
+  // The note goes at the end, so the prompt prefix is the same as without a forced choice.
+  const plain = responsesToChat({ model: 'm', input: 'What is 7 times 8?', tools: FORCE_TOOLS, tool_choice: 'auto' }, qwen).payload;
+  assert.deepEqual(p.messages.slice(0, -1), plain.messages);
+  assert.deepEqual(p.messages.at(-1), { role: 'system', content: 'This reply must be a tool call. Do not reply with text. Use the tool that fits the request best.' });
+});
+
+test('forced tool_choice: a named tool allows one call to that tool; parallel_tool_calls false allows one call', () => {
+  const named = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: { type: 'function', name: 'web_search' } }, qwen).payload;
+  const schema = named.response_format.json_schema.schema;
+  assert.equal(schema.maxItems, 1);
+  assert.deepEqual(schema.items.properties.name.enum, ['web_search']);
+  assert.equal(named.messages.at(-1).content, 'This reply must be a call to the tool web_search. Do not reply with text.');
+  const single = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required', parallel_tool_calls: false }, qwen).payload;
+  assert.equal(single.response_format.json_schema.schema.maxItems, 1);
+  assert.equal(single.parallel_tool_calls, false);
+  const direct = forcedCallSchema(flattenTools(FORCE_TOOLS).tools, { type: 'function', function: { name: 'calculator' } }, false);
+  assert.deepEqual(direct.items.properties.name.enum, ['calculator']);
+});
+
+test('forced tool_choice: auto and none, native mode and llamacpp keep the tool_choice field', () => {
+  for (const choice of ['auto', 'none']) {
+    const chat = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: choice }, qwen);
+    assert.equal(chat.payload.tool_choice, choice);
+    assert.equal(chat.payload.response_format, undefined);
+    assert.equal(chat.tools.forced, undefined);
+  }
+  const native = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required' }, { ...qwen, forcedToolChoice: 'native' });
+  assert.equal(native.payload.tool_choice, 'required');
+  assert.equal(native.payload.response_format, undefined);
+  const bonsai = responsesToChat({ model: 'm', input: 'x', tools: FORCE_TOOLS, tool_choice: 'required' }, llama);
+  assert.equal(bonsai.payload.tool_choice, 'required');
+  assert.equal(bonsai.tools.forced, undefined);
+});
+
+function runForced(chunks: Obj[], tools: unknown = FORCE_TOOLS) {
+  const { map } = flattenTools(tools);
+  map.forced = true;
+  const t = new ChatStreamTranslator('qwen3.8-flash-next', map);
+  const events = [...t.start()];
+  for (const c of chunks) events.push(...t.push(c));
+  events.push(...t.finishStream());
+  return { events, t };
+}
+
+test('forced stream: the JSON answer becomes function calls after the reasoning, with no message item', () => {
+  const json = '[\n  {"name": "calculator", "parameters": {"expression": "7 * 8"}},\n  {"name": "web_search", "parameters": {"query": "56"}}\n]';
+  const { events, t } = runForced([
+    chunk({ reasoning_content: 'I know it is 56.' }),
+    chunk({ content: json.slice(0, 12) }),
+    chunk({ content: json.slice(12) }),
+    chunk({}, 'stop'),
+  ]);
+  assert.equal(t.response.status, 'completed');
+  assert.deepEqual(t.response.output.map((i: Obj) => i.type), ['reasoning', 'function_call', 'function_call']);
+  assert.deepEqual(t.response.output.slice(1).map((i: Obj) => [i.name, i.arguments, i.status]), [
+    ['calculator', '{"expression":"7 * 8"}', 'completed'],
+    ['web_search', '{"query":"56"}', 'completed'],
+  ]);
+  assert(!types(events).some((e) => e.startsWith('response.output_text')));
+  // The reasoning item closes before the first call item opens.
+  const reasoningDone = events.findIndex((e) => e.type === 'response.output_item.done' && (e as Obj).item.type === 'reasoning');
+  const callAdded = events.findIndex((e) => e.type === 'response.output_item.added' && (e as Obj).item.type === 'function_call');
+  assert(reasoningDone >= 0 && reasoningDone < callAdded);
+  events.forEach((e, i) => assert.equal(e.sequence_number, i));
+  assert.equal(new Set(t.response.output.slice(1).map((i: Obj) => i.call_id)).size, 2);
+});
+
+test('forced stream: a forced custom tool call is unwrapped and its patch repaired', () => {
+  const json = JSON.stringify([{ name: 'apply_patch', parameters: { input: '*** Add File: a.txt\n+hi' } }]);
+  const { t } = runForced([chunk({ content: json }), chunk({}, 'stop')]);
+  const call = t.response.output[0];
+  assert.equal(call.type, 'custom_tool_call');
+  assert.equal(call.input, '*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n');
+  assert.equal(t.repairs.length, 1);
+});
+
+test('forced stream: text that is not a valid call fails the response, so the client can retry', () => {
+  for (const [content, pattern] of [
+    ['7 times 8 is **56**.', /no valid JSON/],
+    ['[{"parameters": {}}]', /without a name/],
+    ['', /no tool call/],
+  ] as const) {
+    const chunks = content ? [chunk({ content }), chunk({}, 'stop')] : [chunk({ reasoning_content: 'hm' }), chunk({}, 'stop')];
+    const { events, t } = runForced(chunks);
+    assert.equal(t.response.status, 'failed');
+    assert.match(t.response.error.message, pattern);
+    assert.equal(events.at(-1)!.type, 'response.failed');
+  }
+});
+
+test('forced stream: a native tool call delta still works, and a cut answer is incomplete without calls', () => {
+  const native = runForced([
+    chunk({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'calculator', arguments: '{"expression":"1"}' } }] }),
+    chunk({}, 'tool_calls'),
+  ]).t;
+  assert.equal(native.response.status, 'completed');
+  assert.equal(native.response.output[0].arguments, '{"expression":"1"}');
+  const cut = runForced([chunk({ content: '[{"name": "calcu' }), chunk({}, 'length')]).t;
+  assert.equal(cut.response.status, 'incomplete');
+  assert.equal(cut.response.output.length, 0);
 });

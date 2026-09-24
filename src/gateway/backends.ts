@@ -20,8 +20,15 @@ export class Endpoint {
   /** null until the first health check finishes. */
   healthy: boolean | null = null;
   lastCheckAt: number | null = null;
+  /** Time of the last health check or request that the endpoint answered. */
+  lastOkAt: number | null = null;
   lastError: string | null = null;
   consecutiveFailures = 0;
+  /**
+   * Called when the endpoint becomes healthy: at the first successful check
+   * (previous is null) and after a failure (previous is false).
+   */
+  onHealthy: ((endpoint: Endpoint, previous: boolean | null) => void) | null = null;
 
   constructor(readonly config: EndpointConfig) {}
 
@@ -29,10 +36,13 @@ export class Endpoint {
   get enabled(): boolean { return this.config.enabled !== false; }
 
   markUp(): void {
-    if (this.healthy === false) log('info', 'backend is healthy again', { backend: this.name });
+    const previous = this.healthy;
+    if (previous === false) log('info', 'backend is healthy again', { backend: this.name });
     this.healthy = true;
+    this.lastOkAt = Date.now();
     this.consecutiveFailures = 0;
     this.lastError = null;
+    if (previous !== true) this.onHealthy?.(this, previous);
   }
 
   markDown(reason: string): void {
@@ -92,16 +102,17 @@ const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 64 });
 /**
  * POST a chat-completions request and return when the response headers
  * arrive. Connection failures throw RetryableBackendError. The body stream
- * fails when no byte arrives for `idleTimeoutMs`.
+ * fails when no byte arrives for `idleTimeoutMs`. The payload can be JSON
+ * text, so that a caller that retries serializes it only once.
  */
 export function postChat(
   endpoint: Endpoint,
-  payload: Obj,
+  payload: Obj | string,
   timeouts: RequestTimeouts,
   signal: AbortSignal,
 ): Promise<BackendStream> {
   const url = new URL(`${endpoint.config.baseUrl}/chat/completions`);
-  const body = Buffer.from(JSON.stringify(payload));
+  const body = Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload));
   const client = url.protocol === 'https:' ? https : http;
   const started = performance.now();
   return new Promise((resolve, reject) => {
@@ -152,13 +163,17 @@ export function postChat(
       cleanup();
       const headersMs = performance.now() - started;
       const status = res.statusCode ?? 0;
-      // Idle timeout for the body. It resets on every socket read.
-      res.socket?.setTimeout(timeouts.idleTimeoutMs, () => {
-        res.destroy(new Error(`backend idle for ${timeouts.idleTimeoutMs} ms`));
-      });
+      // Idle timeout for the body. It resets on every socket read. The
+      // socket goes back to the keep-alive pool after the response, so the
+      // listener must go when the response closes. Else each request on the
+      // socket adds one more listener that holds its old response.
+      const socket = res.socket;
+      const onIdle = () => res.destroy(new Error(`backend idle for ${timeouts.idleTimeoutMs} ms`));
+      socket?.setTimeout(timeouts.idleTimeoutMs, onIdle);
       res.on('close', () => {
         signal.removeEventListener('abort', onAbort);
-        res.socket?.setTimeout(0);
+        socket?.setTimeout(0);
+        socket?.off('timeout', onIdle);
       });
       if (status < 200 || status >= 300) {
         const chunks: Buffer[] = [];

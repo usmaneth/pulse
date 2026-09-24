@@ -13,9 +13,21 @@ export function setLogLevel(level: Level): void {
   if (level in ORDER) threshold = level;
 }
 
-export function log(level: Level, msg: string, fields: Record<string, unknown> = {}): void {
-  if (ORDER[level] < ORDER[threshold]) return;
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...fields });
+export type LogSink = (level: Level, line: string) => void;
+
+const stdSink: LogSink = (level, line) => {
   if (level === 'error' || level === 'warn') process.stderr.write(line + '\n');
   else process.stdout.write(line + '\n');
+};
+
+let sink: LogSink = stdSink;
+
+/** Send the log lines to another function, for example in tests. null restores stdout and stderr. */
+export function setLogSink(next: LogSink | null): void {
+  sink = next ?? stdSink;
+}
+
+export function log(level: Level, msg: string, fields: Record<string, unknown> = {}): void {
+  if (ORDER[level] < ORDER[threshold]) return;
+  sink(level, JSON.stringify({ ts: new Date().toISOString(), level, msg, ...fields }));
 }
