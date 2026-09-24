@@ -66,11 +66,14 @@ Do these steps in order. The router on port 8790 can stay up until the last step
    name = "Pulse (Qwen3.8 on DGX Spark)"
    base_url = "http://127.0.0.1:8800/v1"
    wire_api = "responses"
-   # A cold prefill of a long context sends no event for minutes.
+   # The gateway sends a keepalive event every 10 s during a prefill, so
+   # the idle limit only has to cover a stalled backend.
    stream_idle_timeout_ms = 900000
-   # The gateway already fails over between Sparks.
+   # The gateway already fails over between Sparks and retries a request
+   # that has no output yet for 180 s. Codex retries a stream that fails
+   # after the output started.
    request_max_retries = 1
-   stream_max_retries = 1
+   stream_max_retries = 3
    ```
 
    If `PULSE_GATEWAY_API_KEY` is set, also add `env_key = "PULSE_GATEWAY_API_KEY"`
@@ -284,6 +287,44 @@ It does not move on after the backend accepts the request. A backend HTTP 4xx
 (for example a prompt longer than the context) goes to Codex unchanged. A
 failure during the stream gives `response.failed`.
 
+## Backend restarts and long prefills
+
+A request that has no output yet survives a short backend restart:
+
+- When no endpoint can take the request (connection refused, connect
+  timeout, HTTP 502, 503 or 504), the gateway waits and tries again. The wait
+  starts at 250 ms and doubles up to 3 s.
+- When the backend stream breaks before the first output event (for example
+  vLLM stops during the prefill), the gateway sends the request again. The
+  request is stateless, and the prefix cache makes the new prefill short.
+- The retries stop after `retryWindowMs` (180 s) from the request start. Then
+  the client gets HTTP 503 with `Retry-After`, or `response.failed` with the
+  code `backend_unavailable` when the stream already started.
+
+After the first output event the gateway does not retry, because Codex already
+shows that output. The stream ends with `response.failed`, and Codex retries
+the turn (`stream_max_retries`).
+
+A streaming request starts its SSE stream (headers, `response.created`) when
+the backend sends its headers, or after `streamStartMs` (3 s) when the backend
+has not answered yet. After the start, a backend 4xx goes to Codex as
+`response.failed`. A context-length message gets the code
+`context_length_exceeded`, which Codex handles as a full context window. Other
+4xx messages get `invalid_prompt`, which Codex does not retry.
+
+vLLM sends no byte during a prefill. Codex ends a stream after
+`stream_idle_timeout_ms` (default 300 s) without an SSE event, and it does not
+count SSE comment lines: the Codex SSE parser (`eventsource-stream`) drops
+comments before the idle timer sees them. So the gateway sends a
+`response.in_progress` event after `keepaliveMs` (10 s) without another event.
+Codex ignores the event type (`codex-rs/codex-api/src/sse/responses.rs`), but
+the event resets its idle timer.
+
+The gateway has no total time limit for a request by default
+(`requestTimeoutMs` is 0). A long generation that streams tokens does not get
+cut. The backend idle limit (`idleTimeoutMs`) still stops a backend that goes
+silent.
+
 A health check sends `GET <origin>/health` to every enabled endpoint every
 `healthIntervalMs` (10 s). A request failure also marks the endpoint unhealthy
 at once.
@@ -300,7 +341,11 @@ PULSE_QWEN_BACKENDS=spark1=http://127.0.0.1:8888/v1,spark2=http://10.99.0.2:8888
 ## Health and metrics
 
 `GET /health` returns 200 when every model has at least one enabled endpoint
-that is not marked unhealthy, and 503 otherwise or during shutdown:
+that is not marked unhealthy, and 503 with `Retry-After` otherwise or during
+shutdown. The body has the status (`ok`, `degraded` or `draining`), the
+uptime, the in-flight count, the retry count, the retry window, and for each
+endpoint: enabled, healthy, in_flight, consecutive_failures, last_check_at,
+last_ok_at and last_error:
 
 ```
 curl -s http://127.0.0.1:8800/health | jq
@@ -309,7 +354,7 @@ curl -s http://127.0.0.1:8800/health | jq
 `GET /metrics` returns JSON counters since the process start:
 
 - `requests`: total, in_flight, completed, incomplete, failed, cancelled,
-  client_errors
+  client_errors, retries (backend attempts repeated before the first output)
 - `tokens`: input, cached_input, output, reasoning (from backend usage)
 - `tool_calls`
 - `backends[]`: per endpoint health, requests, errors, failovers, in_flight,
@@ -343,7 +388,10 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_CONNECT_TIMEOUT_MS` | `3000` | connect limit per endpoint |
 | `PULSE_GATEWAY_HEADERS_TIMEOUT_MS` | `900000` | wait for backend response headers |
 | `PULSE_GATEWAY_IDLE_TIMEOUT_MS` | `900000` | longest gap between backend bytes |
-| `PULSE_GATEWAY_REQUEST_TIMEOUT_MS` | `3600000` | limit for one request |
+| `PULSE_GATEWAY_REQUEST_TIMEOUT_MS` | `0` | limit for one request, 0 sets no limit |
+| `PULSE_GATEWAY_RETRY_WINDOW_MS` | `180000` | retry time for a request without output, 0 tries each endpoint once |
+| `PULSE_GATEWAY_KEEPALIVE_MS` | `10000` | `response.in_progress` keepalive interval, 0 turns it off |
+| `PULSE_GATEWAY_STREAM_START_MS` | `3000` | wait for the backend before the SSE stream starts |
 | `PULSE_GATEWAY_HEALTH_INTERVAL_MS` | `10000` | health check period, 0 checks once at start |
 | `PULSE_GATEWAY_HEALTH_TIMEOUT_MS` | `3000` | health check limit |
 | `PULSE_GATEWAY_SHUTDOWN_GRACE_MS` | `30000` | drain time after SIGTERM |
@@ -377,11 +425,14 @@ from the backend that Codex cannot parse.
 
 ## Shutdown
 
-On SIGTERM or SIGINT the gateway stops accepting connections, reports
-`draining` on `/health`, and lets in-flight requests finish for
-`shutdownGraceMs`. After that it cancels the remaining streams with
-`response.failed`. A second signal exits at once. The unit gives 45 s before
-systemd sends SIGKILL.
+On SIGTERM or SIGINT the gateway stops accepting connections and lets
+in-flight requests finish for `shutdownGraceMs`. A request that arrives on an
+open connection during the drain gets HTTP 503 with `Retry-After: 2` and
+`Connection: close`, and Codex retries it. When the grace time ends, the
+gateway cancels the remaining streams. Each cancelled stream gets up to 1 s
+to send its `response.failed` event before the sockets close, so Codex
+retries the turn. A second signal exits at once. The unit gives 45 s before
+systemd sends SIGKILL, and it restarts the gateway after any exit.
 
 ## Known limits
 

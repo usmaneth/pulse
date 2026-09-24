@@ -350,7 +350,7 @@ test('a health check moves an unhealthy endpoint to the end of the order', async
 
 test('returns 503 when no endpoint can serve, and /health reports it', async () => {
   const dead = await deadPort();
-  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }]);
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }], { retryWindowMs: 0 });
   try {
     const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
     assert.equal(res.status, 503);
@@ -472,4 +472,264 @@ test('config: env endpoint list sets the failover order', () => {
   const defaults = loadConfig({}, []);
   assert.equal(defaults.models[0].id, 'qwen3.8-flash-next');
   assert.equal(defaults.models[0].endpoints[0].baseUrl, 'http://127.0.0.1:8888/v1');
+});
+
+// ------------------------------------------------------------ reliability
+
+const chunkFrame = (c: Obj) => `data: ${JSON.stringify(c)}\n\n`;
+
+test('keepalive: a long prefill gets response.in_progress events, not only SSE comments', async () => {
+  const backend = await mockBackend((_b, _q, res) => {
+    // vLLM sends the headers at once and no byte during the prefill.
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.flushHeaders();
+    setTimeout(() => { for (const c of reply('after prefill')) res.write(chunkFrame(c)); res.end('data: [DONE]\n\n'); }, 450);
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { keepaliveMs: 100 });
+  try {
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    const progress = evs.filter((e) => e.type === 'response.in_progress');
+    // One from the start, and at least two keepalives during the 450 ms wait.
+    assert(progress.length >= 3, `in_progress events: ${progress.length}`);
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+    evs.forEach((e, i) => assert.equal(e.sequence_number, i));
+    assert.equal(new Set(evs.map((e) => e.response?.id).filter(Boolean)).size, 1);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('keepalive: the stream starts before slow backend headers arrive', async () => {
+  const backend = await mockBackend((_b, _q, res) => { setTimeout(() => sse(res, reply('slow')), 500); });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { keepaliveMs: 100, streamStartMs: 50 });
+  try {
+    const t0 = performance.now();
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
+    assert(performance.now() - t0 < 400, 'the headers must not wait for the backend');
+    assert.equal(res.status, 200);
+    const evs = await events(res);
+    assert.equal(evs[0].type, 'response.created');
+    assert(evs.filter((e) => e.type === 'response.in_progress').length >= 3);
+    assert.equal(evs.at(-1)!.response.output[0].content[0].text, 'slow');
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('retry: a backend that comes back within the retry window serves the request', async () => {
+  const dead = await deadPort();
+  const port = Number(new URL(dead).port);
+  let late: http.Server | null = null;
+  const lateStart = setTimeout(() => {
+    late = http.createServer(async (req, res) => {
+      if (req.url === '/health') { res.writeHead(200); res.end(); return; }
+      for await (const _ of req) { /* drain */ }
+      sse(res, reply('back again'));
+    });
+    late.listen(port, '127.0.0.1');
+  }, 700);
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }], { retryWindowMs: 10_000, streamStartMs: 100, keepaliveMs: 100 });
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
+    assert.equal(res.status, 200);
+    const evs = await events(res);
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+    assert.equal(evs.at(-1)!.response.output[0].content[0].text, 'back again');
+    assert.equal(evs.filter((e) => e.type === 'response.created').length, 1);
+    const metrics = await (await fetch(`${base}/metrics`)).json() as Obj;
+    assert(metrics.requests.retries >= 1);
+  } finally {
+    clearTimeout(lateStart);
+    await gateway.stop();
+    const server = late as http.Server | null;
+    if (server) await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); });
+  }
+});
+
+test('retry: 503 while the backend loads, then 200, is one completed response', async () => {
+  let calls = 0;
+  const backend = await mockBackend((_b, _q, res) => {
+    if (++calls <= 2) { res.writeHead(503); res.end('loading'); return; }
+    sse(res, reply('loaded'));
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { retryWindowMs: 10_000 });
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x' });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json() as Obj).output[0].content[0].text, 'loaded');
+    assert.equal(backend.requests.length, 3);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('retry: a stream that breaks before any output is sent again; after output it fails', async () => {
+  let calls = 0;
+  const backend = await mockBackend((body, _q, res) => {
+    calls++;
+    const cut = body.messages.at(-1).content === 'cut after output';
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    if (cut) {
+      res.write(chunkFrame({ choices: [{ index: 0, delta: { content: 'half' }, finish_reason: null }] }));
+      setTimeout(() => res.destroy(), 20);
+      return;
+    }
+    if (calls === 1) {
+      // A role chunk and usage are not output. Then the backend restarts.
+      res.write(chunkFrame({ choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] }));
+      setTimeout(() => res.destroy(), 20);
+      return;
+    }
+    for (const c of reply('second try')) res.write(chunkFrame(c));
+    res.end('data: [DONE]\n\n');
+  });
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { retryWindowMs: 10_000 });
+  try {
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+    assert.equal(evs.at(-1)!.response.output.length, 1);
+    assert.equal(evs.at(-1)!.response.output[0].content[0].text, 'second try');
+    assert.equal(evs.filter((e) => e.type === 'response.created').length, 1);
+    evs.forEach((e, i) => assert.equal(e.sequence_number, i));
+    assert.equal(backend.requests.length, 2);
+
+    const cut = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'cut after output', stream: true }));
+    assert.equal(cut.at(-1)!.type, 'response.failed');
+    assert.equal(cut.at(-1)!.response.error.code, 'backend_error');
+    assert.equal(backend.requests.length, 3);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('retry: when the window ends after the stream started, the client gets response.failed', async () => {
+  const dead = await deadPort();
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: dead }], { retryWindowMs: 700, streamStartMs: 50 });
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
+    assert.equal(res.status, 200);
+    const evs = await events(res);
+    assert.equal(evs[0].type, 'response.created');
+    assert.equal(evs.at(-1)!.type, 'response.failed');
+    assert.equal(evs.at(-1)!.response.error.code, 'backend_unavailable');
+  } finally { await gateway.stop(); }
+});
+
+test('retry: a backend 4xx after the stream started keeps its meaning for Codex', async () => {
+  const backend = await mockBackend((_b, _q, res) => setTimeout(() => {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end('{"error":{"message":"This model\'s maximum context length is 262144 tokens."}}');
+  }, 200));
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { streamStartMs: 50 });
+  try {
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    assert.equal(evs.at(-1)!.type, 'response.failed');
+    assert.equal(evs.at(-1)!.response.error.code, 'context_length_exceeded');
+    assert.equal(backend.requests.length, 1);
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('no total request limit by default: a long generation that streams tokens completes', async () => {
+  assert.equal(defaultConfig().requestTimeoutMs, 0);
+  assert.equal(loadConfig({}, []).requestTimeoutMs, 0);
+  const backend = await mockBackend((_b, _q, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    let n = 0;
+    const timer = setInterval(() => {
+      if (++n <= 12) { res.write(chunkFrame({ choices: [{ index: 0, delta: { content: 't' }, finish_reason: null }] })); return; }
+      clearInterval(timer);
+      res.write(chunkFrame({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }));
+      res.end('data: [DONE]\n\n');
+    }, 50);
+  });
+  // The whole stream takes about 650 ms. The idle limit is 200 ms.
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { idleTimeoutMs: 200 });
+  try {
+    const evs = await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+    assert.equal(evs.at(-1)!.response.output[0].content[0].text, 't'.repeat(12));
+  } finally { await gateway.stop(); await backend.close(); }
+});
+
+test('drain: a request during shutdown gets 503 with Retry-After', async () => {
+  let release!: () => void;
+  const backend = await mockBackend((_b, _q, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.flushHeaders();
+    release = () => { for (const c of reply('late')) res.write(chunkFrame(c)); res.end('data: [DONE]\n\n'); };
+  });
+  const { gateway, base } = await startGateway([{ name: 'a', baseUrl: backend.url }], { shutdownGraceMs: 5_000 });
+  try {
+    const port = gateway.address!.port;
+    // This request sends its headers now and its body after the drain starts.
+    let sendRest!: () => void;
+    const late = new Promise<{ status: number; retryAfter: string | undefined; body: Obj }>((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/v1/responses', method: 'POST', agent: false, headers: { 'Content-Type': 'application/json' } }, (res) => {
+        let text = '';
+        res.on('data', (c) => { text += c; });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, retryAfter: res.headers['retry-after'] as string | undefined, body: JSON.parse(text) }));
+      });
+      req.on('error', reject);
+      req.write('{"model":"qwen3.8-flash-next",');
+      sendRest = () => req.end('"input":"x","stream":true}');
+    });
+    const first = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
+    assert.equal(first.status, 200);
+    const stopped = gateway.stop();
+    sendRest();
+    const refused = await late;
+    assert.equal(refused.status, 503);
+    assert.equal(refused.retryAfter, '2');
+    assert.equal(refused.body.error.message, 'the gateway is shutting down');
+    release();
+    const evs = await events(first);
+    await stopped;
+    assert.equal(evs.at(-1)!.type, 'response.completed');
+  } finally { await backend.close(); }
+});
+
+test('drain: a stream that outlives the grace time ends with response.failed', async () => {
+  const backend = await mockBackend((_b, _q, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.write(chunkFrame({ choices: [{ index: 0, delta: { content: 'a' }, finish_reason: null }] }));
+  });
+  const { gateway, base } = await startGateway([{ name: 'a', baseUrl: backend.url }], { shutdownGraceMs: 200 });
+  try {
+    const res = await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true });
+    const stopped = gateway.stop();
+    const evs = await events(res);
+    await stopped;
+    assert.equal(evs.at(-1)!.type, 'response.failed');
+    assert.match(evs.at(-1)!.response.error.message, /shutting down/);
+  } finally { await backend.close(); }
+});
+
+test('/health reports the backend state, the in-flight count and the retry window', async () => {
+  const good = await mockBackend((_b, _q, res) => sse(res, reply('ok')));
+  const dead = await deadPort();
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: good.url }, { name: 'spark2', baseUrl: dead }]);
+  try {
+    await gateway.checkHealth();
+    const res = await fetch(`${base}/health`);
+    assert.equal(res.status, 200);
+    const h = await res.json() as Obj;
+    assert.equal(h.status, 'ok');
+    assert.equal(h.in_flight, 0);
+    assert.equal(h.retry_window_ms, 180_000);
+    const [one, two] = h.models[0].backends;
+    assert.equal(one.healthy, true);
+    assert.match(one.last_ok_at, /^\d{4}-/);
+    assert.equal(one.consecutive_failures, 0);
+    assert.equal(two.healthy, false);
+    assert.equal(two.last_ok_at, null);
+    assert(two.consecutive_failures >= 1);
+    assert(two.last_error);
+  } finally { await gateway.stop(); await good.close(); }
+  const down = await startGateway([{ name: 'spark1', baseUrl: dead }]);
+  try {
+    await down.gateway.checkHealth();
+    const res = await fetch(`${down.base}/health`);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('retry-after'), '2');
+    assert.equal((await res.json() as Obj).status, 'degraded');
+  } finally { await down.gateway.stop(); }
+});
+
+test('config: retry window, keepalive and stream start come from the environment', () => {
+  const config = loadConfig({ PULSE_GATEWAY_RETRY_WINDOW_MS: '60000', PULSE_GATEWAY_KEEPALIVE_MS: '5000', PULSE_GATEWAY_STREAM_START_MS: '0' }, []);
+  assert.deepEqual([config.retryWindowMs, config.keepaliveMs, config.streamStartMs], [60_000, 5_000, 0]);
+  const defaults = defaultConfig();
+  assert.deepEqual([defaults.retryWindowMs, defaults.keepaliveMs, defaults.streamStartMs], [180_000, 10_000, 3_000]);
 });

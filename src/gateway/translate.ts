@@ -15,6 +15,9 @@ export type Obj = Record<string, any>;
 
 export class RequestError extends Error {}
 
+/** The backend sent an error chunk in its stream. A retry gets the same error. */
+export class BackendStreamError extends Error {}
+
 /** Model-specific request shaping. One profile per backend family. */
 export type ProfileName = 'qwen38' | 'llamacpp';
 
@@ -544,11 +547,35 @@ export class ChatStreamTranslator {
     ];
   }
 
+  /**
+   * A `response.in_progress` event for a stream that has nothing else to send,
+   * for example during a long prefill. Codex ignores the event, but it resets
+   * the stream idle timer of Codex. An SSE comment line does not.
+   */
+  keepalive(): ResponseEvent {
+    return this.event('response.in_progress', { response: this.snapshot() });
+  }
+
+  /**
+   * Forget all backend output, to send the request to the backend again. The
+   * response id and the sequence numbers continue. Use it only when no event
+   * after start() went to the client.
+   */
+  restart(): void {
+    this.response.output = [];
+    this.response.usage = null;
+    this.reasoning = null;
+    this.message = null;
+    this.calls.clear();
+    this.finish = null;
+    this.sawVisibleOutput = false;
+  }
+
   /** Feed one parsed chat-completions chunk. Returns the events to send. */
   push(chunk: Obj): ResponseEvent[] {
     const events: ResponseEvent[] = [];
     if (chunk.error) {
-      throw new Error(`backend stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
+      throw new BackendStreamError(`backend stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
     }
     if (chunk.usage) this.response.usage = chatUsageToResponses(chunk.usage);
     const choice = chunk.choices?.[0];

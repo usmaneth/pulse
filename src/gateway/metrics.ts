@@ -55,6 +55,8 @@ export class GatewayMetrics {
   failed = 0;
   cancelled = 0;
   clientErrors = 0;
+  /** Backend attempts that the gateway repeated before the first output. */
+  retries = 0;
   inputTokens = 0;
   cachedInputTokens = 0;
   outputTokens = 0;

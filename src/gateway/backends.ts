@@ -20,6 +20,8 @@ export class Endpoint {
   /** null until the first health check finishes. */
   healthy: boolean | null = null;
   lastCheckAt: number | null = null;
+  /** Time of the last health check or request that the endpoint answered. */
+  lastOkAt: number | null = null;
   lastError: string | null = null;
   consecutiveFailures = 0;
 
@@ -31,6 +33,7 @@ export class Endpoint {
   markUp(): void {
     if (this.healthy === false) log('info', 'backend is healthy again', { backend: this.name });
     this.healthy = true;
+    this.lastOkAt = Date.now();
     this.consecutiveFailures = 0;
     this.lastError = null;
   }

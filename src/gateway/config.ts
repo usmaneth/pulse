@@ -47,8 +47,31 @@ export interface GatewayConfig {
   headersTimeoutMs: number;
   /** Time without any byte from the backend before the stream fails. */
   idleTimeoutMs: number;
-  /** Upper limit for one request from start to end. */
+  /**
+   * Upper limit for one request from start to end. 0 sets no limit, so a long
+   * generation that streams tokens never gets cut. The idle limit still stops
+   * a backend that goes silent.
+   */
   requestTimeoutMs: number;
+  /**
+   * Time in which the gateway retries a request that has no output yet: the
+   * backend refuses the connection, returns 502/503/504, or drops the stream
+   * before the first token. A backend restart shorter than this does not end
+   * the conversation. 0 tries each endpoint once.
+   */
+  retryWindowMs: number;
+  /**
+   * Interval of the keepalive event on a stream that has no other event. Codex
+   * ends a stream after stream_idle_timeout_ms without an SSE event, and it
+   * does not count SSE comment lines. 0 turns the keepalive off.
+   */
+  keepaliveMs: number;
+  /**
+   * Time that a streaming request waits for the backend before the gateway
+   * sends the response headers, response.created and keepalives. A backend
+   * error before this time goes to the client as an HTTP status.
+   */
+  streamStartMs: number;
   /** Time to connect to a backend before the gateway tries the next one. */
   connectTimeoutMs: number;
   healthIntervalMs: number;
@@ -79,7 +102,10 @@ export function defaultConfig(): GatewayConfig {
     // prefill.
     headersTimeoutMs: 900_000,
     idleTimeoutMs: 900_000,
-    requestTimeoutMs: 3_600_000,
+    requestTimeoutMs: 0,
+    retryWindowMs: 180_000,
+    keepaliveMs: 10_000,
+    streamStartMs: 3_000,
     connectTimeoutMs: 3_000,
     healthIntervalMs: 10_000,
     healthTimeoutMs: 3_000,
@@ -181,6 +207,9 @@ export function loadConfig(
   config.idleTimeoutMs = num(env, 'PULSE_GATEWAY_IDLE_TIMEOUT_MS') ?? config.idleTimeoutMs;
   config.requestTimeoutMs = num(env, 'PULSE_GATEWAY_REQUEST_TIMEOUT_MS') ?? config.requestTimeoutMs;
   config.connectTimeoutMs = num(env, 'PULSE_GATEWAY_CONNECT_TIMEOUT_MS') ?? config.connectTimeoutMs;
+  config.retryWindowMs = num(env, 'PULSE_GATEWAY_RETRY_WINDOW_MS') ?? config.retryWindowMs;
+  config.keepaliveMs = num(env, 'PULSE_GATEWAY_KEEPALIVE_MS') ?? config.keepaliveMs;
+  config.streamStartMs = num(env, 'PULSE_GATEWAY_STREAM_START_MS') ?? config.streamStartMs;
   config.healthIntervalMs = num(env, 'PULSE_GATEWAY_HEALTH_INTERVAL_MS') ?? config.healthIntervalMs;
   config.healthTimeoutMs = num(env, 'PULSE_GATEWAY_HEALTH_TIMEOUT_MS') ?? config.healthTimeoutMs;
   config.shutdownGraceMs = num(env, 'PULSE_GATEWAY_SHUTDOWN_GRACE_MS') ?? config.shutdownGraceMs;

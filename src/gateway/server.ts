@@ -19,19 +19,51 @@ import { GatewayMetrics } from './metrics.js';
 import { log } from './log.js';
 import { sseData } from './sse.js';
 import {
-  ChatStreamTranslator, RequestError, isJsonObjectText, newId, responsesToChat, sseFrame,
+  BackendStreamError, ChatStreamTranslator, RequestError, isJsonObjectText, newId, responsesToChat, sseFrame,
 } from './translate.js';
 import type { ChatRequest, Obj, ResponseEvent } from './translate.js';
 
 const VERSION = '1.0.0';
-const HEARTBEAT_MS = 10_000;
+/** Seconds in the Retry-After header of a 503 response. */
+const RETRY_AFTER_S = 2;
 
 class HttpError extends Error {
   /** The id of the Responses request that failed, when there is one. */
   requestId?: string;
   /** True when the `response` log line of the request already has this error. */
   logged = false;
-  constructor(readonly status: number, message: string, readonly code = 'invalid_request_error') { super(message); }
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly code = 'invalid_request_error',
+    readonly headers: Record<string, string> = {},
+  ) { super(message); }
+}
+
+/** Wait before the next backend attempt: 250 ms, doubled on each attempt, up to 3 s. */
+export function retryDelayMs(attempt: number): number {
+  return Math.min(250 * 2 ** attempt, 3_000);
+}
+
+/** Resolve after `ms`. Reject when the signal aborts. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * The Responses error code for a backend 4xx message. Codex treats
+ * `context_length_exceeded` as a full context window, and `invalid_prompt`
+ * as a request error that a retry does not repair.
+ */
+export function backendErrorCode(message: string): string {
+  return /context length|context window|too many tokens|reduce the length|prompt is too long/i.test(message)
+    ? 'context_length_exceeded'
+    : 'invalid_prompt';
 }
 
 export class Gateway {
@@ -106,6 +138,12 @@ export class Gateway {
     if (this.inflight.size) {
       log('warn', 'shutdown grace ended; cancelling in-flight requests', { in_flight: this.inflight.size });
       for (const controller of this.inflight) controller.abort(new Error('the gateway is shutting down'));
+      // Give each cancelled stream the time to write its response.failed
+      // event before the sockets close.
+      const cancelDeadline = Date.now() + 1_000;
+      while (this.inflight.size && Date.now() < cancelDeadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
     }
     this.server?.closeAllConnections();
     await closed;
@@ -134,8 +172,9 @@ export class Gateway {
           request_id: error.requestId ?? null, method: req.method, path, status, error: error.message,
         });
       }
-      if (!res.headersSent) sendJson(res, status, { error: { type: code, message: (error as Error).message } });
-      else res.end();
+      if (!res.headersSent) {
+        sendJson(res, status, { error: { type: code, message: (error as Error).message } }, error instanceof HttpError ? error.headers : {});
+      } else res.end();
     }
   }
 
@@ -145,7 +184,12 @@ export class Gateway {
     return req.headers.authorization === `Bearer ${key}`;
   }
 
+  /**
+   * The gateway state and the state of each backend. The status is 200 when
+   * every model has a backend that is not marked unhealthy, else 503.
+   */
   private sendHealth(res: ServerResponse): void {
+    const iso = (t: number | null) => (t ? new Date(t).toISOString() : null);
     const models = this.routes.map((route) => ({
       id: route.config.id,
       available: route.available,
@@ -154,12 +198,24 @@ export class Gateway {
         base_url: e.config.baseUrl,
         enabled: e.enabled,
         healthy: e.healthy,
-        last_check_at: e.lastCheckAt ? new Date(e.lastCheckAt).toISOString() : null,
+        in_flight: e.stats.inFlight,
+        consecutive_failures: e.consecutiveFailures,
+        last_check_at: iso(e.lastCheckAt),
+        last_ok_at: iso(e.lastOkAt),
         last_error: e.lastError,
       })),
     }));
     const ok = !this.draining && this.routes.every((r) => r.available);
-    sendJson(res, ok ? 200 : 503, { status: this.draining ? 'draining' : ok ? 'ok' : 'degraded', version: VERSION, models });
+    const headers: Record<string, string> = ok ? {} : { 'Retry-After': String(RETRY_AFTER_S) };
+    sendJson(res, ok ? 200 : 503, {
+      status: this.draining ? 'draining' : ok ? 'ok' : 'degraded',
+      version: VERSION,
+      uptime_s: Math.round((Date.now() - this.metrics.startedAt) / 1000),
+      in_flight: this.metrics.inFlight,
+      retries: this.metrics.retries,
+      retry_window_ms: this.config.retryWindowMs,
+      models,
+    }, headers);
   }
 
   private sendModels(res: ServerResponse): void {
@@ -180,7 +236,7 @@ export class Gateway {
       uptime_s: Math.round((Date.now() - m.startedAt) / 1000),
       requests: {
         total: m.requests, in_flight: m.inFlight, completed: m.completed, incomplete: m.incomplete,
-        failed: m.failed, cancelled: m.cancelled, client_errors: m.clientErrors,
+        failed: m.failed, cancelled: m.cancelled, client_errors: m.clientErrors, retries: m.retries,
       },
       tokens: {
         input: m.inputTokens, cached_input: m.cachedInputTokens, output: m.outputTokens,
@@ -225,41 +281,61 @@ export class Gateway {
     });
   }
 
-  /** Try each endpoint in failover order until one returns response headers. */
-  private async openBackend(route: ModelRoute, payload: string, signal: AbortSignal, requestId: string): Promise<{ endpoint: Endpoint; stream: BackendStream }> {
-    const errors: string[] = [];
-    for (const endpoint of route.attemptOrder()) {
-      if (signal.aborted) break;
-      endpoint.stats.requests++;
-      try {
-        const stream = await postChat(endpoint, payload, this.config, signal);
-        endpoint.stats.headers.add(stream.headersMs);
-        // 502/503/504 mean the backend itself is not able to serve: loading,
-        // overloaded or behind a dead proxy. The next endpoint can serve.
-        if ([502, 503, 504].includes(stream.status)) {
+  /**
+   * Try each endpoint in failover order until one returns response headers.
+   * When no endpoint can take the request, wait and try again until the
+   * deadline. So a short backend restart delays the request, but does not
+   * fail it.
+   */
+  private async openBackend(
+    route: ModelRoute, payload: string, signal: AbortSignal, requestId: string, deadline: number,
+  ): Promise<{ endpoint: Endpoint; stream: BackendStream }> {
+    for (let attempt = 0; ; attempt++) {
+      const errors: string[] = [];
+      for (const endpoint of route.attemptOrder()) {
+        if (signal.aborted) break;
+        endpoint.stats.requests++;
+        try {
+          const stream = await postChat(endpoint, payload, this.config, signal);
+          endpoint.stats.headers.add(stream.headersMs);
+          // 502/503/504 mean the backend itself is not able to serve: loading,
+          // overloaded or behind a dead proxy. The next endpoint can serve.
+          if ([502, 503, 504].includes(stream.status)) {
+            endpoint.stats.errors++;
+            endpoint.stats.failovers++;
+            endpoint.markDown(`HTTP ${stream.status}`);
+            errors.push(`${endpoint.name}: HTTP ${stream.status}`);
+            log('warn', 'backend refused request; trying next', { request_id: requestId, backend: endpoint.name, status: stream.status });
+            continue;
+          }
+          endpoint.markUp();
+          return { endpoint, stream };
+        } catch (error) {
           endpoint.stats.errors++;
+          const message = (error as Error).message;
+          if (!(error instanceof RetryableBackendError)) {
+            throw new HttpError(502, `${endpoint.name}: ${message}`, 'backend_error');
+          }
           endpoint.stats.failovers++;
-          endpoint.markDown(`HTTP ${stream.status}`);
-          errors.push(`${endpoint.name}: HTTP ${stream.status}`);
-          log('warn', 'backend refused request; trying next', { request_id: requestId, backend: endpoint.name, status: stream.status });
-          continue;
+          endpoint.markDown(message);
+          errors.push(`${endpoint.name}: ${message}`);
+          log('warn', 'backend unreachable; trying next', { request_id: requestId, backend: endpoint.name, error: message });
         }
-        endpoint.markUp();
-        return { endpoint, stream };
-      } catch (error) {
-        endpoint.stats.errors++;
-        const message = (error as Error).message;
-        if (!(error instanceof RetryableBackendError)) {
-          throw new HttpError(502, `${endpoint.name}: ${message}`, 'backend_error');
-        }
-        endpoint.stats.failovers++;
-        endpoint.markDown(message);
-        errors.push(`${endpoint.name}: ${message}`);
-        log('warn', 'backend unreachable; trying next', { request_id: requestId, backend: endpoint.name, error: message });
+      }
+      if (signal.aborted) throw new HttpError(499, 'client closed the request', 'cancelled');
+      const reason = errors.join('; ') || 'no enabled backends';
+      const wait = retryDelayMs(attempt);
+      if (Date.now() + wait > deadline) {
+        throw new HttpError(503, `no backend could take the request (${reason})`, 'backend_unavailable', { 'Retry-After': String(RETRY_AFTER_S) });
+      }
+      this.metrics.retries++;
+      log('warn', 'no backend could take the request; retrying', { request_id: requestId, attempt: attempt + 1, wait_ms: wait, error: reason });
+      try {
+        await sleep(wait, signal);
+      } catch {
+        throw new HttpError(499, 'client closed the request', 'cancelled');
       }
     }
-    if (signal.aborted) throw new HttpError(499, 'client closed the request', 'cancelled');
-    throw new HttpError(503, `no backend could take the request (${errors.join('; ') || 'no enabled backends'})`, 'backend_unavailable');
   }
 
   /**
@@ -315,7 +391,11 @@ export class Gateway {
       if (request !== undefined) this.trace({ request_id: requestId, request, error: (error as Error).message });
       throw error;
     };
-    if (this.draining) return reject(new HttpError(503, 'the gateway is shutting down', 'unavailable'));
+    // Codex retries a 503. The next attempt reaches the new gateway process.
+    const shuttingDown = () => new HttpError(503, 'the gateway is shutting down', 'unavailable', {
+      'Retry-After': String(RETRY_AFTER_S), Connection: 'close',
+    });
+    if (this.draining) return reject(shuttingDown());
 
     let request: Obj;
     try {
@@ -323,6 +403,8 @@ export class Gateway {
     } catch (error) {
       return reject(error instanceof HttpError ? error : new HttpError(400, 'invalid JSON'));
     }
+    // The body can arrive after the drain started.
+    if (this.draining) return reject(shuttingDown());
     const route = this.routes.find((r) => r.config.id === request?.model);
     if (!route) {
       return reject(new HttpError(400, `unknown model: ${String(request?.model)}; this gateway serves ${this.routes.map((r) => r.config.id).join(', ')}`), request);
@@ -338,7 +420,7 @@ export class Gateway {
     } catch (error) {
       return reject(error instanceof RequestError ? new HttpError(400, error.message) : error, request);
     }
-    // Serialize the payload once. The backend call and the trace use it.
+    // Serialize the payload once. Each backend attempt and the trace use it.
     const payload = JSON.stringify(chat.payload);
     if (this.config.traceFile) {
       this.trace(`{"request_id":${JSON.stringify(requestId)},"request":${JSON.stringify(request)},"payload":${payload}}`);
@@ -346,72 +428,141 @@ export class Gateway {
 
     const streaming = request.stream === true;
     const controller = new AbortController();
-    const requestTimer = setTimeout(
-      () => controller.abort(new Error(`request exceeded ${this.config.requestTimeoutMs} ms`)),
-      this.config.requestTimeoutMs,
-    );
+    const requestTimer = this.config.requestTimeoutMs > 0
+      ? setTimeout(() => controller.abort(new Error(`request exceeded ${this.config.requestTimeoutMs} ms`)), this.config.requestTimeoutMs)
+      : undefined;
     const onClose = () => { if (!res.writableFinished) controller.abort(new Error('client disconnected')); };
     res.on('close', onClose);
     this.inflight.add(controller);
     m.inFlight++;
 
     const translator = new ChatStreamTranslator(String(request.model), chat.tools, this.config.emitReasoning);
+    const deadline = Date.now() + this.config.retryWindowMs;
     let endpoint: Endpoint | null = null;
+    /** The endpoint whose in-flight count this request holds. */
+    let active: Endpoint | null = null;
     let firstTokenMs: number | null = null;
-    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let keepalive: ReturnType<typeof setInterval> | undefined;
+    let startTimer: ReturnType<typeof setTimeout> | undefined;
     let outcome = 'failed';
     /** The reason of a failure that the translator does not hold. */
     let failure: string | undefined;
-    const write = (events: ResponseEvent[]) => streaming ? writeAll(res, events.map(sseFrame).join('')) : Promise.resolve();
+    /** True when an event after response.in_progress went to the client. */
+    let sentOutput = false;
+    let lastWriteAt = Date.now();
+    const write = (events: ResponseEvent[]) => {
+      if (!streaming || !events.length) return Promise.resolve();
+      lastWriteAt = Date.now();
+      return writeAll(res, events.map(sseFrame).join(''));
+    };
+    const release = () => {
+      if (active) active.stats.inFlight--;
+      active = null;
+    };
+    // The stream starts (headers, response.created, keepalives) when the
+    // backend answers, or after streamStartMs when it does not answer yet.
+    // After the start, an error goes to the client as response.failed.
+    let committed = false;
+    const commit = (): Promise<void> => {
+      if (!streaming || committed || res.destroyed) return Promise.resolve();
+      committed = true;
+      if (startTimer) clearTimeout(startTimer);
+      const headers: Record<string, string> = {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+        'X-Pulse-Request-Id': requestId,
+      };
+      if (endpoint) headers['X-Pulse-Backend'] = endpoint.name;
+      res.writeHead(200, headers);
+      if (this.config.keepaliveMs > 0) {
+        // Codex fails a stream after stream_idle_timeout_ms without an SSE
+        // event, and SSE comment lines do not count. A long prefill sends no
+        // token, so the gateway sends response.in_progress events.
+        keepalive = setInterval(() => {
+          if (res.destroyed || res.writableLength > 0) return;
+          if (Date.now() - lastWriteAt < this.config.keepaliveMs) return;
+          lastWriteAt = Date.now();
+          res.write(sseFrame(translator.keepalive()));
+        }, Math.max(50, Math.floor(this.config.keepaliveMs / 2)));
+        keepalive.unref();
+      }
+      return write(translator.start());
+    };
+    if (streaming) {
+      startTimer = setTimeout(() => void commit().catch(() => {}), this.config.streamStartMs);
+      startTimer.unref();
+    }
 
     try {
-      const opened = await this.openBackend(route, payload, controller.signal, requestId);
-      endpoint = opened.endpoint;
-      endpoint.stats.inFlight++;
-      const backend = opened.stream;
-      if (backend.status < 200 || backend.status >= 300 || !backend.body) {
-        // A 4xx from the backend describes the request (for example a prompt
-        // longer than the context window). Pass it to the client unchanged.
-        outcome = 'client_error';
-        m.clientErrors++;
-        failure = (backend.errorText || `backend HTTP ${backend.status}`).slice(0, 1000);
-        sendJson(res, backend.status || 502, {
-          error: { type: 'backend_error', message: backend.errorText || `backend HTTP ${backend.status}` },
-        });
-        return;
-      }
-
-      if (streaming) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'X-Accel-Buffering': 'no',
-          'X-Pulse-Backend': endpoint.name,
-          'X-Pulse-Request-Id': requestId,
-        });
-        // SSE comments keep proxies and the client socket active while the
-        // backend runs a long prefill.
-        heartbeat = setInterval(() => {
-          if (!res.destroyed && res.writableLength === 0) res.write(': pulse heartbeat\n\n');
-        }, HEARTBEAT_MS);
-        heartbeat.unref();
-      }
-      await write(translator.start());
-
-      // Some servers close the stream after the finish reason without [DONE].
-      // That is still a complete answer. A stream without a finish reason is
-      // not, and finishStream() fails it.
-      for await (const data of sseData(backend.body)) {
-        if (data === '[DONE]') break;
-        let chunk: Obj;
-        try { chunk = JSON.parse(data); } catch { continue; }
-        const events = translator.push(chunk);
-        if (firstTokenMs === null && translator.hasOutput) {
-          firstTokenMs = performance.now() - started;
-          endpoint.stats.firstToken.add(firstTokenMs);
+      for (let attempt = 0; ; attempt++) {
+        const opened = await this.openBackend(route, payload, controller.signal, requestId, deadline);
+        endpoint = opened.endpoint;
+        active = endpoint;
+        endpoint.stats.inFlight++;
+        const backend = opened.stream;
+        if (backend.status < 200 || backend.status >= 300 || !backend.body) {
+          // A 4xx from the backend describes the request (for example a prompt
+          // longer than the context window). Pass it to the client unchanged.
+          outcome = 'client_error';
+          m.clientErrors++;
+          const message = backend.errorText || `backend HTTP ${backend.status}`;
+          failure = message.slice(0, 1000);
+          if (committed) {
+            await write(translator.fail(message, backendErrorCode(message)));
+            res.end();
+          } else {
+            sendJson(res, backend.status || 502, { error: { type: 'backend_error', code: backendErrorCode(message), message } });
+          }
+          return;
         }
-        if (events.length) await write(events);
+        await commit();
+
+        // Some servers close the stream after the finish reason without
+        // [DONE]. That is still a complete answer. A stream without a finish
+        // reason is not, and finishStream() fails it.
+        let broken: string | null = null;
+        try {
+          for await (const data of sseData(backend.body)) {
+            if (data === '[DONE]') break;
+            let chunk: Obj;
+            try { chunk = JSON.parse(data); } catch { continue; }
+            const events = translator.push(chunk);
+            if (firstTokenMs === null && translator.hasOutput) {
+              firstTokenMs = performance.now() - started;
+              endpoint.stats.firstToken.add(firstTokenMs);
+            }
+            if (events.length) {
+              sentOutput = streaming;
+              await write(events);
+            }
+          }
+        } catch (error) {
+          if (controller.signal.aborted || error instanceof BackendStreamError || sentOutput) throw error;
+          broken = (error as Error).message;
+        }
+        if (broken === null && !translator.finishReason && !sentOutput) broken = 'backend stream ended before a finish reason';
+        if (broken !== null) {
+          // The client has no output of this attempt yet, so the gateway can
+          // send the request again. It is stateless, and the prefix cache of
+          // the backend makes the new prefill short.
+          const wait = retryDelayMs(attempt);
+          endpoint.stats.errors++;
+          endpoint.markDown(broken);
+          release();
+          if (Date.now() + wait > deadline) throw new Error(broken);
+          m.retries++;
+          log('warn', 'backend stream broke before any output; retrying', {
+            request_id: requestId, backend: endpoint.name, attempt: attempt + 1, wait_ms: wait, error: broken,
+          });
+          translator.restart();
+          firstTokenMs = null;
+          await sleep(wait, controller.signal);
+          continue;
+        }
+        break;
       }
+
       const final = translator.finishStream();
       for (const item of translator.response.output) {
         // Codex answers such a call with a parse error. The warning shows how
@@ -443,25 +594,28 @@ export class Gateway {
         error.logged = true;
         throw error;
       }
-      if (endpoint && !clientGone) endpoint.stats.errors++;
+      if (active && !clientGone) active.stats.errors++;
       if (clientGone) return;
       if (res.headersSent) {
-        await write(translator.fail(reason)).catch(() => {});
+        // Codex retries a stream that ends with response.failed.
+        const code = error instanceof HttpError ? error.code : 'backend_error';
+        await write(translator.fail(reason, code)).catch(() => {});
         res.end();
+      } else if (this.draining) {
+        sendJson(res, 503, { error: { type: 'unavailable', message: reason } }, { 'Retry-After': String(RETRY_AFTER_S), Connection: 'close' });
       } else {
         sendJson(res, 502, { error: { type: 'backend_error', message: reason } });
       }
     } finally {
-      clearTimeout(requestTimer);
-      if (heartbeat) clearInterval(heartbeat);
+      if (requestTimer) clearTimeout(requestTimer);
+      if (startTimer) clearTimeout(startTimer);
+      if (keepalive) clearInterval(keepalive);
       res.off('close', onClose);
       controller.abort();
       this.inflight.delete(controller);
       m.inFlight--;
-      if (endpoint) {
-        endpoint.stats.inFlight--;
-        endpoint.stats.total.add(performance.now() - started);
-      }
+      release();
+      if (endpoint) endpoint.stats.total.add(performance.now() - started);
       this.record(outcome, translator.response);
       log(outcome === 'failed' ? 'warn' : 'info', 'response', {
         request_id: requestId,
@@ -497,9 +651,9 @@ export class Gateway {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
+  res.writeHead(status, { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
 }
 
