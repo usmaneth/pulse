@@ -337,7 +337,7 @@ it. The file `~/.config/pulse/qwen38.env` is the place for local overrides.
 | `PULSE_GATEWAY_MODEL_CATALOG` | none | Codex catalog file; `/v1/models` returns its matching entries |
 | `PULSE_GATEWAY_EMIT_REASONING` | `1` | `0` hides reasoning items |
 | `PULSE_GATEWAY_REPLAY_REASONING` | `1` | `0` does not send earlier reasoning back to the model |
-| `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload, or the reason the gateway refused it, to this JSONL file (mode 0600; for debugging, it holds full prompts) |
+| `PULSE_GATEWAY_TRACE_FILE` | none | append each request and its chat payload, or the reason the gateway refused it, to this JSONL file (the gateway sets mode 0600, also on an existing file; for debugging, it holds full prompts) |
 | `PULSE_GATEWAY_MAX_TOOL_OUTPUT_CHARS` | `12000` | tool output cap, 0 disables it |
 | `PULSE_GATEWAY_MAX_BODY_BYTES` | 64 MiB | request body limit |
 | `PULSE_GATEWAY_CONNECT_TIMEOUT_MS` | `3000` | connect limit per endpoint |

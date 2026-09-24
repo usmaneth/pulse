@@ -10,7 +10,8 @@
 
 import http from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { createWriteStream, fchmod, readFileSync } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import type { GatewayConfig } from './config.js';
 import { Endpoint, HealthChecker, ModelRoute, RetryableBackendError, postChat, closeAgents } from './backends.js';
 import type { BackendStream } from './backends.js';
@@ -41,6 +42,8 @@ export class Gateway {
   private readonly inflight = new Set<AbortController>();
   private draining = false;
   private catalog: Obj[] | null = null;
+  private traceStream: WriteStream | null = null;
+  private traceFailed = false;
 
   constructor(readonly config: GatewayConfig) {
     this.routes = config.models.map((m) => new ModelRoute(m));
@@ -107,6 +110,7 @@ export class Gateway {
     this.server?.closeAllConnections();
     await closed;
     closeAgents();
+    await this.closeTrace();
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -222,7 +226,7 @@ export class Gateway {
   }
 
   /** Try each endpoint in failover order until one returns response headers. */
-  private async openBackend(route: ModelRoute, payload: Obj, signal: AbortSignal, requestId: string): Promise<{ endpoint: Endpoint; stream: BackendStream }> {
+  private async openBackend(route: ModelRoute, payload: string, signal: AbortSignal, requestId: string): Promise<{ endpoint: Endpoint; stream: BackendStream }> {
     const errors: string[] = [];
     for (const endpoint of route.attemptOrder()) {
       if (signal.aborted) break;
@@ -260,15 +264,42 @@ export class Gateway {
 
   /**
    * Append one row to the trace file, when one is set. For debugging only.
-   * The file holds full prompts, so only the owner can read it.
+   * The file holds full prompts, so only the owner can read it. The write is
+   * asynchronous, so a trace does not stop other streams. `row` can be JSON
+   * text, to use a payload that is already serialized.
    */
-  private trace(row: Obj): void {
-    if (!this.config.traceFile) return;
-    try {
-      appendFileSync(this.config.traceFile, JSON.stringify(row) + '\n', { mode: 0o600 });
-    } catch (error) {
-      log('warn', 'could not write the trace file', { error: String(error) });
+  private trace(row: Obj | string): void {
+    if (!this.config.traceFile || this.traceFailed) return;
+    if (!this.traceStream) {
+      const path = this.config.traceFile;
+      const stream = createWriteStream(path, { flags: 'a', mode: 0o600 });
+      // The mode of open(2) applies only to a new file. An existing file
+      // gets the private mode when the stream opens it.
+      stream.on('open', (fd: number) => fchmod(fd, 0o600, (error) => {
+        if (error) log('warn', 'could not make the trace file private', { error: String(error) });
+      }));
+      stream.on('error', (error) => {
+        log('warn', 'could not write the trace file; tracing stops', { error: String(error) });
+        this.traceFailed = true;
+        this.traceStream = null;
+      });
+      this.traceStream = stream;
     }
+    this.traceStream.write((typeof row === 'string' ? row : JSON.stringify(row)) + '\n');
+  }
+
+  /** Resolve when all trace rows so far are in the file. */
+  flushTrace(): Promise<void> {
+    const stream = this.traceStream;
+    if (!stream) return Promise.resolve();
+    return new Promise((resolve) => stream.write('', () => resolve()));
+  }
+
+  private closeTrace(): Promise<void> {
+    const stream = this.traceStream;
+    this.traceStream = null;
+    if (!stream) return Promise.resolve();
+    return new Promise((resolve) => stream.end(() => resolve()));
   }
 
   private async handleResponses(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -307,7 +338,11 @@ export class Gateway {
     } catch (error) {
       return reject(error instanceof RequestError ? new HttpError(400, error.message) : error, request);
     }
-    this.trace({ request_id: requestId, request, payload: chat.payload });
+    // Serialize the payload once. The backend call and the trace use it.
+    const payload = JSON.stringify(chat.payload);
+    if (this.config.traceFile) {
+      this.trace(`{"request_id":${JSON.stringify(requestId)},"request":${JSON.stringify(request)},"payload":${payload}}`);
+    }
 
     const streaming = request.stream === true;
     const controller = new AbortController();
@@ -330,7 +365,7 @@ export class Gateway {
     const write = (events: ResponseEvent[]) => streaming ? writeAll(res, events.map(sseFrame).join('')) : Promise.resolve();
 
     try {
-      const opened = await this.openBackend(route, chat.payload, controller.signal, requestId);
+      const opened = await this.openBackend(route, payload, controller.signal, requestId);
       endpoint = opened.endpoint;
       endpoint.stats.inFlight++;
       const backend = opened.stream;

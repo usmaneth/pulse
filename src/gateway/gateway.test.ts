@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { Gateway } from './server.js';
 import { defaultConfig, loadConfig, parseEndpointList } from './config.js';
@@ -175,6 +175,20 @@ test('reasoning replay can be turned off, and the trace file gets the payload', 
   } finally { rmSync(trace, { force: true }); await backend.close(); }
 });
 
+test('the trace file is made private also when it already exists', async () => {
+  const backend = await mockBackend((_b, _q, res) => sse(res, reply('ok')));
+  const trace = `${process.env.TMPDIR ?? '/tmp'}/pulse-gateway-trace-mode-${process.pid}.jsonl`;
+  writeFileSync(trace, '', { mode: 0o644 });
+  chmodSync(trace, 0o644);
+  const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }], { traceFile: trace });
+  try {
+    await events(await post(base, { model: 'qwen3.8-flash-next', input: 'x', stream: true }));
+    await gateway.stop();
+    assert.equal(statSync(trace).mode & 0o777, 0o600);
+    assert.equal(readFileSync(trace, 'utf8').trim().split('\n').length, 1);
+  } finally { rmSync(trace, { force: true }); await backend.close(); }
+});
+
 test('unsupported input returns 400 before any backend call', async () => {
   const backend = await mockBackend((_b, _q, res) => sse(res, reply('no')));
   const { gateway, base } = await startGateway([{ name: 'spark1', baseUrl: backend.url }]);
@@ -240,6 +254,7 @@ test('rejected requests and backend errors get a log line with the reason', asyn
     const warned = lines.find((l) => l.msg === 'tool call arguments are not a JSON object');
     assert.deepEqual([warned?.name, warned?.arguments], ['shell_command', '{"command": "ls']);
     // The trace file keeps the rejected request with its reason.
+    await gateway.flushTrace();
     const rows = readFileSync(trace, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     assert.equal(rows[0].request_id, rejected[0].request_id);
     assert.equal(rows[0].request.store, true);

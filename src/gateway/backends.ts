@@ -92,16 +92,17 @@ const agentHttps = new https.Agent({ keepAlive: true, maxSockets: 64 });
 /**
  * POST a chat-completions request and return when the response headers
  * arrive. Connection failures throw RetryableBackendError. The body stream
- * fails when no byte arrives for `idleTimeoutMs`.
+ * fails when no byte arrives for `idleTimeoutMs`. The payload can be JSON
+ * text, so that a caller that retries serializes it only once.
  */
 export function postChat(
   endpoint: Endpoint,
-  payload: Obj,
+  payload: Obj | string,
   timeouts: RequestTimeouts,
   signal: AbortSignal,
 ): Promise<BackendStream> {
   const url = new URL(`${endpoint.config.baseUrl}/chat/completions`);
-  const body = Buffer.from(JSON.stringify(payload));
+  const body = Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload));
   const client = url.protocol === 'https:' ? https : http;
   const started = performance.now();
   return new Promise((resolve, reject) => {
