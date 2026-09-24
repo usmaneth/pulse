@@ -28,7 +28,7 @@ Status labels:
 
 | Component | Path | Status | Purpose |
 |---|---|---|---|
-| Pulse gateway | `src/gateway`, `config/`, `deploy/systemd` | Stable (one node) | Responses API for Codex CLI 0.156 over a vLLM backend that serves Qwen3.8-Flash-Next. |
+| Pulse gateway | `src/gateway`, `config/`, `deploy/systemd` | Stable (one node) | Responses API for Codex CLI 0.156.1 over a vLLM backend that serves Qwen3.8-Flash-Next. |
 | Gateway failover to a second node | `src/gateway/backends.ts` | Experimental | Ordered endpoint list. Unit tests and a fake-backend drill only. The shipped config disables the second endpoint. |
 | Gateway `llamacpp` translation profile | `src/gateway/translate.ts` | Experimental | Chat Completions requests for llama.cpp. Unit tests only. No shipped config and no live run. |
 | Runtime manager (`pulse model`) | `src/runtime`, `runtime/`, `bin/pulse-cli` | Experimental | Renders a runtime profile into the recipe `.env`, then stops, starts and verifies vLLM on a node. |
@@ -40,7 +40,7 @@ Status labels:
 | Bonsai adapter and launchers | `src/server`, `scripts/codex-bonsai*` | Experimental | Responses and Chat Completions proxy in front of a Prism-compatible llama.cpp `llama-server`. |
 | Task continuity hooks | `scripts/codex-bonsai-continuity.py` | Experimental | Stores task state outside the model context, so a task can continue after compaction. CPU tests only. |
 | Jev reasoning budget | `src/jev` | Experimental, opt-in | Optional external decision API that sets a reasoning budget in the Bonsai adapter. No measured speed gain. |
-| Agent evaluation suite | `bench/agent-eval` | Experimental | Matched evaluation protocol over Chat Completions. No GPU results are recorded. |
+| Agent evaluation suite | `bench/agent-eval` | Experimental | Matched evaluation protocol over Chat Completions. The repository has no GPU results for it. |
 | Native CUDA decoder | `src/engine`, `tests/engine` | Research | Sequential decoder for Ternary Bonsai 2 27B PQ2_0, with a llama.cpp reference dumper and comparators. |
 | llama.cpp benchmark log and patches | `bench/RESULTS.md`, `bench/*.py`, `patches/` | Historical | Rounds 1 to 43 of Bonsai 2 27B measurements on llama.cpp. |
 | Kernel scaffold | `src/cuda`, `include/`, `src/main.cpp`, `src/server/mesh.ts` | Legacy | Synthetic-weight kernels that `make all` builds, and an unused router prototype. Their model constants do not match the real model. |
@@ -65,7 +65,7 @@ The [upstream single-Spark recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Ne
 This repository does not contain the recipe. Pulse writes only the recipe `.env`, a backup of it, and a log file.
 
 **Client.** The measured gateway runs used Codex CLI 0.156.1.
-The Bonsai path was validated with Codex CLI 0.154.0. Its CPU tests also pass with 0.156.1.
+The live checks of the Bonsai path used Codex CLI 0.154.0. Its CPU tests also pass with 0.156.1.
 
 ## Architecture
 
@@ -132,7 +132,7 @@ Requirements:
    PULSE_QWEN_BACKENDS="node1=http://127.0.0.1:8888/v1" npm run gateway
    ```
 
-3. Check the gateway. The health status is `ok` (HTTP 200) when each model has a healthy endpoint. Else it is `degraded` (HTTP 503).
+3. Check the gateway. The health status is `ok` (HTTP 200) when each model has a healthy endpoint. Else it is `degraded` (HTTP 503). During a graceful shutdown it is `draining` (HTTP 503).
 
    ```sh
    curl -s http://127.0.0.1:8800/health | jq .status
@@ -216,11 +216,11 @@ See [docs/RUNTIME.md](docs/RUNTIME.md) for the profile format, the safety rules 
 
 ## Experimental: Bonsai 2 through llama.cpp
 
-This path is validated on one installation only. A fresh clone cannot run it, because it needs:
+The live checks of this path ran on one installation only. A fresh clone cannot run it, because it needs:
 
 - a Prism-compatible llama.cpp build (stock llama.cpp cannot apply the activation transform of Bonsai 2),
 - local Ternary Bonsai 2 27B GGUF files,
-- a corrected v2 draft GGUF that is not published.
+- an unpublished corrected v2 draft GGUF.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -248,8 +248,8 @@ Limits:
 - It has no tokenizer, EOS policy, sampler, server, scheduler, batch support or speculative decoding.
 - Prefill runs one token per step. The multi-token GDN kernel (1 to 64 tokens) is a standalone fixture. It is not connected to the decoder.
 - The decoder is slower than llama.cpp in every measured case. Round 42 of [bench/RESULTS.md](bench/RESULTS.md) records that no measured regime gives the native path higher throughput than llama.cpp.
-- The opt-in CUDA graph (`PULSE_CUDA_GRAPH=1`) and Q8_1 activations (`PULSE_Q8_ACTIVATIONS=1`) make the native path faster. They do not close the gap to llama.cpp.
-- Correctness is tested on short forced traces only. The comparator limits (0.05 relative error, 0.999 cosine, identical greedy tokens) are diagnostic limits, not bitwise equivalence. Long-context correctness and task quality are not established.
+- The opt-in CUDA graph (`PULSE_CUDA_GRAPH=1`) and Q8_1 activations (`PULSE_Q8_ACTIVATIONS=1`) make the native path faster. They do not remove the difference from llama.cpp.
+- The correctness tests use short forced traces only. The comparator limits (0.05 relative error, 0.999 cosine, identical greedy tokens) are diagnostic limits, not bitwise equivalence. No result shows long-context correctness or task quality.
 
 The build needs a CUDA build of a Prism-compatible llama.cpp tree that defines `GGML_TYPE_PQ2_0`.
 Always set `LLAMA_DIR`, and write the output to `build/native`. The binaries in `bin/` are out of date.
@@ -287,12 +287,12 @@ Record: the header of [runtime/qwen38/profiles/best.env](runtime/qwen38/profiles
 ### Qwen3.8-Flash-Next quality
 
 HumanEval pass@1 was 160 of 164 at temperature 0 (`bench/qwen38/qualitygate.py`, 2026-09-23).
-Conditions: MTP K=3, r2 MTP head, recipe with the PLE fix. No HumanEval result at K=6 is recorded.
+Conditions: MTP K=3, r2 MTP head, recipe with the PLE fix. No HumanEval result exists for K=6.
 Output at temperature 0 is not bit-deterministic on this stack.
 
 ### Gateway: time to first token
 
-Conditions: production node, 2026-09-23, K=4 runtime profile, one request at a time, Codex CLI 0.156.1 request shape with about 11k prompt tokens.
+Conditions: production node, 2026-09-23, recipe configuration with MTP K=4 (not a `pulse model` runtime profile), one request at a time, Codex CLI 0.156.1 request shape with about 11k prompt tokens.
 
 | Case | Time to first token |
 |---|---|
@@ -309,8 +309,8 @@ These results check the transport. They are not a model quality score.
 
 | Check | Conditions | Result |
 |---|---|---|
-| `codex exec` task suite | 2026-09-24, Codex CLI 0.156.1, K=4 runtime profile, 7 tasks (create, three `apply_patch` fixes, resume, output schema, long output) at efforts low and medium, 1 repetition | 14 of 14 passed, 0 transport errors, 87% of input tokens cached, median wall time 12.2 s |
-| tool-eval-bench v2.1.0 | 84 scenarios, 1 trial, Codex Responses request shape, effort medium, temperature 0, seed 42 | Score 86.0 (65 pass, 14 partial, 5 fail), 0 infrastructure errors |
+| `codex exec` task suite | 2026-09-23, Codex CLI 0.156.1, recipe configuration with MTP K=4, 7 tasks (create, three `apply_patch` fixes, resume, output schema, long output) at efforts low and medium, 1 repetition | 14 of 14 passed, 0 transport errors, 87% of input tokens cached, median wall time 12.2 s |
+| tool-eval-bench v2.1.0 | 2026-09-23, recipe configuration with MTP K=4, 84 scenarios, 1 trial, Codex Responses request shape, effort medium, temperature 0, seed 42 | Score 86.0 (65 pass, 14 partial, 5 fail), 0 infrastructure errors |
 | Gateway process kill | `kill -9` of the gateway during a multi-turn `codex exec` on the production node | systemd restarted the gateway. Codex reconnected once and completed all 7 steps. |
 | Backend outage | 120 s outage of a fake backend during `codex exec` | The gateway retried 43 times. `codex exec` exited 0 with all 4 work steps correct. |
 
@@ -343,6 +343,7 @@ overlays/qwen38/      vLLM speculation-layer overlay generators and tests
 distill/qwen38/       MTP head self-distillation scripts
 bench/qwen38/         Qwen3.8 A/B benchmarks
 bench/agent-eval/     matched agent evaluation suite
+bench/jev-policy/     Jev policy CPU tests and cache-replay simulation
 bench/                historical llama.cpp benchmark scripts and log (RESULTS.md)
 config/               gateway and Bonsai configuration files
 deploy/systemd/       systemd user unit for the gateway
@@ -354,7 +355,7 @@ bin/pulse-cli         command-line entry point (pulse model, Bonsai launcher com
 docs/                 design, protocol and measurement documents
 ```
 
-Some tracked files contain paths and addresses of one site, for example `runtime/nodes.json`. Treat them as site configuration.
+Some tracked files contain paths and addresses of one site, for example `runtime/nodes.json` and `config/qwen38-gateway.json`. Treat them as site configuration, not as a template to copy without changes.
 
 ## Development
 
