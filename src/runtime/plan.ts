@@ -191,7 +191,9 @@ export function preflightScript(r: Rendered): string {
     'if ! ps_out=$(docker ps --format \'{{.Names}} {{.Image}}\' 2>&1); then fail docker "docker ps failed: $ps_out"; ps_out=""; fi',
     `others=$(printf '%s\\n' "$ps_out" | awk -v c=${shq(recipe.container)} '$1 != c && $2 ~ /vllm/ {print $1}' | tr '\\n' ' ')`,
     'if [ -n "$others" ]; then fail other-server "another vLLM container runs on this node: $others(one vLLM server per node)"; fi',
-    `state=$(docker inspect -f '{{.State.Status}} {{.State.StartedAt}}' ${shq(recipe.container)} 2>/dev/null || echo absent)`,
+    // docker inspect prints an empty line for a missing container, so the
+    // exit status sets "absent" and not the output.
+    `state=$(docker inspect -f '{{.State.Status}} {{.State.StartedAt}}' ${shq(recipe.container)} 2>/dev/null) || state=absent`,
     'echo "@pulse container $state"',
     'if [ -f .env ]; then',
     '  grep -E \'^# pulse-[a-z0-9-]+:\' .env | sed \'s/^/@pulse env-header /\'',
@@ -308,7 +310,7 @@ export function waitReadyScript(r: Rendered, logPath: string, rcPath: string, ti
     'while :; do',
     '  now=$(date +%s); el=$((now - t0))',
     '  if [ -f "$rc" ] && [ "$(cat "$rc")" != "0" ]; then echo "@pulse fail start the start command exited with $(cat "$rc")"; tails; exit 1; fi',
-    '  st=$(docker inspect -f \'{{.State.Status}}\' "$c" 2>/dev/null || echo absent)',
+    '  st=$(docker inspect -f \'{{.State.Status}}\' "$c" 2>/dev/null) || st=absent',
     '  [ "$st" = running ] && seen=1',
     '  if [ "$seen" = 1 ] && [ "$st" != running ]; then echo "@pulse fail container $c is $st"; tails; exit 1; fi',
     '  code=$(kcurl -s -o /dev/null -m 5 -w \'%{http_code}\' "$url" 2>/dev/null); [ -n "$code" ] || code=000',
@@ -329,7 +331,8 @@ export function verifyScript(r: Rendered): string {
     'docker logs "$c" > "$logs" 2>&1 </dev/null',
     keyedCurl('./.env'),
     `echo "@pulse models-body $(kcurl -s -m 10 ${shq(`http://${host}:${r.port}/v1/models`)} | tr -d '\\n')"`,
-    'echo "@pulse container $(docker inspect -f \'{{.State.Status}} {{.State.StartedAt}}\' "$c" 2>/dev/null || echo absent)"',
+    'cst=$(docker inspect -f \'{{.State.Status}} {{.State.StartedAt}}\' "$c" 2>/dev/null) || cst=absent',
+    'echo "@pulse container $cst"',
     'echo "@pulse kv $(grep -E \'GPU KV cache size|Available KV cache|Maximum concurrency\' "$logs" | tail -n 1)"',
   ];
   for (const p of r.proofs) {

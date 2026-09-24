@@ -702,7 +702,8 @@ case "$1 $2" in
   "ps -aq") [ -f "$S/running" ] && echo 0123abcd ;;
   "logs "*) printf '%s\\n' "INFO GPU KV cache size: 667,808 tokens, Maximum concurrency for 262,144 tokens per request: 2.55x" ;;
   "inspect -f")
-    [ -f "$S/running" ] || exit 1
+    # Like docker 29: an empty line and exit 1 for a missing container.
+    [ -f "$S/running" ] || { echo; exit 1; }
     case "$3" in
       *json*) echo "{\\"Status\\":\\"running\\",\\"Running\\":true,\\"StartedAt\\":\\"$(cat "$S/started")\\"}" ;;
       *StartedAt*) echo "running $(cat "$S/started")" ;;
@@ -803,6 +804,7 @@ test('e2e: up datagen, status, smoke and down on a fake local recipe', async () 
   const text = c.out.join('\n');
   assert.match(text, /fake is up: profile datagen, qwen3\.8-flash-next, max_model_len 262144/);
   assert.match(text, /KV cache: 667,808 tokens/);
+  assert.match(text, /server vllm-fn-tp1: absent\n/);
 
   // The new .env: the rendered text, then the carried secret line. The secret never reached the output.
   const env = readFileSync(path.join(recipe, '.env'), 'utf8');
