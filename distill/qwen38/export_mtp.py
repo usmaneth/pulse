@@ -6,7 +6,7 @@ and every non-MTP tensor are copied through byte for byte. The output shard is
 bind-mounted over model-00034-of-00034.safetensors for an A/B, so reverting is
 removing one mount.
 
-    python3 export_mtp.py --trained mtp_trained.pt --out /models/usman/distill/shard34_tuned.safetensors
+    python3 export_mtp.py --trained mtp_trained.pt --out /mnt/models/distill/shard34_tuned.safetensors
 """
 import argparse, glob
 
@@ -14,7 +14,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-SNAP = glob.glob("/models/usman/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/")[0]
+SNAP = glob.glob("/mnt/models/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/")[0]
 
 
 def trained_to_ckpt_name(n):

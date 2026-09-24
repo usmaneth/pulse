@@ -19,7 +19,7 @@ Do not replace that path without adapting and testing its following normalizatio
 Build the fixture:
 
 ```sh
-make BIN_DIR=build/native build/native/test-gdn-prefill LLAMA_DIR=/home/usman/llama.cpp-upstream -j1
+make BIN_DIR=build/native build/native/test-gdn-prefill LLAMA_DIR=~/llama.cpp-upstream -j1
 ```
 
 Run `build/native/test-gdn-prefill` only during an exclusive GPU experiment slot.

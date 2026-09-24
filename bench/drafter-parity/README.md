@@ -24,8 +24,8 @@ Run from this directory:
 
 ```sh
 make -j1
-python3 compare_rope.py --trainer /home/usman/Bonsai-demo/dflash-training/v2/train_dspark_v2.py --probe /home/usman/Documents/spark-orchestration/drafter-artifacts/rope-probe --output /tmp/rope-comparison.json
-PYTHONPATH=/home/usman/Bonsai-demo/llama.cpp/gguf-py python3 -m unittest test_metadata.py
+python3 compare_rope.py --trainer ~/Bonsai-demo/dflash-training/v2/train_dspark_v2.py --probe ./artifacts/rope-probe --output /tmp/rope-comparison.json
+PYTHONPATH=~/Bonsai-demo/llama.cpp/gguf-py python3 -m unittest test_metadata.py
 ```
 
 The probe calls the actual ggml CPU RoPE operator. The Python comparison calls the actual trainer implementation.
@@ -36,7 +36,7 @@ It does not test CUDA, attention outputs, model quality, or acceptance.
 ## Artifact conversion
 
 ```sh
-python3 metadata_variant.py --gguf-py /home/usman/Bonsai-demo/llama.cpp/gguf-py --source SOURCE.gguf --destination VARIANT.gguf --manifest VARIANT.manifest.json
+python3 metadata_variant.py --gguf-py ~/Bonsai-demo/llama.cpp/gguf-py --source SOURCE.gguf --destination VARIANT.gguf --manifest VARIANT.manifest.json
 ```
 
 Use a new destination and manifest path.

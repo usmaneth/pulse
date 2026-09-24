@@ -25,11 +25,12 @@ def ntok(text):
     return len(post("/tokenize", {"content": text})["tokens"])
 
 # build a large natural pool
+import os
 import glob
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp') +
-                glob.glob('/home/usman/llama.cpp-upstream/common/*.cpp') +
-                glob.glob('/home/usman/llama.cpp-upstream/ggml/src/ggml-cuda/*.cu')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp')) +
+                glob.glob(os.path.expanduser('~/llama.cpp-upstream/common/*.cpp')) +
+                glob.glob(os.path.expanduser('~/llama.cpp-upstream/ggml/src/ggml-cuda/*.cu'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

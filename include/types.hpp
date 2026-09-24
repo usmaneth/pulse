@@ -80,7 +80,8 @@ struct TensorParallelConfig {
     TensorParallelMode mode{TensorParallelMode::DISABLED};
     uint32_t world_size{1};
     uint32_t rank{0};
-    std::string peer_host{"10.99.0.2"};
+    // Placeholder; a real deployment sets this to the peer node's address.
+    std::string peer_host{"127.0.0.1"};
     uint16_t peer_port{50055};
 
     uint32_t sharded_hidden_dim{QWEN_HIDDEN_DIM};

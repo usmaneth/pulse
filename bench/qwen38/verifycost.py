@@ -13,7 +13,7 @@ prefix (the suffix-drafter case, where routing may overlap).
 import json, statistics, time, urllib.request
 
 PORT = 8888
-BASE = open("/models/usman/qwen38-tune/long_context.txt").read()[:9000]
+BASE = open("/mnt/models/qwen38-tune/long_context.txt").read()[:9000]
 
 
 def ttft(prompt):
@@ -44,7 +44,7 @@ def main():
             base_t = base_t or med
             res[f"{kind}_{n}"] = {"ttft_ms": round(med * 1000, 1), "delta_ms": round((med - base_t) * 1000, 1)}
             print(kind, n, res[f"{kind}_{n}"], flush=True)
-    json.dump(res, open("/models/usman/qwen38-tune/verifycost.json", "w"), indent=1)
+    json.dump(res, open("/mnt/models/qwen38-tune/verifycost.json", "w"), indent=1)
 
 
 if __name__ == "__main__":

@@ -5,12 +5,13 @@
 # drafter buys tokens per weight sweep only while the sweep is under-occupied.
 # This maps where each wins so `pulse serve` can pick correctly.
 set -uo pipefail
-ROOT=/home/usman/Bonsai-demo
+HERE=$(cd "$(dirname "$0")" && pwd)
+# Ternary Bonsai 2 checkout: a sibling of this repo by default.
+ROOT=${ROOT:-"$HERE/../../Bonsai-demo"}
 BIN=$ROOT/bin/cuda/llama-server
 M=models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf
 V1=models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-Q4_0.gguf
 V2=models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf
-HERE=$(cd "$(dirname "$0")" && pwd)
 SLOTS=${SLOTS:-16}
 LEVELS=${LEVELS:-1,2,4,8,16}
 

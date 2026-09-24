@@ -11,7 +11,7 @@ import subprocess
 import time
 import urllib.request
 
-ROOT = Path('/home/usman')
+ROOT = Path.home()
 ARTIFACTS = ROOT/'Documents/spark-orchestration/drafter-artifacts'
 BACKEND = ROOT/'llama.cpp-upstream/build-cuda/bin/llama-server'
 MODEL = ROOT/'Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf'

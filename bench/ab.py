@@ -14,8 +14,11 @@ Usage:
 """
 import argparse, json, os, re, shlex, statistics as st, subprocess, sys, time
 
-BIN   = os.environ.get("SPEC_BIN", "/home/usman/Bonsai-demo/bin/cuda/llama-speculative-simple")
-ROOT  = os.environ.get("SPEC_ROOT", "/home/usman/Bonsai-demo")
+# Ternary Bonsai 2 checkout: a sibling of this repo by default.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BONSAI_DEFAULT = os.path.join(_REPO_ROOT, "..", "Bonsai-demo")
+BIN   = os.environ.get("SPEC_BIN", os.path.join(_BONSAI_DEFAULT, "bin/cuda/llama-speculative-simple"))
+ROOT  = os.environ.get("SPEC_ROOT", _BONSAI_DEFAULT)
 MODEL = os.environ.get("SPEC_MODEL", "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf")
 DRAFT = os.environ.get("SPEC_DRAFT", "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf")
 # Warm, interleaved, warmup-discarded: measured 3.4% spread.

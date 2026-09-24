@@ -7,7 +7,7 @@ overlay (overlays/qwen38, overlay "capture") writes <row>_<start>.pt per prefill
 chunk. The script then writes <row>.ids.pt with the token ids, so a training
 example is (ids, concatenated hidden rows).
 
-    python3 capture_client.py --gen gen.jsonl --dir /models/usman/distill/cap --max-rows 2000
+    python3 capture_client.py --gen gen.jsonl --dir /mnt/models/distill/cap --max-rows 2000
 """
 import argparse, json, os, urllib.request
 from concurrent.futures import ThreadPoolExecutor

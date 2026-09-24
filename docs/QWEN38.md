@@ -22,7 +22,7 @@ The gateway is stateless. Codex sends the full history on every turn
 | `src/gateway/server.ts` | HTTP server: `/v1/responses`, `/v1/models`, `/health`, `/metrics` |
 | `src/gateway/config.ts` | configuration from file and environment |
 | `src/gateway/index.ts` | entry point, graceful shutdown |
-| `config/qwen38-gateway.json` | production configuration |
+| `config/qwen38-gateway.json` | production configuration (gitignored; copy from `config/qwen38-gateway.example.json`) |
 | `deploy/systemd/pulse-qwen38.service` | systemd user unit |
 | `deploy/systemd/pulse-qwen38.env.example` | environment overrides for the unit |
 
@@ -83,8 +83,8 @@ Do these steps in order. The router on port 8790 can stay up until the last step
    flags stay the same:
 
    ```sh
-   alias codex-qwen='/home/usman/.bun/bin/codex -c model_provider=pulse -m qwen3.8-flash-next -c model_auto_compact_token_limit=400000 -c model_catalog_json=/home/usman/.codex/model_catalog.all.json'
-   alias codex-qwen-swarm='/home/usman/.bun/bin/codex -c model_provider=pulse -m qwen3.8-flash-next -c model_auto_compact_token_limit=150000 -c model_catalog_json=/home/usman/.codex/model_catalog.all.json'
+   alias codex-qwen='~/.bun/bin/codex -c model_provider=pulse -m qwen3.8-flash-next -c model_auto_compact_token_limit=400000 -c model_catalog_json=~/.codex/model_catalog.all.json'
+   alias codex-qwen-swarm='~/.bun/bin/codex -c model_provider=pulse -m qwen3.8-flash-next -c model_auto_compact_token_limit=150000 -c model_catalog_json=~/.codex/model_catalog.all.json'
    ```
 
 To go back, set `model_provider=all-models` again. The router route for
@@ -352,11 +352,11 @@ at once.
 
 Spark2 is in `config/qwen38-gateway.json` with `"enabled": false`, because its
 vLLM server binds to loopback only today. To use it, start that server with
-`BIND=10.99.0.2` (or `0.0.0.0` on the private link), then set
+`BIND=203.0.113.2` (or `0.0.0.0` on the private link), then set
 `"enabled": true` or add it to `PULSE_QWEN_BACKENDS`:
 
 ```
-PULSE_QWEN_BACKENDS=spark1=http://127.0.0.1:8888/v1,spark2=http://10.99.0.2:8888/v1
+PULSE_QWEN_BACKENDS=spark1=http://127.0.0.1:8888/v1,spark2=http://203.0.113.2:8888/v1
 ```
 
 ## Health and metrics

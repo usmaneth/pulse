@@ -75,7 +75,18 @@ function need(cond: unknown, msg: string): asserts cond {
 
 /** Load and check runtime/nodes.json. */
 export function loadNodes(file: string): NodesFile {
-  const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<NodesFile> & { nodes?: Record<string, Partial<NodeConfig>> };
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new ProfileError(
+        `${file}: not found. Copy runtime/nodes.example.json to this path and fill in your own node hosts, then try again.`,
+      );
+    }
+    throw e;
+  }
+  const raw = JSON.parse(text) as Partial<NodesFile> & { nodes?: Record<string, Partial<NodeConfig>> };
   need(raw.nodes && typeof raw.nodes === 'object', `${file}: "nodes" is missing`);
   const nodes: Record<string, NodeConfig> = {};
   for (const [name, n] of Object.entries(raw.nodes)) {

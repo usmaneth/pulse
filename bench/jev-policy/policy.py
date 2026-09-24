@@ -206,7 +206,7 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--live', action='store_true')
     parser.add_argument('--mode', choices=['advice', 'experiment'], default='advice')
-    parser.add_argument('--secret-file', type=Path, default=Path('/home/usman/.config/pulse/typesafe.env'))
+    parser.add_argument('--secret-file', type=Path, default=Path('~/.config/pulse/typesafe.env').expanduser())
     args = parser.parse_args()
     fixture = json.loads(args.fixture.read_text())
     state, constraints = fixture['state'], fixture['constraints']

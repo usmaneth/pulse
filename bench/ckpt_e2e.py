@@ -5,6 +5,7 @@ Simulates a 3-turn agent conversation, then a 4th turn that EDITS turn 2's
 content. Without checkpoints that is a full re-prefill; with them it should
 restore the turn-1 boundary and prefill only from there.
 """
+import os
 import glob, json, sys, time, urllib.request
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 
@@ -15,7 +16,7 @@ def post(path, body, timeout=900):
         return json.loads(r.read()), (time.perf_counter()-t0)*1000
 
 pool=""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp'))):
     try: pool+=open(p,errors='replace').read()+"\n"
     except Exception: pass
 CHUNK = 6000

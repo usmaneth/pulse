@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-SNAP = glob.glob("/models/usman/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/")
+SNAP = glob.glob("/mnt/models/hf/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/*/")
 FP4 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
@@ -193,7 +193,7 @@ def main():
     ap.add_argument("--eval-frac", type=float, default=0.05)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--out", default="/models/usman/distill/mtp_trained.pt")
+    ap.add_argument("--out", default="/mnt/models/distill/mtp_trained.pt")
     ap.add_argument("--max-steps", type=int, default=0)
     a = ap.parse_args()
     device = "cuda"

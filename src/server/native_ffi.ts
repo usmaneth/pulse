@@ -6,6 +6,8 @@
 
 // @ts-ignore
 import { dlopen, FFIType, ptr } from 'bun:ffi';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 export interface NativeStepResult {
   tokens: number[];
@@ -15,7 +17,10 @@ export interface NativeStepResult {
   rateToksSec: number;
 }
 
-const LIB_PATH = '/home/usman/pulse/bin/libpulse_engine.so';
+// bin/libpulse_engine.so sits two levels above the compiled dist/server/
+// output (repo root, then bin/). PULSE_ENGINE_LIB overrides the path.
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const LIB_PATH = process.env.PULSE_ENGINE_LIB ?? join(REPO_ROOT, 'bin', 'libpulse_engine.so');
 
 export class NativePulseEngine {
   private lib: ReturnType<typeof dlopen> | null = null;

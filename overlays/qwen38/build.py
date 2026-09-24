@@ -39,8 +39,8 @@ GENERATORS = os.path.join(HERE, "generators")
 
 IMAGE_DEFAULT = "vllm/vllm-openai:qwen38-flash-next"
 VLLM_PKG = "/usr/local/lib/python3.12/dist-packages/vllm"
-RECIPE_DEFAULT = os.environ.get("QWEN38_RECIPE_DIR", "/models/usman/qwen38-flash")
-CAPTURE_DIR_DEFAULT = os.environ.get("QWEN38_CAPTURE_DIR", "/models/usman/distill/cap")
+RECIPE_DEFAULT = os.environ.get("QWEN38_RECIPE_DIR", "/mnt/models/qwen38-flash")
+CAPTURE_DIR_DEFAULT = os.environ.get("QWEN38_CAPTURE_DIR", "/mnt/models/distill/cap")
 
 MTP_REL = "models/qwen3_8_flash_next/nvidia/mtp.py"
 

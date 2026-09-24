@@ -21,7 +21,7 @@ The upstream tree on this host includes the Bonsai Hadamard correction.
 
 ```sh
 make native-cpu-test
-make bin/pulse-engine bin/pulse-dumpref LLAMA_DIR=/home/usman/llama.cpp-upstream -j1
+make bin/pulse-engine bin/pulse-dumpref LLAMA_DIR=~/llama.cpp-upstream -j1
 ```
 
 ## Sequential comparison

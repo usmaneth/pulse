@@ -15,6 +15,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Ternary Bonsai 2 checkout: a sibling of this repo by default, overridable
+// with PULSE_BONSAI_DIR or the --model / --llama-server flags below.
+const bonsaiDir = process.env.PULSE_BONSAI_DIR || path.join(rootDir, '..', 'Bonsai-demo');
 const args = process.argv.slice(2);
 const command = args[0] || 'help';
 
@@ -139,7 +142,7 @@ function serve() {
   const profile = loadProfile(flag('profile', 'gb10-bonsai2'));
   const slots = Number(flag('slots', profile.parallel_slots.recommended));
   const opts = {
-    model: flag('model', '/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/' + profile.model.target),
+    model: flag('model', path.join(bonsaiDir, 'models', 'bonsai2-gguf', '27B', profile.model.target)),
     ctx: Number(flag('ctx', 65536)),
     slots,
     host: flag('host', '127.0.0.1'),
@@ -150,7 +153,7 @@ function serve() {
     // speculation is a net loss above the measured crossover
     speculate: has('no-speculate') ? false : slots < profile.speculation_by_load.crossover_clients,
   };
-  const bin = flag('llama-server', '/home/usman/Bonsai-demo/bin/cuda/llama-server');
+  const bin = flag('llama-server', path.join(bonsaiDir, 'bin', 'cuda', 'llama-server'));
   const { argv, drafter, d, kvType } = buildServerArgs(profile, opts);
 
   const c = profile.speculation_by_load;

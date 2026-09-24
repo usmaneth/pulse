@@ -19,6 +19,10 @@ import time
 import os
 import sys
 
+# Repo root and the Ternary Bonsai 2 checkout (a sibling of this repo by default).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_BONSAI_DEFAULT = os.environ.get("PULSE_BONSAI_DIR", os.path.join(_REPO_ROOT, "..", "Bonsai-demo"))
+
 BENCHMARK_PROMPTS = [
     # ── Category 1: Algorithmic Code (HumanEval / MBPP style) ──
     {
@@ -99,7 +103,7 @@ BENCHMARK_PROMPTS = [
         "id": "schema_03_json_api_contract",
         "category": "Structured Schema",
         "name": "Strict JSON Array Contract",
-        "prompt": "{\n  \"status\": \"success\",\n  \"cluster\": \"dgx-spark-blackwell-dual\",\n  \"nodes\": [\n    {\n      \"node_id\": \"spark1\",\n      \"ip\": \"10.99.0.1\",\n      \"gpu\": \"NVIDIA GB10\",\n      \"vram_total_gb\": 128,\n      \"status\": \"active\",\n      \"services\": [\"llama-server\", \"pulse-engine\", \"model-router\"]\n    },\n",
+        "prompt": "{\n  \"status\": \"success\",\n  \"cluster\": \"dgx-spark-blackwell-dual\",\n  \"nodes\": [\n    {\n      \"node_id\": \"spark1\",\n      \"ip\": \"203.0.113.1\",\n      \"gpu\": \"NVIDIA GB10\",\n      \"vram_total_gb\": 128,\n      \"status\": \"active\",\n      \"services\": [\"llama-server\", \"pulse-engine\", \"model-router\"]\n    },\n",
         "n_predict": 130
     },
 
@@ -108,7 +112,7 @@ BENCHMARK_PROMPTS = [
         "id": "agent_01_shell_command",
         "category": "Agentic Tool Use",
         "name": "CLI File System Audit Tool Call",
-        "prompt": "<|im_start|>system\nYou are a helpful assistant with access to bash shell commands. When the user asks to inspect a directory or disk usage, invoke the shell function.\nTools: [{\"type\": \"function\", \"function\": {\"name\": \"exec_command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"]}}}]<|im_end|>\n<|im_start|>user\nInspect the /home/usman directory on the machine and list the top 5 largest subdirectories by size.<|im_end|>\n<|im_start|>assistant\n",
+        "prompt": "<|im_start|>system\nYou are a helpful assistant with access to bash shell commands. When the user asks to inspect a directory or disk usage, invoke the shell function.\nTools: [{\"type\": \"function\", \"function\": {\"name\": \"exec_command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"]}}}]<|im_end|>\n<|im_start|>user\nInspect the /home/user directory on the machine and list the top 5 largest subdirectories by size.<|im_end|>\n<|im_start|>assistant\n",
         "n_predict": 100
     },
     {
@@ -136,10 +140,10 @@ BENCHMARK_PROMPTS = [
     }
 ]
 
-LLAMA_SPEC_BIN = "/home/usman/Bonsai-demo/bin/cuda/llama-speculative-simple"
-PULSE_BIN = "/home/usman/pulse/bin/pulse"
-TARGET_MODEL = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf"
-DRAFTER_V2 = "/home/usman/Bonsai-demo/models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf"
+LLAMA_SPEC_BIN = os.path.join(_BONSAI_DEFAULT, "bin/cuda/llama-speculative-simple")
+PULSE_BIN = os.path.join(_REPO_ROOT, "bin/pulse")
+TARGET_MODEL = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-PQ2_0.gguf")
+DRAFTER_V2 = os.path.join(_BONSAI_DEFAULT, "models/bonsai2-gguf/27B/Ternary-Bonsai-2-27B-dspark-dflash-v2-Q4_K_M.gguf")
 
 def run_llama_spec(prompt: str, k: int, n_predict: int):
     cmd = [
@@ -302,9 +306,10 @@ def main():
             } for cat, v in cat_summary.items()
         }
     }
-    with open("/home/usman/pulse/industry_benchmark_report.json", "w") as f:
+    out_path = os.path.join(_REPO_ROOT, "industry_benchmark_report.json")
+    with open(out_path, "w") as f:
         json.dump(summary_data, f, indent=2)
-    print("\nFull JSON artifact saved to /home/usman/pulse/industry_benchmark_report.json")
+    print(f"\nFull JSON artifact saved to {out_path}")
 
 if __name__ == "__main__":
     main()

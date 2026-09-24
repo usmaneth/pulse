@@ -8,6 +8,7 @@ the medium band is being served at the wrong depth. This sweeps both axes.
 K values are interleaved within each repeat so machine drift cannot masquerade
 as a K effect.
 """
+import os
 import glob, json, statistics, sys, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8085"
@@ -16,7 +17,7 @@ CTXS = [8192, 12288, 16384, 34000]
 REPEATS = 3
 
 pool = ""
-for p in sorted(glob.glob('/home/usman/llama.cpp-upstream/src/*.cpp')):
+for p in sorted(glob.glob(os.path.expanduser('~/llama.cpp-upstream/src/*.cpp'))):
     try: pool += open(p, errors='replace').read() + "\n"
     except Exception: pass
 

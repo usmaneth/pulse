@@ -26,11 +26,11 @@
   "max_tokens": 512,
   "resource_check": [
     "python3",
-    "/home/usman/pulse/bench/agent-eval/resource_check.py"
+    "bench/agent-eval/resource_check.py"
   ],
   "token_counter": [
     "python3",
-    "/home/usman/pulse/bench/agent-eval/token_counter.py",
+    "bench/agent-eval/token_counter.py",
     "/models/REQUIRED_LOCAL_TOKENIZER"
   ],
   "reset_cache": [

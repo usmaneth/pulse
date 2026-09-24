@@ -8,37 +8,37 @@
       "host": "local",
       "protected": true,
       "env": {
-        "HF_HOME": "/models/usman/hf",
+        "HF_HOME": "/mnt/models/hf",
         "BIND": "127.0.0.1",
         "PORT": "8888"
       },
       "vars": {
-        "tritonCache": "/models/usman/triton-cache",
-        "mtpShardR2": "/models/usman/distill/shard34_r2.safetensors",
-        "captureDir": "/models/usman/distill/cap",
+        "tritonCache": "/mnt/models/triton-cache",
+        "mtpShardR2": "/mnt/models/distill/shard34_r2.safetensors",
+        "captureDir": "/mnt/models/distill/cap",
         "hfSnapshot": "925d7be6c14c6c9442ef83e8f05b5a3c39304f69"
       },
       "gatewayUrl": "http://127.0.0.1:8888/v1",
-      "gpuProbe": "bash /models/usman/qwen38-tune/probe.sh",
+      "gpuProbe": "bash /mnt/models/qwen38-tune/probe.sh",
       "recipes": {
         "qwen38-flash": {
-          "dir": "/models/usman/qwen38-flash",
+          "dir": "/mnt/models/qwen38-flash",
           "start": "./start.sh",
           "stop": "./stop.sh",
           "container": "vllm-fn-tp1",
-          "dockerArgs": ["-v", "/models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache"]
+          "dockerArgs": ["-v", "/mnt/models/vllm-ple-cache:/mnt/models/vllm-ple-cache"]
         },
         "qwen38-dual": {
-          "dir": "/models/usman/qwen38-dual",
+          "dir": "/mnt/models/qwen38-dual",
           "start": "./start.sh --launch",
           "stop": "./stop.sh",
           "container": "vllm-fn",
           "vars": {
-            "headIp": "10.99.0.1",
-            "workerIp": "10.99.0.2",
+            "headIp": "203.0.113.1",
+            "workerIp": "203.0.113.2",
             "iface": "enp1s0f1np1",
             "ibHca": "=rocep1s0f1",
-            "workerHfHome": "/home/usman/.cache/huggingface"
+            "workerHfHome": "/var/cache/pulse-hf"
           }
         }
       }
@@ -48,26 +48,26 @@
       "host": "ssh",
       "ssh": "spark2",
       "env": {
-        "HF_HOME": "/home/usman/.cache/huggingface",
+        "HF_HOME": "/var/cache/pulse-hf",
         "BIND": "127.0.0.1",
         "PORT": "8888",
         "REQUIRE_IDLE_GPU": "false"
       },
       "vars": {
-        "tritonCache": "/models/usman/triton-cache",
-        "mtpShardR2": "/models/usman/distill/shard34_r2.safetensors",
-        "captureDir": "/models/usman/distill/cap",
+        "tritonCache": "/mnt/models/triton-cache",
+        "mtpShardR2": "/mnt/models/distill/shard34_r2.safetensors",
+        "captureDir": "/mnt/models/distill/cap",
         "hfSnapshot": "925d7be6c14c6c9442ef83e8f05b5a3c39304f69"
       },
-      "gatewayUrl": "http://10.99.0.2:8888/v1",
-      "gpuProbe": "bash /models/usman/distill/probe.sh",
+      "gatewayUrl": "http://203.0.113.2:8888/v1",
+      "gpuProbe": "bash /mnt/models/distill/probe.sh",
       "recipes": {
         "qwen38-flash": {
-          "dir": "/models/usman/qwen38-flash",
+          "dir": "/mnt/models/qwen38-flash",
           "start": "./start.sh",
           "stop": "./stop.sh",
           "container": "vllm-fn-tp1",
-          "dockerArgs": ["-v", "/models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache"]
+          "dockerArgs": ["-v", "/mnt/models/vllm-ple-cache:/mnt/models/vllm-ple-cache"]
         }
       }
     }

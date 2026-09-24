@@ -479,9 +479,9 @@ test('SSE parser handles split UTF-8, CRLF, comments and multi-line data', async
 });
 
 test('config: env endpoint list sets the failover order', () => {
-  assert.deepEqual(parseEndpointList('spark1=http://127.0.0.1:8888/v1, spark2=http://10.99.0.2:8888/v1'), [
+  assert.deepEqual(parseEndpointList('spark1=http://127.0.0.1:8888/v1, spark2=http://203.0.113.2:8888/v1'), [
     { name: 'spark1', baseUrl: 'http://127.0.0.1:8888/v1' },
-    { name: 'spark2', baseUrl: 'http://10.99.0.2:8888/v1' },
+    { name: 'spark2', baseUrl: 'http://203.0.113.2:8888/v1' },
   ]);
   const config = loadConfig({ PULSE_QWEN_BACKENDS: 'http://a:1/v1/,http://b:2/v1', PULSE_GATEWAY_PORT: '18800' }, []);
   assert.equal(config.port, 18800);
