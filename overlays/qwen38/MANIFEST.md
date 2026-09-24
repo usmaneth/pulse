@@ -216,7 +216,9 @@ These items are not overlays, and they are easy to lose in a new profile:
 - The persistent Triton cache: `-e TRITON_CACHE_DIR=/triton-cache` and
   `-v <host dir>:/triton-cache`. Create the host directory as the user before
   the first start, or docker creates it as root.
-- The PLE cache mount: `-v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache`.
+- The PLE cache mount: `-v <PLE cache dir>:<PLE cache dir>`. The host path
+  and the container path are the same, because the host PLE cache
+  (`~/.cache/vllm/ple_cache`) is a symlink to that directory.
 - The round-2 MTP shard, mounted read-only over
   `model-00034-of-00034.safetensors` in the HF snapshot.
 - `MTP_INDEX_SHARE=1`, `MTP_DISABLE_BLOCK_DROP=1`,
@@ -235,7 +237,7 @@ A test checks each key and value in this section against the value that
 Example `EXTRA_DOCKER_ARGS` for the best set (host paths are examples):
 
 ```bash
-EXTRA_DOCKER_ARGS="-e VLLM_USE_V2_MODEL_RUNNER=1 -e TRITON_CACHE_DIR=/triton-cache -v /models/usman/triton-cache:/triton-cache -v /models/usman/vllm-ple-cache:/models/usman/vllm-ple-cache <contents of docker-args.txt> -v <r2 shard>:/root/.cache/huggingface/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/<revision>/model-00034-of-00034.safetensors:ro"
+EXTRA_DOCKER_ARGS="-e VLLM_USE_V2_MODEL_RUNNER=1 -e TRITON_CACHE_DIR=/triton-cache -v <Triton cache dir>:/triton-cache -v <PLE cache dir>:<PLE cache dir> <contents of docker-args.txt> -v <r2 shard>:/root/.cache/huggingface/hub/models--Mia-AiLab--Qwen3.8-Flash-Next-NVFP4/snapshots/<revision>/model-00034-of-00034.safetensors:ro"
 ```
 
 ## Rejected records
